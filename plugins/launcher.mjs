@@ -137,6 +137,10 @@ function jlog(event, fields = {}) {
 // pathological reconnect storm) can't exhaust file descriptors / RAM.
 const SHELL_PTY_CAP = parseInt(process.env.CCV_SHELL_PTY_CAP || '8', 10);
 let _shellPtyCount = 0;
+// Reference to the /ws/shell WebSocketServer once installed; null until then.
+// Used by /healthz to report `wsCount = wss.clients.size`. Kept at module
+// scope (not closed-over) so the route handler can read it without plumbing.
+let _shellWss = null;
 
 function safeJson(filePath) {
   try { return JSON.parse(readFileSync(filePath, 'utf-8')); } catch { return null; }
@@ -1000,15 +1004,23 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
 
   // /healthz: lightweight liveness probe for monitors (no auth required).
   // Returns ok + key counters; never blocks on disk or external state.
+  // wsCount = open /ws/shell sockets; orphanCount = PTYs with no attached
+  // socket (becomes meaningful once PB3 lands session resume — today a PTY
+  // is always tied to a live ws so this is normally 0 except briefly during
+  // close races).
   if (url === '/healthz' && method === 'GET') {
+    const wsCount = _shellWss ? _shellWss.clients.size : 0;
+    const orphanCount = Math.max(0, _shellPtyCount - wsCount);
     sendJson(res, 200, {
       ok: true,
       uptimeSec: Math.round(process.uptime()),
       ptyCount: _shellPtyCount,
       ptyCap: SHELL_PTY_CAP,
+      wsCount,
+      orphanCount,
+      sessionCount: approvedSessions.size,
       instanceCount: instances.size,
       pendingPairs: pendingPairs.size,
-      sessions: approvedSessions.size,
     });
     return;
   }
@@ -1298,6 +1310,7 @@ function installShellWebSocket(httpServer) {
   }
   const { WebSocketServer } = require('/opt/homebrew/lib/node_modules/cc-viewer/node_modules/ws');
   const wss = new WebSocketServer({ noServer: true });
+  _shellWss = wss;
 
   // Intercept upgrade before ccv's own /ws/terminal handler
   const existingUpgradeListeners = httpServer.listeners('upgrade');
