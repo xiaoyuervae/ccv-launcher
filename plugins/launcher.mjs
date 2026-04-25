@@ -382,6 +382,7 @@ const HTML_PAGE = `<!doctype html>
         +   '<div class="actions">'
         +     '<button data-act="open" data-href="'+escape(openHref)+'">Open</button>'
         +     '<button data-act="copy" data-text="'+(pub||lan)+'">Copy URL</button>'
+        +     '<button data-act="openterm" data-cwd="'+path+'">Terminal</button>'
         +     termBtn
         +     stopBtn
         +   '</div>'
@@ -406,6 +407,7 @@ const HTML_PAGE = `<!doctype html>
           +   '</div>'
           +   '<div class="actions">'
           +     '<button data-act="launch" data-cwd="'+path+'">Launch</button>'
+          +     '<button data-act="openterm" data-cwd="'+path+'">Terminal</button>'
           +     '<button class="danger" data-act="forget" data-wsid="'+(h.wsId||'')+'">Forget</button>'
           +   '</div>'
           + '</div>';
@@ -438,6 +440,9 @@ const HTML_PAGE = `<!doctype html>
       catch (e) { alert('Forget failed: ' + e.message); }
     } else if (act === 'terminal') {
       openTerminal(t.dataset.port, t.dataset.token, t.dataset.name, t.dataset.path, t.dataset.pub, t.dataset.lan);
+    } else if (act === 'openterm') {
+      try { await api('/api/launcher/open-terminal', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd: t.dataset.cwd }) }); }
+      catch (e) { alert('Open Terminal failed: ' + e.message); }
     }
   });
 
@@ -723,6 +728,22 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
       sendJson(res, 200, { ok: removed });
     } catch (err) {
       log('forget error:', err.message);
+      sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  if (url === '/api/launcher/open-terminal' && method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      const { cwd: targetCwd } = JSON.parse(raw || '{}');
+      if (!targetCwd) throw new Error('cwd required');
+      const resolved = realpathSync(targetCwd);
+      if (!existsSync(resolved) || !statSync(resolved).isDirectory()) throw new Error('not a directory');
+      spawn('open', ['-a', 'Terminal', resolved], { stdio: 'ignore', detached: true }).unref();
+      sendJson(res, 200, { ok: true, cwd: resolved });
+    } catch (err) {
+      log('open-terminal error:', err.message);
       sendJson(res, 400, { error: err.message });
     }
     return;
