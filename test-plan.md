@@ -1,0 +1,176 @@
+# iPhone 验收测试清单（QA2）
+
+> 切到 fork hub 后，验证 iOS Safari/Chrome 后台→前台的连接恢复 + Claude Code 状态保留。
+
+---
+
+## 0. 前置 / 一次性
+
+- 电脑 Mac 上确认 hub 运行的是 fork：
+  ```sh
+  ps aux | grep "cli.js" | grep -v grep
+  # 应该看到: /opt/homebrew/bin/node /Users/dayuer/Projects/cc-viewer/cli.js --d --no-open
+  ```
+- 验证 PA1 PID 锁文件：
+  ```sh
+  cat ~/.claude/cc-viewer/runtime/hub.pid     # 应该等于上面 ps 看到的 PID
+  ```
+- 实时监控 hub 健康度（另起一个终端窗口，整个测试期间挂着）：
+  ```sh
+  while true; do clear; date; curl -s http://127.0.0.1:7100/healthz | python3 -m json.tool; sleep 2; done
+  ```
+- iPhone Safari 和 iPhone Chrome 各打开一遍：`https://ccv.xiaoyuervae.cn:9990/launcher`
+- 应该自动登录（pairing session 已持久化），如需重新配对走一次 6 位码流程
+- 想看详细前端日志：在 iPhone Chrome DevTools（或电脑 Safari 远程调试）console 里：
+  ```js
+  window.__CCV_TRANSPORT_DEBUG__ = true
+  ```
+  之后会看到 `[resilient]` 前缀的 SSE/WS 重连诊断
+
+---
+
+## 1. 后台 30s 恢复（核心场景）
+
+**目的**：验证 iOS 后台杀连接 → 前台触发自动重连，不丢 Claude Code 状态。
+
+### 1.A — 在 iPhone Safari 测 cc-viewer Console
+
+| 步骤 | 期望 |
+|---|---|
+| 在 launcher 主页点 Console（绿/蓝色之一）打开某个 ccv 实例 | 进入 cc-viewer 主界面，能看到当前 Claude Code 会话 |
+| 切到桌面/锁屏，等 ~60 秒 | iOS 在后台 ~30s 内会切断 SSE/WS（NSURLSession 行为） |
+| 切回 Safari，看 cc-viewer 标签页 | 1-2 秒内自动恢复，能看到聊天/终端最新输出（PB1 + PB2 的 ring buffer 回放） |
+| Console 里发一句新输入（如 `echo POST_RESUME`）| Claude 端能正常收到，输出实时回流 |
+| 桌面 Mac 那边看 `/healthz` | `wsCount` 短暂减为 0 → 恢复为 ≥1；`orphanCount` 短暂出现非零数 → 恢复为 0 |
+
+### 1.B — 在 iPhone Chrome 测同上
+
+复测 1.A 全流程。Chrome 在 iOS 也走 WKWebView，行为应一致。
+
+### 1.C — 测 launcher /ws/shell（绿色 Shell 按钮）
+
+| 步骤 | 期望 |
+|---|---|
+| launcher 主页点 Shell 按钮，开一个 zsh | 看到 prompt，可以输入 |
+| 输入 `echo PB3_BEFORE_BG && pwd` 看到回显 | OK |
+| 切桌面 ~60s | — |
+| 回到 Safari/Chrome | 终端浮层顶栏可能闪一下「reconnected」；但屏幕**已存在的输出保留**（不像之前是空白） |
+| 输入 `echo PB3_AFTER_BG` | 看到 _AFTER_BG，且 prompt 仍然在原 cwd（PB3 PtySessionManager 'owned' 模式 reattach 成功） |
+| 看 `/healthz` | `ptyCount` 不减、`wsCount` 短暂减为 0→恢复（说明 PTY 没死，只是 WS 重连） |
+
+---
+
+## 2. 长时间后台 + 5min 边界
+
+**目的**：确认 5min PTY orphan TTL 边界行为。
+
+### 2.A — 后台 4min（应 reattach 成功）
+
+| 步骤 | 期望 |
+|---|---|
+| 起一个 Shell，`cd /tmp && echo INSIDE_TMP > /tmp/pb3_marker` | OK |
+| 锁屏 4 分钟（一定要锁屏不止切桌面，触发更激进的 NSURLSession 终止）| — |
+| 回到 Safari | reconnect，`pwd` 还在 `/tmp`，`ls /tmp/pb3_marker` 存在 |
+
+### 2.B — 后台 6min（应 fresh shell + 提示）
+
+| 步骤 | 期望 |
+|---|---|
+| 同样起 Shell `cd /tmp` | — |
+| 锁屏 ≥6 分钟 | hub 端 5min orphan TTL 触发 → SIGTERM→SIGKILL → PTY 真死 |
+| 回到 Safari | 拿一个**全新**的 zsh，`pwd` 是 home（cwd 默认），看不到刚刚的 marker |
+| 客户端 banner 应明确告知是新 shell（如果有），或至少 prompt 立刻可见 | — |
+| `/healthz` | `orphanCount` 在 5min 后归 0 |
+
+---
+
+## 3. 多 client 共享（验证 cc-viewer 共享 PTY 模型未坏）
+
+**目的**：iPhone + 电脑同时打开同一个 ccv 实例，看共享是否仍然工作。
+
+| 步骤 | 期望 |
+|---|---|
+| 电脑浏览器和 iPhone Safari 都打开同一个 ccv 实例（同一个 cwd）| 两边都能看 Claude Code 当前 session |
+| 在电脑端发一句 prompt | iPhone 端实时看到（SSE 推送） |
+| 在 iPhone 后台 60s 后回前台 | iPhone 自动重连，看到电脑端期间发的所有内容（PB2 ring buffer 回放） |
+| 电脑端连接全程不断 | 电脑端 readyState 始终 OPEN，无任何异常 |
+
+---
+
+## 4. 轮询节流（PA4）
+
+**目的**：验证后台时不发轮询请求，省电省流量。
+
+桌面端测（手机不容易看 DevTools）：
+| 步骤 | 期望 |
+|---|---|
+| 打开 `https://ccv.xiaoyuervae.cn:9990/launcher` | — |
+| Chrome DevTools → Network → 勾上 Preserve log | — |
+| 观察 30 秒，看到周期性的 `/api/launcher/list`（30s）和 `/api/launcher/pair-list`（5s）| OK |
+| Chrome DevTools → 三点 → More tools → Application → Background services → freeze 这个 tab | — |
+| 观察 30s | 0 个 fetch（因为页面被 freeze） |
+| Unfreeze | 立即 fire 一次 list + pair-list（page-visibility resume hook） |
+
+---
+
+## 5. 多次反复后台 → 前台（无累积内存/listener 泄漏）
+
+**目的**：5+ 次循环不会越用越卡。
+
+| 步骤 | 期望 |
+|---|---|
+| 起 Console + Shell，分别在两个 tab | — |
+| 后台 30s → 前台，重复 5 次以上 | 每次 reconnect 应该都 1-2s 完成；不应越来越慢 |
+| 5 次后看 `/healthz` | `wsCount` 等于当前 active client 数（应该是 2），`orphanCount` 0 |
+| Chrome DevTools → Performance Monitor | JS Heap 不应持续增长（PB3 已验证 5-cycle 无 listener 泄漏，桌面端类比应一致） |
+
+---
+
+## 6. xterm 移动端配置（视觉感受）
+
+**目的**：移动端 scrollback 减小、字体改系统 mono，是否生效 + 体验改善。
+
+| 检查 | 期望 |
+|---|---|
+| iPhone 上看 Console 字体 | 应该是 `ui-monospace`（系统 mono），不是 NerdFont 风格 |
+| 长时间用，往上滚 | 滚到 ~500 行就到顶（之前 1000 行）；iPad 仍 3000；iOS 仅 200 |
+| 内存压力 | iPhone safari 后台被踢回的概率应明显降低 |
+
+---
+
+## 7. 验收门槛
+
+**全部通过即合格**：
+
+- [ ] 1.A / 1.B / 1.C 三个 60s 后台→前台测试，三处都自动恢复且无数据丢失
+- [ ] 2.A 4min 后台 reattach 成功，2.B 6min 后台 fresh shell 符合预期
+- [ ] 3 多 client 共享不坏（cc-viewer 共享 PTY 模型保留）
+- [ ] 4 轮询在隐藏时为 0 请求，可见时立即恢复
+- [ ] 5 多轮循环不累积内存/连接
+- [ ] 6 移动端字体/scrollback 生效
+
+**任一不过 → DM team-lead，注明：iPhone 型号、iOS 版本、Safari/Chrome 版本、`/healthz` 输出、DevTools console 中所有 `[resilient]` 行**。
+
+---
+
+## 8. 回滚
+
+如果发现严重问题，回滚到 npm 版 cc-viewer：
+
+```sh
+launchctl bootout gui/$(id -u)/com.dayuer.ccv-hub
+# 改回 plist：
+#   ProgramArguments[1]: /Users/dayuer/Projects/cc-viewer/cli.js → /opt/homebrew/bin/ccv
+#   WorkingDirectory:    /Users/dayuer/Projects/cc-viewer       → /Users/dayuer
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dayuer.ccv-hub.plist
+```
+
+注意：fork 的 launcher plugin 修改是 symlink，不会随 hub 回滚自动失效；如果想完全回到 PA-PB-PC 之前的状态，需要 `git checkout` 到 ccv-launcher repo 的旧 commit。完整回滚到本次工作之前：
+
+```sh
+cd ~/Projects/ccv-launcher
+git checkout 2b7919c  # PA3 之前的最后一个 commit
+launchctl kickstart -k gui/$(id -u)/com.dayuer.ccv-hub
+```
+
+> 不建议这么做 —— 这会丢掉 pairing auth 持久化、xterm 移动端配置、健康端点等等。先从子集回滚（比如只回滚 PB3）再说。
