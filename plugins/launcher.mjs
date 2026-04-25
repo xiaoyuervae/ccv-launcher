@@ -879,6 +879,10 @@ function installShellWebSocket(httpServer) {
       return;
     }
 
+    // Heartbeat: detect half-open connections (e.g. iOS Safari background suspends)
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
     ws.send(JSON.stringify({ type: 'state', running: true, cwd }));
 
     proc.onData((data) => {
@@ -899,7 +903,24 @@ function installShellWebSocket(httpServer) {
     ws.on('close', () => { try { proc.kill(); } catch { /* already dead */ } });
   });
 
-  log('/ws/shell WebSocket endpoint ready (node-pty)');
+  // Server-side heartbeat: ping every 25s, terminate sockets that miss a pong.
+  // Idle TCP connections through NAT/proxies (and iOS background suspension)
+  // can leave half-open sockets that never fire 'close' — this reaps them so
+  // the associated PTY is killed deterministically.
+  const HEARTBEAT_INTERVAL_MS = 25_000;
+  const heartbeatTimer = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (ws.isAlive === false) {
+        try { ws.terminate(); } catch { /* already dead */ }
+        continue;
+      }
+      ws.isAlive = false;
+      try { ws.ping(); } catch { /* socket gone, next tick will terminate */ }
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+  wss.on('close', () => clearInterval(heartbeatTimer));
+
+  log('/ws/shell WebSocket endpoint ready (node-pty, heartbeat 25s)');
 }
 
 export default {
