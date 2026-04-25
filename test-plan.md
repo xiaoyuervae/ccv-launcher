@@ -1,6 +1,8 @@
-# iPhone 验收测试清单（QA2）
+# iPhone 验收测试清单（QA2 + 移动加载优化）
 
-> 切到 fork hub 后，验证 iOS Safari/Chrome 后台→前台的连接恢复 + Claude Code 状态保留。
+> 切到 fork hub 后，验证 iOS Safari/Chrome 后台→前台的连接恢复 + Claude Code 状态保留 + 移动端首屏加载优化。
+>
+> **更新（2026-04-26 M1+M2）**：补了 SSE `Last-Event-ID` 重放 + 移动端首屏限制 50 条。原 1.A/1.B/1.C 用例**应该再也不丢消息**了；6 节加了移动加载验证。
 
 ---
 
@@ -138,6 +140,29 @@
 
 ---
 
+## 6.5 移动端首屏加载 + Last-Event-ID 重连（M1+M2）
+
+**目的**：验证 iPhone 首屏只拉 50 条历史（不是 200）+ 后台→前台不重发整段历史。
+
+| 步骤 | 期望 |
+|---|---|
+| 在 iPhone Safari 打开某个 ccv 实例（**清掉 cache/localStorage 后**冷启动）| 进入聊天界面 |
+| Mac 上 Charles / Wireshark / 本机 `tail -f stdout.log` 看请求；或者 chrome 远程调试 iPhone | 应该看到 `GET /events?limit=50&...`（不是 200） |
+| 顶部出现「加载更多历史」按钮（`hasMoreHistory: true`）| 点一下，往前补 100 条 |
+| 切桌面 60s，回前台 | 浏览器自动重连 SSE 时**应携带 `Last-Event-ID: <数字>` request header**（chrome devtools 远程调试可见） |
+| 服务端响应**不应**以 `event: load_start` 开头 | 应该直接是 `id: <更大的 seq>` 数据帧（仅回放间隔期间的事件） |
+| 极端情况：后台 30+ 分钟，事件量 >500 | 服务端发 `event: state_lost` → 前端做完整 reload（这是预期降级）|
+
+**桌面端验证（更直观）**：
+1. Chrome DevTools → Network → 筛选 `events` → 看 URL：iPhone UA 应该是 `?limit=50`，桌面 UA 是 `?limit=200`（保持原样）
+2. 主动断 SSE：在 Network 列里右键那条 events 流 → Block request URL → Unblock → 重连
+3. 看新连接的 Request Headers：应有 `Last-Event-ID: <num>`
+4. 看 Response 流：第一个 chunk 应是 `id: <num+1>` 而不是 `event: load_start`
+
+> 如果你在 iPhone 上的 console 开了 `__CCV_TRANSPORT_DEBUG__ = true`，会看到 `[resilient] resume after Xms hidden, reconnecting N instances` 日志，那就是 PB1 触发了 close+redial，紧接着的 SSE 重连会自动带 Last-Event-ID。
+
+---
+
 ## 7. 验收门槛
 
 **全部通过即合格**：
@@ -148,6 +173,7 @@
 - [ ] 4 轮询在隐藏时为 0 请求，可见时立即恢复
 - [ ] 5 多轮循环不累积内存/连接
 - [ ] 6 移动端字体/scrollback 生效
+- [ ] 6.5 iPhone 首屏 SSE URL 带 `?limit=50`，重连带 `Last-Event-ID`，无 `load_start` 重发
 
 **任一不过 → DM team-lead，注明：iPhone 型号、iOS 版本、Safari/Chrome 版本、`/healthz` 输出、DevTools console 中所有 `[resilient]` 行**。
 
