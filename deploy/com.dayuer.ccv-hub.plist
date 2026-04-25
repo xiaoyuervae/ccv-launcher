@@ -8,13 +8,13 @@
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/node</string>
-        <string>/opt/homebrew/bin/ccv</string>
+        <string>/Users/dayuer/Projects/cc-viewer/cli.js</string>
         <string>--d</string>
         <string>--no-open</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/dayuer</string>
+    <string>/Users/dayuer/Projects/cc-viewer</string>
 
     <key>EnvironmentVariables</key>
     <dict>
