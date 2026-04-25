@@ -223,6 +223,9 @@ const HTML_PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ccv launcher</title>
 <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
 <style>
   :root { --bg:#0f1115; --fg:#e6e8ec; --mute:#9aa3ad; --line:#1c2129; --card:#161a22; --accent:#6ea8fe; --ok:#34d399; --warn:#fbbf24; --bad:#f87171; }
   * { box-sizing: border-box; }
@@ -266,6 +269,15 @@ const HTML_PAGE = `<!doctype html>
   .err { color:var(--bad); font-size:12px; margin-top:6px; }
   .empty { color:var(--mute); text-align:center; padding:60px 20px; font-size:13px; }
   footer { padding:12px 20px; border-top:1px solid var(--line); color:var(--mute); font-size:11px; text-align:center; }
+  #term-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:100; }
+  #term-overlay.open { display:flex; flex-direction:column; }
+  #term-bar { display:flex; align-items:center; gap:10px; padding:8px 16px; background:var(--card); border-bottom:1px solid var(--line); }
+  #term-bar .name { font-weight:600; font-size:13px; }
+  #term-bar .path { color:var(--mute); font-size:11px; font-family:ui-monospace,monospace; }
+  #term-bar .grow { flex:1; }
+  #term-bar button { background:transparent; color:var(--fg); border:1px solid var(--line); padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px; }
+  #term-bar button:hover { border-color:var(--bad); color:var(--bad); }
+  #term-container { flex:1; overflow:hidden; }
 </style>
 </head>
 <body>
@@ -277,6 +289,16 @@ const HTML_PAGE = `<!doctype html>
 </header>
 <main id="list"><div class="empty">loading instances…</div></main>
 <footer>ccv launcher · plugin: <code>launcher.mjs</code></footer>
+
+<div id="term-overlay">
+  <div id="term-bar">
+    <span class="name" id="term-name"></span>
+    <span class="path" id="term-path"></span>
+    <span class="grow"></span>
+    <button id="term-close">Close terminal</button>
+  </div>
+  <div id="term-container"></div>
+</div>
 
 <dialog id="dlg">
   <h2>Launch a new ccv instance</h2>
@@ -340,6 +362,9 @@ const HTML_PAGE = `<!doctype html>
       const stopBtn = it.isHub
         ? ''
         : '<button class="danger" data-act="stop" data-pid="'+it.pid+'" data-name="'+name+'">Stop</button>';
+      const termBtn = it.isHub
+        ? ''
+        : '<button data-act="terminal" data-port="'+(it.port||'')+'" data-token="'+(it.token||'')+'" data-name="'+name+'" data-path="'+path+'" data-pub="'+(it.publicUrl||'')+'" data-lan="'+(it.lanUrl||'')+'">Terminal</button>';
       const openHref = pub || lan || '#';
       return ''
         + '<div class="'+cls+'" data-pid="'+it.pid+'">'
@@ -357,6 +382,7 @@ const HTML_PAGE = `<!doctype html>
         +   '<div class="actions">'
         +     '<button data-act="open" data-href="'+escape(openHref)+'">Open</button>'
         +     '<button data-act="copy" data-text="'+(pub||lan)+'">Copy URL</button>'
+        +     termBtn
         +     stopBtn
         +   '</div>'
         + '</div>';
@@ -410,7 +436,95 @@ const HTML_PAGE = `<!doctype html>
       if (!confirm('Remove this project from history?')) return;
       try { await api('/api/launcher/forget', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ wsId: t.dataset.wsid }) }); refresh(); }
       catch (e) { alert('Forget failed: ' + e.message); }
+    } else if (act === 'terminal') {
+      openTerminal(t.dataset.port, t.dataset.token, t.dataset.name, t.dataset.path, t.dataset.pub, t.dataset.lan);
     }
+  });
+
+  // ---- Terminal ----
+  let _term = null, _termWs = null;
+  const termOverlay = document.getElementById('term-overlay');
+  const termContainer = document.getElementById('term-container');
+  const termName = document.getElementById('term-name');
+  const termPath = document.getElementById('term-path');
+  document.getElementById('term-close').addEventListener('click', closeTerminal);
+
+  function openTerminal(port, token, name, path, pubUrl, lanUrl) {
+    closeTerminal();
+    termName.textContent = name || ':' + port;
+    termPath.textContent = path || '';
+    termOverlay.classList.add('open');
+
+    _term = new Terminal({ cursorBlink: true, fontSize: 14, theme: { background: '#0f1115', foreground: '#e6e8ec', cursor: '#6ea8fe' } });
+    const fitAddon = new FitAddon.FitAddon();
+    _term.loadAddon(fitAddon);
+    _term.open(termContainer);
+    fitAddon.fit();
+
+    // Build WS URL: prefer same-origin relative path if port matches hub, otherwise cross-origin to child
+    let wsUrl;
+    const loc = window.location;
+    if (pubUrl) {
+      // public: wss://ccv-<port>.xiaoyuervae.cn:9990/ws/terminal
+      try {
+        const u = new URL(pubUrl);
+        wsUrl = (u.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + u.host + '/ws/terminal';
+      } catch { /* fallback below */ }
+    }
+    if (!wsUrl && lanUrl) {
+      try {
+        const u = new URL(lanUrl);
+        wsUrl = 'ws://' + u.host + '/ws/terminal';
+      } catch { /* fallback below */ }
+    }
+    if (!wsUrl) {
+      wsUrl = (loc.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + loc.hostname + ':' + port + '/ws/terminal';
+    }
+
+    _term.writeln('\\x1b[90mConnecting to ' + wsUrl + '...\\x1b[0m');
+    _termWs = new WebSocket(wsUrl);
+    _termWs.onopen = () => {
+      _term.writeln('\\x1b[32mConnected.\\x1b[0m Press Enter to get a prompt.');
+      _termWs.send(JSON.stringify({ type: 'resize', cols: _term.cols, rows: _term.rows }));
+    };
+    _termWs.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'data' && msg.data) _term.write(msg.data);
+        else if (msg.type === 'exit') _term.writeln('\\r\\n\\x1b[33m[process exited: ' + (msg.exitCode ?? '?') + ']\\x1b[0m');
+        else if (msg.type === 'state' && !msg.running) _term.writeln('\\x1b[90m[no active process — type to spawn shell]\\x1b[0m');
+      } catch { _term.write(ev.data); }
+    };
+    _termWs.onerror = () => _term.writeln('\\r\\n\\x1b[31mWebSocket error\\x1b[0m');
+    _termWs.onclose = () => _term.writeln('\\r\\n\\x1b[90m[disconnected]\\x1b[0m');
+
+    _term.onData((data) => {
+      if (_termWs && _termWs.readyState === 1) {
+        _termWs.send(JSON.stringify({ type: 'input', data }));
+      }
+    });
+    _term.onResize(({ cols, rows }) => {
+      if (_termWs && _termWs.readyState === 1) {
+        _termWs.send(JSON.stringify({ type: 'resize', cols, rows }));
+      }
+    });
+
+    const ro = new ResizeObserver(() => { try { fitAddon.fit(); } catch {} });
+    ro.observe(termContainer);
+    termOverlay._ro = ro;
+  }
+
+  function closeTerminal() {
+    termOverlay.classList.remove('open');
+    if (_termWs) { try { _termWs.close(); } catch {} _termWs = null; }
+    if (_term) { _term.dispose(); _term = null; }
+    if (termOverlay._ro) { termOverlay._ro.disconnect(); termOverlay._ro = null; }
+    termContainer.innerHTML = '';
+  }
+
+  // ESC closes terminal overlay
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && termOverlay.classList.contains('open')) closeTerminal();
   });
 
   async function refresh() {
