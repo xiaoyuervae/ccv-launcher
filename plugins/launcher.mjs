@@ -15,6 +15,8 @@ import { join, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { getWorkspaces, removeWorkspace } from '/opt/homebrew/lib/node_modules/cc-viewer/workspace-registry.js';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
 
 const PREFIX = '[ccv-launcher]';
 const HUB_ENABLED = process.env.CCV_HUB === '1';
@@ -441,8 +443,7 @@ const HTML_PAGE = `<!doctype html>
     } else if (act === 'terminal') {
       openTerminal(t.dataset.port, t.dataset.token, t.dataset.name, t.dataset.path, t.dataset.pub, t.dataset.lan);
     } else if (act === 'openterm') {
-      try { await api('/api/launcher/open-terminal', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd: t.dataset.cwd }) }); }
-      catch (e) { alert('Open Terminal failed: ' + e.message); }
+      openShell(t.dataset.cwd, t.dataset.name || t.dataset.cwd);
     }
   });
 
@@ -512,6 +513,50 @@ const HTML_PAGE = `<!doctype html>
       if (_termWs && _termWs.readyState === 1) {
         _termWs.send(JSON.stringify({ type: 'resize', cols, rows }));
       }
+    });
+
+    const ro = new ResizeObserver(() => { try { fitAddon.fit(); } catch {} });
+    ro.observe(termContainer);
+    termOverlay._ro = ro;
+  }
+
+  function openShell(cwd, name) {
+    closeTerminal();
+    termName.textContent = name || cwd;
+    termPath.textContent = cwd || '';
+    termOverlay.classList.add('open');
+
+    _term = new Terminal({ cursorBlink: true, fontSize: 14, theme: { background: '#0f1115', foreground: '#e6e8ec', cursor: '#6ea8fe' } });
+    const fitAddon = new FitAddon.FitAddon();
+    _term.loadAddon(fitAddon);
+    _term.open(termContainer);
+    fitAddon.fit();
+
+    // Connect to hub's own /ws/shell endpoint (same origin)
+    const loc = window.location;
+    const wsProto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = wsProto + '//' + loc.host + '/ws/shell?cwd=' + encodeURIComponent(cwd);
+
+    _term.writeln('\\x1b[90m$ cd ' + cwd + '\\x1b[0m');
+    _termWs = new WebSocket(wsUrl);
+    _termWs.onopen = () => {
+      _termWs.send(JSON.stringify({ type: 'resize', cols: _term.cols, rows: _term.rows }));
+    };
+    _termWs.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'data' && msg.data) _term.write(msg.data);
+        else if (msg.type === 'exit') _term.writeln('\\r\\n\\x1b[33m[shell exited: ' + (msg.exitCode ?? '?') + ']\\x1b[0m');
+      } catch { _term.write(ev.data); }
+    };
+    _termWs.onerror = () => _term.writeln('\\r\\n\\x1b[31mWebSocket error\\x1b[0m');
+    _termWs.onclose = () => _term.writeln('\\r\\n\\x1b[90m[disconnected]\\x1b[0m');
+
+    _term.onData((data) => {
+      if (_termWs && _termWs.readyState === 1) _termWs.send(JSON.stringify({ type: 'input', data }));
+    });
+    _term.onResize(({ cols, rows }) => {
+      if (_termWs && _termWs.readyState === 1) _termWs.send(JSON.stringify({ type: 'resize', cols, rows }));
     });
 
     const ro = new ResizeObserver(() => { try { fitAddon.fit(); } catch {} });
@@ -786,6 +831,77 @@ function installRequestMultiplexer(httpServer, ccvProtocol) {
   });
 }
 
+// ---- /ws/shell WebSocket: spawn independent zsh in a given cwd ----
+function installShellWebSocket(httpServer) {
+  let pty;
+  try {
+    pty = require('/opt/homebrew/lib/node_modules/cc-viewer/node_modules/node-pty');
+  } catch (err) {
+    log('node-pty not available, /ws/shell disabled:', err.message);
+    return;
+  }
+  const { WebSocketServer } = require('/opt/homebrew/lib/node_modules/cc-viewer/node_modules/ws');
+  const wss = new WebSocketServer({ noServer: true });
+
+  // Intercept upgrade before ccv's own /ws/terminal handler
+  const existingUpgradeListeners = httpServer.listeners('upgrade');
+  httpServer.removeAllListeners('upgrade');
+
+  httpServer.on('upgrade', (req, socket, head) => {
+    const parsed = new URL(req.url, 'http://localhost');
+    if (parsed.pathname === '/ws/shell') {
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+      return;
+    }
+    // delegate to ccv's original upgrade handlers (/ws/terminal etc.)
+    for (const fn of existingUpgradeListeners) fn.call(httpServer, req, socket, head);
+  });
+
+  wss.on('connection', (ws, req) => {
+    const parsed = new URL(req.url, 'http://localhost');
+    let cwd = parsed.searchParams.get('cwd') || homedir();
+    try { cwd = realpathSync(cwd); } catch { /* keep as-is */ }
+    if (!existsSync(cwd)) cwd = homedir();
+
+    const shell = process.env.SHELL || '/bin/zsh';
+    let proc;
+    try {
+      proc = pty.spawn(shell, [], {
+        name: 'xterm-256color',
+        cols: 120,
+        rows: 30,
+        cwd,
+        env: { ...process.env, HOME: homedir() },
+      });
+    } catch (err) {
+      ws.send(JSON.stringify({ type: 'data', data: `\\x1b[31mFailed to spawn shell: ${err.message}\\x1b[0m\\r\\n` }));
+      ws.close();
+      return;
+    }
+
+    ws.send(JSON.stringify({ type: 'state', running: true, cwd }));
+
+    proc.onData((data) => {
+      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'data', data }));
+    });
+    proc.onExit(({ exitCode }) => {
+      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'exit', exitCode }));
+      ws.close();
+    });
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === 'input' && msg.data) proc.write(msg.data);
+        else if (msg.type === 'resize' && msg.cols && msg.rows) proc.resize(msg.cols, msg.rows);
+      } catch { /* ignore malformed */ }
+    });
+    ws.on('close', () => { try { proc.kill(); } catch { /* already dead */ } });
+  });
+
+  log('/ws/shell WebSocket endpoint ready (node-pty)');
+}
+
 export default {
   name: 'launcher',
   hooks: {
@@ -799,6 +915,7 @@ export default {
         startWatcher();
         if (ctx?.httpServer) {
           installRequestMultiplexer(ctx.httpServer, ctx.protocol);
+          installShellWebSocket(ctx.httpServer);
         } else {
           log('serverStarted: no httpServer in ctx, launcher routes will not work');
         }
