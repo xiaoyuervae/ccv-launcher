@@ -16,6 +16,10 @@ import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { getWorkspaces, removeWorkspace } from '/opt/homebrew/lib/node_modules/cc-viewer/workspace-registry.js';
+// PB2 module — resumable PTY sessions. Lives only in the fork today (npm
+// build is older). Once P0.3 switches launchd to the fork the parent dir is
+// the same; the absolute path here keeps working either way.
+import { PtySessionManager } from '/Users/dayuer/Projects/cc-viewer/lib/pty-session-manager.js';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 
@@ -135,12 +139,29 @@ function jlog(event, fields = {}) {
 // Cap concurrent /ws/shell sessions per process. Each PTY holds a zsh + node
 // listeners; on a public hub we want a hard ceiling so a runaway client (or
 // pathological reconnect storm) can't exhaust file descriptors / RAM.
+// SHELL_PTY_CAP is now a soft pre-check before the manager spawns; the
+// manager itself enforces MAX_PTY_TOTAL=10 (and 3/subject) authoritatively.
+// We keep this as an early-reject so a caller saturating the cap gets a
+// 1013 close before allocating ws+pty bookkeeping.
 const SHELL_PTY_CAP = parseInt(process.env.CCV_SHELL_PTY_CAP || '8', 10);
-let _shellPtyCount = 0;
 // Reference to the /ws/shell WebSocketServer once installed; null until then.
 // Used by /healthz to report `wsCount = wss.clients.size`. Kept at module
 // scope (not closed-over) so the route handler can read it without plumbing.
 let _shellWss = null;
+// PtySessionManager singleton (PB3). Constructed lazily inside
+// installShellWebSocket so node-pty/ws resolution failures are isolated to
+// /ws/shell setup, not the whole plugin.
+let _ptyManager = null;
+
+// Stable subject id for PtySessionManager. Public requests carry the HMAC
+// session cookie (one per paired device → per-device sessions). LAN requests
+// have no cookie; we fall back to `lan:<ip>` so two devices on the same LAN
+// don't share each other's session pool.
+function subjectIdFor(req) {
+  const cookies = parseCookies(req.headers.cookie);
+  if (cookies.ccv_session) return 'sess:' + cookies.ccv_session;
+  return 'lan:' + (getClientIp(req) || 'unknown');
+}
 
 function safeJson(filePath) {
   try { return JSON.parse(readFileSync(filePath, 'utf-8')); } catch { return null; }
@@ -827,10 +848,17 @@ const HTML_PAGE = `<!doctype html>
     _term.open(termContainer);
     fitAddon.fit();
 
-    // Connect to hub's own /ws/shell endpoint (same origin)
+    // Connect to hub's own /ws/shell endpoint (same origin). If we have a
+    // resumable sessionId from a previous /ws/shell connection (PB3), pass
+    // it so the server replays buffered output and reattaches to the live
+    // PTY instead of spawning a fresh one. sessionStorage (not localStorage)
+    // because the resume is meaningful only within the same tab lifetime —
+    // a new tab gets a fresh shell.
     const loc = window.location;
     const wsProto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = wsProto + '//' + loc.host + '/ws/shell?cwd=' + encodeURIComponent(cwd);
+    const storedSid = (() => { try { return sessionStorage.getItem('ccvShellSessionId'); } catch { return null; } })();
+    const sidParam = storedSid ? '&sessionId=' + encodeURIComponent(storedSid) : '';
+    const wsUrl = wsProto + '//' + loc.host + '/ws/shell?cwd=' + encodeURIComponent(cwd) + sidParam;
 
     _term.writeln('\\x1b[90m$ cd ' + cwd + '\\x1b[0m');
     _termWs = new WebSocket(wsUrl);
@@ -840,8 +868,20 @@ const HTML_PAGE = `<!doctype html>
     _termWs.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
-        if (msg.type === 'data' && msg.data) _term.write(msg.data);
-        else if (msg.type === 'exit') _term.writeln('\\r\\n\\x1b[33m[shell exited: ' + (msg.exitCode ?? '?') + ']\\x1b[0m');
+        if (msg.type === 'hello' && msg.sessionId) {
+          // Server rotates sessionId on every successful (re)attach; persist
+          // immediately so a quick disconnect+reconnect picks it up.
+          try { sessionStorage.setItem('ccvShellSessionId', msg.sessionId); } catch {}
+          if (msg.isReattach) _term.writeln('\\x1b[32m[reattached to existing shell]\\x1b[0m');
+        }
+        else if (msg.type === 'data' && msg.data) _term.write(msg.data);
+        else if (msg.type === 'exit') {
+          _term.writeln('\\r\\n\\x1b[33m[shell exited: ' + (msg.exitCode ?? '?') + ']\\x1b[0m');
+          // Shell ended for real (not a network drop) — drop the stored id
+          // so the next openShell starts fresh instead of trying to resume
+          // a dead session.
+          try { sessionStorage.removeItem('ccvShellSessionId'); } catch {}
+        }
       } catch { _term.write(ev.data); }
     };
     _termWs.onerror = () => _term.writeln('\\r\\n\\x1b[31mWebSocket error\\x1b[0m');
@@ -866,6 +906,10 @@ const HTML_PAGE = `<!doctype html>
     if (_term) { _term.dispose(); _term = null; }
     if (termOverlay._ro) { termOverlay._ro.disconnect(); termOverlay._ro = null; }
     termContainer.innerHTML = '';
+    // Explicit close = user dismissed; don't try to resume on next open.
+    // Server-side: ws.close fires markOrphan with a 5min TTL, so the PTY
+    // sticks around briefly — that's fine, it'll be reaped.
+    try { sessionStorage.removeItem('ccvShellSessionId'); } catch {}
   }
 
   // ESC closes terminal overlay
@@ -1036,11 +1080,14 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
   // close races).
   if (url === '/healthz' && method === 'GET') {
     const wsCount = _shellWss ? _shellWss.clients.size : 0;
-    const orphanCount = Math.max(0, _shellPtyCount - wsCount);
+    const ptyCount = _ptyManager ? _ptyManager._stats().sessions : 0;
+    // Manager sessions whose ws went away are "orphaned" until the TTL
+    // expires; on the wire this looks like ptyCount > wsCount.
+    const orphanCount = Math.max(0, ptyCount - wsCount);
     sendJson(res, 200, {
       ok: true,
       uptimeSec: Math.round(process.uptime()),
-      ptyCount: _shellPtyCount,
+      ptyCount,
       ptyCap: SHELL_PTY_CAP,
       wsCount,
       orphanCount,
@@ -1338,6 +1385,35 @@ function installShellWebSocket(httpServer) {
   const wss = new WebSocketServer({ noServer: true });
   _shellWss = wss;
 
+  // Spawner the manager invokes for fresh sessions. The manager hooks
+  // pty.onData itself (to feed the ring buffer), so we don't.
+  _ptyManager = new PtySessionManager({
+    spawner: ({ subjectId, ip }) => {
+      const shell = process.env.SHELL || '/bin/zsh';
+      const cwd = _pendingCwd || homedir();
+      _pendingCwd = null;
+      const proc = pty.spawn(shell, [], {
+        name: 'xterm-256color',
+        cols: 120,
+        rows: 30,
+        cwd,
+        env: { ...process.env, HOME: homedir() },
+      });
+      jlog('ws-shell-spawn', { pid: proc.pid, cwd, subjectId, ip });
+      return proc;
+    },
+    onOrphanExpire: (s) => {
+      jlog('ws-shell-orphan-expired', { subjectId: s.subjectId });
+    },
+  });
+
+  // The spawner closure has no access to the per-connection cwd, so we
+  // smuggle it through this module-local. createOrAttachSession runs the
+  // spawner synchronously inside its own call, so a single var is enough as
+  // long as we don't re-enter — which we don't because the upgrade handler
+  // is the only caller.
+  let _pendingCwd = null;
+
   // Intercept upgrade before ccv's own /ws/terminal handler
   const existingUpgradeListeners = httpServer.listeners('upgrade');
   httpServer.removeAllListeners('upgrade');
@@ -1363,52 +1439,91 @@ function installShellWebSocket(httpServer) {
     let cwd = parsed.searchParams.get('cwd') || homedir();
     try { cwd = realpathSync(cwd); } catch { /* keep as-is */ }
     if (!existsSync(cwd)) cwd = homedir();
+    const reqSessionId = parsed.searchParams.get('sessionId') || null;
+    const subjectId = subjectIdFor(req);
+    const ip = getClientIp(req);
+    const ua = req.headers['user-agent'] || '';
 
-    if (_shellPtyCount >= SHELL_PTY_CAP) {
-      jlog('ws-shell-cap-hit', { cap: SHELL_PTY_CAP, current: _shellPtyCount, ip: getClientIp(req) });
+    // Soft pre-check before allocating a manager session. The manager will
+    // also reject (throw) at MAX_PTY_TOTAL=10 — we just want a friendly 1013
+    // before that, and to honor the operator's CCV_SHELL_PTY_CAP override if
+    // they set it lower than 10.
+    const stats = _ptyManager._stats();
+    if (!reqSessionId && stats.sessions >= SHELL_PTY_CAP) {
+      jlog('ws-shell-cap-hit', { cap: SHELL_PTY_CAP, current: stats.sessions, ip });
       try {
         ws.send(JSON.stringify({ type: 'data', data: `\\x1b[31mShell capacity reached (${SHELL_PTY_CAP}). Try again later.\\x1b[0m\\r\\n` }));
       } catch { /* socket may already be gone */ }
-      ws.close(1013, 'capacity'); // 1013 = Try Again Later
+      ws.close(1013, 'capacity');
       return;
     }
 
-    const shell = process.env.SHELL || '/bin/zsh';
-    let proc;
+    // Attempt session attach/create. createOrAttachSession runs the spawner
+    // synchronously when a fresh PTY is needed, so set _pendingCwd first.
+    let attached = null;
     try {
-      proc = pty.spawn(shell, [], {
-        name: 'xterm-256color',
-        cols: 120,
-        rows: 30,
-        cwd,
-        env: { ...process.env, HOME: homedir() },
-      });
+      _pendingCwd = cwd;
+      attached = _ptyManager.createOrAttachSession({ subjectId, ip, ua, sessionId: reqSessionId });
+      _pendingCwd = null;
+      // If the requested sessionId failed validation (mismatched fingerprint
+      // or unknown id), fall back to a fresh session so the user isn't stuck
+      // in a loop. PB1's resilient transport on the client side will store
+      // the new id.
+      if (!attached && reqSessionId) {
+        _pendingCwd = cwd;
+        attached = _ptyManager.createOrAttachSession({ subjectId, ip, ua });
+        _pendingCwd = null;
+      }
     } catch (err) {
-      ws.send(JSON.stringify({ type: 'data', data: `\\x1b[31mFailed to spawn shell: ${err.message}\\x1b[0m\\r\\n` }));
-      ws.close();
+      jlog('ws-shell-attach-error', { subjectId, ip, sessionId: reqSessionId, err: err.message });
+      try {
+        ws.send(JSON.stringify({ type: 'data', data: `\\x1b[31m${err.message}\\x1b[0m\\r\\n` }));
+      } catch { /* socket may already be gone */ }
+      ws.close(1013, err.message);
       return;
     }
-    _shellPtyCount++;
-    let _ptyAccounted = true;
-    const releasePty = () => {
-      if (!_ptyAccounted) return;
-      _ptyAccounted = false;
-      _shellPtyCount = Math.max(0, _shellPtyCount - 1);
-    };
-    jlog('ws-shell-spawn', { pid: proc.pid, cwd, current: _shellPtyCount, cap: SHELL_PTY_CAP });
+    if (!attached) {
+      // Should not happen: with reqSessionId=null the manager either returns
+      // a session or throws.
+      ws.close(1011, 'attach failed');
+      return;
+    }
+    const { sessionId, pty: proc, replayBuffer, isReattach } = attached;
 
     // Heartbeat: detect half-open connections (e.g. iOS Safari background suspends)
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
 
+    // Tell the client which session this is so they can persist it for
+    // reconnect. Always sent first frame so PB1's client can wire it up
+    // before any data flows.
+    try {
+      ws.send(JSON.stringify({ type: 'hello', sessionId, isReattach }));
+    } catch { /* socket may already be gone */ }
     ws.send(JSON.stringify({ type: 'state', running: true, cwd }));
 
-    proc.onData((data) => {
+    // Replay buffered output so the user sees what they missed during the
+    // disconnect. UTF-8 decoding here can in theory split a multi-byte
+    // codepoint at the ring buffer boundary, but xterm tolerates that and
+    // the very next live chunk will resync.
+    if (isReattach && replayBuffer && replayBuffer.length > 0) {
+      try {
+        ws.send(JSON.stringify({ type: 'data', data: replayBuffer.toString('utf8') }));
+      } catch { /* socket may already be gone */ }
+    }
+
+    // Wire pty→ws for live data. The manager already feeds pty.onData into
+    // the ring buffer; these are independent listeners (node-pty allows
+    // multiple subscribers). Capture the disposables so we can detach them
+    // on ws close — otherwise each reattach cycle would leak a closure
+    // bound to the old (closed) ws on the same PTY.
+    const dataDisposable = proc.onData((data) => {
       if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'data', data }));
     });
-    proc.onExit(({ exitCode }) => {
+    const exitDisposable = proc.onExit(({ exitCode }) => {
       if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'exit', exitCode }));
-      releasePty();
+      // The PTY died on its own — drop the manager entry; nothing to resume.
+      _ptyManager._sessions.delete(sessionId);
       ws.close();
     });
 
@@ -1420,8 +1535,12 @@ function installShellWebSocket(httpServer) {
       } catch { /* ignore malformed */ }
     });
     ws.on('close', () => {
-      try { proc.kill(); } catch { /* already dead */ }
-      releasePty();
+      try { dataDisposable?.dispose?.(); } catch {}
+      try { exitDisposable?.dispose?.(); } catch {}
+      // Hand the session to the manager: SIGTERM→10s→SIGKILL after the
+      // 5min orphan TTL if no peer reattaches. killPty:true is mandatory
+      // here — each PTY belongs to exactly one client, no sharing.
+      _ptyManager.markOrphan(sessionId, { killPty: true });
     });
   });
 
