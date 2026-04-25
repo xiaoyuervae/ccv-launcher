@@ -711,6 +711,32 @@ const HTML_PAGE = `<!doctype html>
   // Preload the NerdFont so xterm.js can measure glyphs correctly on first open
   document.fonts.load('14px NerdFont').then(() => { _fontReady = true; }).catch(() => {});
 
+  // Mirrors cc-viewer/src/env.js + TerminalPanel.jsx:243-251 mobile detection.
+  // iPadOS 13+ Safari spoofs Mac UA so we use maxTouchPoints to disambiguate;
+  // smaller scrollback on iOS keeps memory pressure low (Safari kills
+  // backgrounded tabs more aggressively when RAM is tight).
+  const _isIPadOS = navigator.maxTouchPoints > 1 && /Macintosh/i.test(navigator.userAgent);
+  const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent) || _isIPadOS;
+  const isPad = _isIPadOS || /iPad/i.test(navigator.userAgent);
+  const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || _isIPadOS;
+
+  // Shared xterm config — keeps both openConsole (ccv child WS) and openShell
+  // (hub /ws/shell) terminals visually consistent and mobile-friendly.
+  // iOS Safari falls back to a non-monospace font more often when given
+  // exotic fontFamily lists, so on mobile we prefer the system monospace token.
+  function buildTerminalConfig() {
+    return {
+      cursorBlink: true,
+      fontSize: (isMobile && !isPad) ? 11 : 14,
+      fontFamily: isMobile
+        ? 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+        : TERM_FONT,
+      // iOS gets the smallest scrollback — RAM is the binding constraint there.
+      scrollback: isPad ? 3000 : isIOS ? 200 : isMobile ? 500 : 3000,
+      theme: { background: '#0f1115', foreground: '#e6e8ec', cursor: '#6ea8fe' },
+    };
+  }
+
   let _term = null, _termWs = null;
   const termOverlay = document.getElementById('term-overlay');
   const termContainer = document.getElementById('term-container');
@@ -727,7 +753,7 @@ const HTML_PAGE = `<!doctype html>
     termPath.textContent = path || '';
     termOverlay.classList.add('open');
 
-    _term = new Terminal({ cursorBlink: true, fontSize: 14, fontFamily: TERM_FONT, theme: { background: '#0f1115', foreground: '#e6e8ec', cursor: '#6ea8fe' } });
+    _term = new Terminal(buildTerminalConfig());
     const fitAddon = new FitAddon.FitAddon();
     _term.loadAddon(fitAddon);
     _term.open(termContainer);
@@ -784,7 +810,7 @@ const HTML_PAGE = `<!doctype html>
     const ro = new ResizeObserver(() => { try { fitAddon.fit(); } catch {} });
     ro.observe(termContainer);
     termOverlay._ro = ro;
-    if (!_fontReady) document.fonts.ready.then(() => { _fontReady = true; if (_term) { _term.options.fontFamily = TERM_FONT; fitAddon.fit(); } });
+    if (!_fontReady && !isMobile) document.fonts.ready.then(() => { _fontReady = true; if (_term) { _term.options.fontFamily = TERM_FONT; fitAddon.fit(); } });
   }
 
   function openShell(cwd, name) {
@@ -795,7 +821,7 @@ const HTML_PAGE = `<!doctype html>
     termPath.textContent = cwd || '';
     termOverlay.classList.add('open');
 
-    _term = new Terminal({ cursorBlink: true, fontSize: 14, fontFamily: TERM_FONT, theme: { background: '#0f1115', foreground: '#e6e8ec', cursor: '#6ea8fe' } });
+    _term = new Terminal(buildTerminalConfig());
     const fitAddon = new FitAddon.FitAddon();
     _term.loadAddon(fitAddon);
     _term.open(termContainer);
@@ -831,7 +857,7 @@ const HTML_PAGE = `<!doctype html>
     const ro = new ResizeObserver(() => { try { fitAddon.fit(); } catch {} });
     ro.observe(termContainer);
     termOverlay._ro = ro;
-    if (!_fontReady) document.fonts.ready.then(() => { _fontReady = true; if (_term) { _term.options.fontFamily = TERM_FONT; fitAddon.fit(); } });
+    if (!_fontReady && !isMobile) document.fonts.ready.then(() => { _fontReady = true; if (_term) { _term.options.fontFamily = TERM_FONT; fitAddon.fit(); } });
   }
 
   function closeTerminal() {
