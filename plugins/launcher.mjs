@@ -625,11 +625,26 @@ const HTML_PAGE = `<!doctype html>
     finally { btn.disabled = false; btn.textContent = 'Launch'; }
   };
 
+  // Page Visibility-aware poller: pauses when tab is hidden (no point polling
+  // a backgrounded iOS Safari tab whose connections may already be suspended)
+  // and fires once immediately on visibilitychange→visible so the user sees
+  // fresh data the moment they return.
+  function visibilityPoll(fn, intervalMs) {
+    let timer = null;
+    function start() { if (timer == null) timer = setInterval(fn, intervalMs); }
+    function stop() { if (timer != null) { clearInterval(timer); timer = null; } }
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) stop();
+      else { fn(); start(); }
+    });
+    if (!document.hidden) start();
+  }
+
   refresh();
   // 30s polling: new/kill flows refresh immediately on user action, so
   // background polling only catches out-of-band changes (e.g. another tab
   // spawned, hub auto-restarted). Public bandwidth concern beats latency here.
-  setInterval(refresh, 30000);
+  visibilityPoll(refresh, 30000);
 })();
 </script>
 </body>
