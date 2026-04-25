@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSyn
 import { join, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
+import { getWorkspaces, removeWorkspace } from '/opt/homebrew/lib/node_modules/cc-viewer/workspace-registry.js';
 
 const PREFIX = '[ccv-launcher]';
 const HUB_ENABLED = process.env.CCV_HUB === '1';
@@ -322,14 +323,15 @@ const HTML_PAGE = `<!doctype html>
     return Math.floor(ms/1000) + 's';
   }
 
-  function render(items) {
-    metaEl.textContent = items.length + ' instance' + (items.length===1?'':'s');
-    if (!items.length) {
-      listEl.innerHTML = '<div class="empty">no ccv instances running. Click "+ New instance" to launch one.</div>';
+  function render(items, history) {
+    const total = items.length + (history || []).length;
+    metaEl.textContent = items.length + ' running' + (history && history.length ? ' · ' + history.length + ' recent' : '');
+    if (!total) {
+      listEl.innerHTML = '<div class="empty">no ccv instances. Click "+ New instance" to launch one.</div>';
       return;
     }
     items.sort((a,b) => (b.isHub?1:0) - (a.isHub?1:0) || (a.port||0) - (b.port||0));
-    listEl.innerHTML = items.map(it => {
+    let html = items.map(it => {
       const cls = it.isHub ? 'card hub' : 'card running';
       const name = escape(it.projectName || '?');
       const path = escape(it.cwd || '');
@@ -359,6 +361,31 @@ const HTML_PAGE = `<!doctype html>
         +   '</div>'
         + '</div>';
     }).join('');
+    // idle history items
+    if (history && history.length) {
+      html += '<div style="padding:8px 0 4px;color:var(--mute);font-size:12px;border-top:1px solid var(--line);margin-top:8px">Recent projects (not running)</div>';
+      history.sort((a,b) => new Date(b.lastUsed) - new Date(a.lastUsed));
+      html += history.map(h => {
+        const name = escape(h.projectName || '?');
+        const path = escape(h.cwd || '');
+        const ago = h.lastUsed ? fmtAge(h.lastUsed) + ' ago' : '';
+        const logs = h.logCount ? h.logCount + ' logs' : '';
+        return ''
+          + '<div class="card idle">'
+          +   '<span class="badge"></span>'
+          +   '<div>'
+          +     '<div class="name">'+name+'</div>'
+          +     '<div class="path">'+path+'</div>'
+          +     '<div class="stats"><span>not running</span>'+(ago?'<span>last used '+ago+'</span>':'')+(logs?'<span>'+logs+'</span>':'')+'</div>'
+          +   '</div>'
+          +   '<div class="actions">'
+          +     '<button data-act="launch" data-cwd="'+path+'">Launch</button>'
+          +     '<button class="danger" data-act="forget" data-wsid="'+(h.wsId||'')+'">Forget</button>'
+          +   '</div>'
+          + '</div>';
+      }).join('');
+    }
+    listEl.innerHTML = html;
     listEl.querySelectorAll('canvas[data-qr]').forEach(c => {
       try { QRCode.toCanvas(c, c.dataset.qr, { width:130, margin:1 }); } catch(e){}
     });
@@ -376,11 +403,21 @@ const HTML_PAGE = `<!doctype html>
       if (!confirm('Stop ccv "'+t.dataset.name+'" (pid '+t.dataset.pid+')?')) return;
       try { await api('/api/launcher/kill', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ pid: parseInt(t.dataset.pid,10) }) }); refresh(); }
       catch (e) { alert('Stop failed: ' + e.message); }
+    } else if (act === 'launch') {
+      try { await api('/api/launcher/spawn', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd: t.dataset.cwd }) }); refresh(); }
+      catch (e) { alert('Launch failed: ' + e.message); }
+    } else if (act === 'forget') {
+      if (!confirm('Remove this project from history?')) return;
+      try { await api('/api/launcher/forget', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ wsId: t.dataset.wsid }) }); refresh(); }
+      catch (e) { alert('Forget failed: ' + e.message); }
     }
   });
 
   async function refresh() {
-    try { const data = await api('/api/launcher/list'); render(data.instances || []); }
+    try {
+      const data = await api('/api/launcher/list');
+      render(data.instances || [], data.history || []);
+    }
     catch (e) { listEl.innerHTML = '<div class="empty err">'+escape(e.message)+'</div>'; }
   }
 
@@ -480,7 +517,26 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
 
   if (url === '/api/launcher/list' && method === 'GET') {
     rescanRuntime();
-    sendJson(res, 200, { instances: [...instances.values()] });
+    const running = [...instances.values()];
+    const runningCwds = new Set(running.map(i => i.cwd));
+    // merge workspace-registry history: show idle projects not currently running
+    let idle = [];
+    try {
+      const wsHistory = getWorkspaces();
+      idle = wsHistory
+        .filter(w => w.path && !runningCwds.has(w.path))
+        .filter(w => existsSync(w.path)) // skip deleted dirs
+        .map(w => ({
+          wsId: w.id,
+          cwd: w.path,
+          projectName: w.projectName,
+          lastUsed: w.lastUsed,
+          logCount: w.logCount || 0,
+          totalSize: w.totalSize || 0,
+          status: 'idle',
+        }));
+    } catch (e) { log('getWorkspaces error:', e.message); }
+    sendJson(res, 200, { instances: running, history: idle });
     return;
   }
 
@@ -539,6 +595,20 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
       sendJson(res, 200, { ok: true });
     } catch (err) {
       log('kill error:', err.message);
+      sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  if (url === '/api/launcher/forget' && method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      const { wsId } = JSON.parse(raw || '{}');
+      if (!wsId) throw new Error('wsId required');
+      const removed = removeWorkspace(wsId);
+      sendJson(res, 200, { ok: removed });
+    } catch (err) {
+      log('forget error:', err.message);
       sendJson(res, 400, { error: err.message });
     }
     return;
