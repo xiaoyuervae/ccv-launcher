@@ -10,10 +10,11 @@
 // produced by runtime-broadcast.mjs. Spawns children with CCV_HUB cleared so
 // they do not become hubs themselves.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, watch } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, realpathSync, statSync, unlinkSync, watch } from 'node:fs';
 import { join, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { getWorkspaces, removeWorkspace } from '/opt/homebrew/lib/node_modules/cc-viewer/workspace-registry.js';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
@@ -31,12 +32,111 @@ const HUB_PORT_FLOOR = parseInt(process.env.CCV_CHILD_PORT_FLOOR || '7008', 10);
 const HUB_PORT_CEIL = parseInt(process.env.CCV_CHILD_PORT_CEIL || '7099', 10);
 const SPAWN_TIMEOUT_MS = 15000;
 
+// ---------- pairing auth ----------
+// pendingPairs: code → { code, userAgent, ip, createdAt }
+const pendingPairs = new Map();
+// approvedSessions: sessionToken → { createdAt, userAgent, ip }
+const approvedSessions = new Map();
+const PAIR_CODE_TTL_MS = 5 * 60 * 1000; // 5 min
+const SESSION_MAX_AGE = 30 * 24 * 3600;  // 30 days in seconds
+const SESSIONS_FILE = join(homedir(), '.claude', 'cc-viewer', 'sessions.json');
+
+function loadSessions() {
+  try {
+    const data = JSON.parse(readFileSync(SESSIONS_FILE, 'utf-8'));
+    const now = Date.now();
+    for (const [token, info] of Object.entries(data)) {
+      if (now - info.createdAt < SESSION_MAX_AGE * 1000) {
+        approvedSessions.set(token, info);
+      }
+    }
+    log(`loaded ${approvedSessions.size} sessions from disk`);
+  } catch { /* file doesn't exist yet */ }
+}
+
+function saveSessions() {
+  try {
+    const dir = join(homedir(), '.claude', 'cc-viewer');
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const obj = Object.fromEntries(approvedSessions);
+    writeFileSync(SESSIONS_FILE, JSON.stringify(obj, null, 2));
+  } catch (err) { log('saveSessions error:', err.message); }
+}
+
+function generatePairCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function cleanExpiredPairs() {
+  const now = Date.now();
+  for (const [code, p] of pendingPairs) {
+    if (now - p.createdAt > PAIR_CODE_TTL_MS) pendingPairs.delete(code);
+  }
+}
+
+function parseCookies(cookieHeader) {
+  const cookies = {};
+  if (!cookieHeader) return cookies;
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    cookies[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
+  }
+  return cookies;
+}
+
+function isLanIp(ip) {
+  if (!ip) return false;
+  if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return true;
+  const v4 = ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+  return v4.startsWith('192.168.') || v4.startsWith('10.') || /^172\.(1[6-9]|2\d|3[01])\./.test(v4);
+}
+
+function getClientIp(req) {
+  return req.headers['x-real-ip'] || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '';
+}
+
+function isAuthenticated(req) {
+  // LAN requests skip auth
+  if (isLanIp(getClientIp(req))) return true;
+  const cookies = parseCookies(req.headers.cookie);
+  const token = cookies.ccv_session;
+  return token && approvedSessions.has(token);
+}
+
+function shortUA(ua) {
+  if (!ua) return 'Unknown';
+  if (/iPhone/i.test(ua)) return 'iPhone';
+  if (/iPad/i.test(ua)) return 'iPad';
+  if (/Android/i.test(ua)) return 'Android';
+  if (/Mac/i.test(ua)) return 'Mac';
+  if (/Windows/i.test(ua)) return 'Windows';
+  if (/Linux/i.test(ua)) return 'Linux';
+  return 'Browser';
+}
+
 // in-memory instance map: pid → runtime payload (with augmented urls / status)
 const instances = new Map();
 let _selfPort = null;
 let _selfToken = null;
 
 function log(...args) { console.error(PREFIX, ...args); }
+
+// Structured JSON log: one record per line on stderr (captured by launchd's
+// stderr.log). Use for events that ops/monitoring should be able to parse,
+// e.g. ws-shell-spawn, ws-shell-cap-hit, healthz. `event` is required;
+// additional fields are merged in.
+function jlog(event, fields = {}) {
+  try {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), event, ...fields }));
+  } catch { /* ignore stringify failures */ }
+}
+
+// Cap concurrent /ws/shell sessions per process. Each PTY holds a zsh + node
+// listeners; on a public hub we want a hard ceiling so a runaway client (or
+// pathological reconnect storm) can't exhaust file descriptors / RAM.
+const SHELL_PTY_CAP = parseInt(process.env.CCV_SHELL_PTY_CAP || '8', 10);
+let _shellPtyCount = 0;
 
 function safeJson(filePath) {
   try { return JSON.parse(readFileSync(filePath, 'utf-8')); } catch { return null; }
@@ -218,68 +318,187 @@ async function doSpawn(targetCwd) {
 
 // ---------- HTTP routes via beforeRequest hook ----------
 
+const PAIR_PAGE = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ccv launcher — pair</title>
+<style>
+  :root { --bg:#0d1117; --fg:#e6edf3; --mute:#7d8590; --line:#21262d; --card:#161b22; --accent:#58a6ff; --ok:#3fb950; --bad:#f85149; }
+  * { box-sizing:border-box; margin:0; }
+  body { font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; background:var(--bg); color:var(--fg); min-height:100vh; display:flex; align-items:center; justify-content:center; }
+  .wrap { text-align:center; max-width:360px; padding:24px; }
+  h1 { font-size:18px; font-weight:600; margin-bottom:8px; }
+  .sub { color:var(--mute); font-size:13px; margin-bottom:32px; }
+  .code-box { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:24px; margin-bottom:24px; }
+  .code { font-size:42px; font-weight:700; letter-spacing:12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--accent); }
+  .status { color:var(--mute); font-size:12px; margin-top:12px; }
+  .status.ok { color:var(--ok); }
+  .status.err { color:var(--bad); }
+  .hint { color:var(--mute); font-size:12px; line-height:1.6; }
+  .spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--line); border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; vertical-align:middle; margin-right:6px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ccv launcher</h1>
+  <p class="sub">Pair this device to access the launcher</p>
+  <div class="code-box">
+    <div class="code" id="code">------</div>
+    <div class="status" id="status"><span class="spinner"></span>Generating code…</div>
+  </div>
+  <p class="hint">Open the launcher on your computer (LAN) and approve this pairing code. The code expires in 5 minutes.</p>
+</div>
+<script>
+(async () => {
+  const codeEl = document.getElementById('code');
+  const statusEl = document.getElementById('status');
+  try {
+    const res = await fetch('/api/launcher/pair-request', { method: 'POST' });
+    const data = await res.json();
+    if (!data.code) throw new Error('no code');
+    codeEl.textContent = data.code;
+    statusEl.innerHTML = '<span class="spinner"></span>Waiting for approval…';
+    // poll
+    const poll = async () => {
+      try {
+        const r = await fetch('/api/launcher/pair-status?code=' + data.code);
+        const s = await r.json();
+        if (s.approved && s.redirect) {
+          statusEl.className = 'status ok';
+          statusEl.textContent = 'Approved! Redirecting…';
+          window.location.href = s.redirect;
+          return;
+        }
+        if (s.expired) {
+          statusEl.className = 'status err';
+          statusEl.textContent = 'Code expired. Refresh to try again.';
+          return;
+        }
+      } catch {}
+      setTimeout(poll, 2000);
+    };
+    poll();
+  } catch (e) {
+    statusEl.className = 'status err';
+    statusEl.textContent = 'Failed: ' + e.message;
+  }
+})();
+</script>
+</body>
+</html>`;
+
 const HTML_PAGE = `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ccv launcher</title>
-<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
 <style>
-  :root { --bg:#0f1115; --fg:#e6e8ec; --mute:#9aa3ad; --line:#1c2129; --card:#161a22; --accent:#6ea8fe; --ok:#34d399; --warn:#fbbf24; --bad:#f87171; }
-  * { box-sizing: border-box; }
-  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif; background:var(--bg); color:var(--fg); }
-  header { display:flex; align-items:center; gap:12px; padding:14px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:rgba(15,17,21,.92); backdrop-filter:blur(8px); z-index:10; }
-  header h1 { font-size:16px; font-weight:600; margin:0; }
+  @font-face {
+    font-family: 'NerdFont';
+    src: url('https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.3.0/patched-fonts/JetBrainsMono/Ligatures/Regular/JetBrainsMonoNerdFont-Regular.ttf') format('truetype');
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+  }
+  :root { --bg:#0d1117; --fg:#e6edf3; --mute:#7d8590; --line:#21262d; --card:#161b22; --card-hover:#1c2128; --accent:#58a6ff; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --tag-bg:#1f2937; --term-font:'NerdFont','MesloLGS NF','JetBrainsMono Nerd Font',ui-monospace,SFMono-Regular,Menlo,monospace; }
+  * { box-sizing:border-box; margin:0; }
+  body { font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; background:var(--bg); color:var(--fg); min-height:100vh; }
+
+  /* header */
+  header { display:flex; align-items:center; gap:12px; padding:12px 24px; border-bottom:1px solid var(--line); position:sticky; top:0; background:rgba(13,17,23,.85); backdrop-filter:blur(12px); z-index:10; }
+  header h1 { font-size:15px; font-weight:600; letter-spacing:-.3px; }
   header .meta { color:var(--mute); font-size:12px; }
   header .grow { flex:1; }
-  header button { background:var(--accent); color:#0b1220; border:0; padding:8px 14px; border-radius:8px; font-weight:600; cursor:pointer; }
-  main { max-width:1100px; margin:0 auto; padding:20px; display:grid; gap:14px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; display:grid; grid-template-columns:auto 1fr auto; gap:12px 16px; align-items:center; }
-  .card .badge { width:8px; height:8px; border-radius:50%; }
-  .card.running .badge { background:var(--ok); box-shadow:0 0 6px var(--ok); }
-  .card.hub .badge { background:var(--accent); box-shadow:0 0 6px var(--accent); }
-  .card .name { font-weight:600; }
-  .card .path { color:var(--mute); font-size:12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; word-break:break-all; }
-  .card .url  { color:var(--mute); font-size:12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; word-break:break-all; margin-top:4px; }
-  .card .url a { color:var(--mute); text-decoration:none; }
-  .card .url a:hover { color:var(--accent); }
-  .card .stats { color:var(--mute); font-size:12px; display:flex; gap:14px; flex-wrap:wrap; margin-top:4px; }
-  .card .actions { display:flex; flex-direction:column; gap:6px; }
-  .card .actions button { background:transparent; color:var(--fg); border:1px solid var(--line); padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px; min-width:74px; }
-  .card .actions button:hover { border-color:var(--accent); color:var(--accent); }
-  .card .actions button.danger:hover { border-color:var(--bad); color:var(--bad); }
-  details summary { cursor:pointer; color:var(--mute); font-size:12px; padding:4px 0; user-select:none; }
+  header button { background:var(--accent); color:#0d1117; border:0; padding:6px 14px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; transition:opacity .15s; }
+  header button:hover { opacity:.85; }
+
+  /* sections */
+  .content { max-width:960px; margin:0 auto; padding:16px 24px 32px; }
+  .section-hd { display:flex; align-items:center; gap:8px; padding:12px 0 8px; font-size:12px; font-weight:600; color:var(--mute); text-transform:uppercase; letter-spacing:.5px; }
+  .section-hd .dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
+  .section-hd .dot.green { background:var(--ok); }
+  .section-hd .dot.gray  { background:var(--mute); opacity:.5; }
+
+  /* cards */
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin-bottom:8px; border-left:2px solid transparent; transition:border-color .15s, background .15s; }
+  .card:hover { background:var(--card-hover); }
+  .card.running { border-left-color:var(--ok); }
+  .card.hub     { border-left-color:var(--accent); }
+  .card.idle    { border-left-color:transparent; }
+  .card-head { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+  .card-head .name { font-weight:600; font-size:13px; }
+  .card-head .hub-tag { font-size:10px; color:var(--accent); background:rgba(88,166,255,.12); padding:1px 6px; border-radius:3px; font-weight:600; }
+  .tag { display:inline-block; font-size:11px; color:var(--mute); background:var(--tag-bg); padding:1px 7px; border-radius:3px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .card-path { color:var(--mute); font-size:11px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:6px; }
+  .card-meta { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+  .card-actions { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+
+  /* buttons */
+  .btn { display:inline-flex; align-items:center; gap:4px; background:transparent; color:var(--fg); border:1px solid var(--line); padding:4px 10px; border-radius:5px; cursor:pointer; font-size:11px; font-family:inherit; transition:all .15s; white-space:nowrap; }
+  .btn:hover { border-color:var(--accent); color:var(--accent); }
+  .btn.primary { background:var(--accent); color:#0d1117; border-color:var(--accent); font-weight:600; }
+  .btn.primary:hover { opacity:.85; color:#0d1117; }
+  .btn.danger:hover { border-color:var(--bad); color:var(--bad); }
+  .btn svg { width:13px; height:13px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+
+  /* details / QR */
+  details { margin-top:6px; }
+  details summary { cursor:pointer; color:var(--mute); font-size:11px; padding:2px 0; user-select:none; }
   details[open] summary { color:var(--accent); }
-  .qr { padding:10px; background:#fff; border-radius:8px; display:inline-block; margin-top:8px; }
+  .url-row { color:var(--mute); font-size:11px; font-family:ui-monospace,monospace; word-break:break-all; padding:2px 0; }
+  .url-row a { color:var(--mute); text-decoration:none; }
+  .url-row a:hover { color:var(--accent); }
+  .qr { padding:8px; background:#fff; border-radius:6px; display:inline-block; margin-top:6px; }
   .qr canvas { display:block; }
-  dialog { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:12px; padding:20px; max-width:520px; width:92%; }
-  dialog::backdrop { background:rgba(0,0,0,.5); }
-  dialog h2 { margin:0 0 12px; font-size:15px; }
-  dialog input { width:100%; padding:8px 10px; background:#0a0d12; color:var(--fg); border:1px solid var(--line); border-radius:6px; font-family:ui-monospace,monospace; font-size:13px; margin-bottom:8px; }
+
+  /* dialog */
+  dialog { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:10px; padding:20px; max-width:500px; width:92%; }
+  dialog::backdrop { background:rgba(0,0,0,.55); }
+  dialog h2 { margin:0 0 12px; font-size:14px; font-weight:600; }
+  dialog input { width:100%; padding:7px 10px; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:5px; font-family:ui-monospace,monospace; font-size:12px; margin-bottom:8px; }
   dialog .row { display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
-  dialog button { background:transparent; color:var(--fg); border:1px solid var(--line); padding:6px 14px; border-radius:6px; cursor:pointer; }
-  dialog button.primary { background:var(--accent); color:#0b1220; border-color:var(--accent); font-weight:600; }
-  .tree { font-family:ui-monospace,monospace; font-size:12px; color:var(--mute); max-height:240px; overflow:auto; background:#0a0d12; padding:8px; border-radius:6px; }
+  .tree { font-family:ui-monospace,monospace; font-size:12px; color:var(--mute); max-height:220px; overflow:auto; background:var(--bg); padding:6px; border-radius:5px; }
   .tree .row { padding:3px 6px; cursor:pointer; border-radius:3px; display:flex; gap:6px; align-items:center; }
-  .tree .row:hover { background:#1a1f2a; color:var(--fg); }
-  .tree .row.dir::before { content:"📁"; }
+  .tree .row:hover { background:var(--card); color:var(--fg); }
+  .tree .row.dir::before { content:"📁"; font-size:12px; }
   .tree .row.up::before  { content:"↩"; }
   .err { color:var(--bad); font-size:12px; margin-top:6px; }
-  .empty { color:var(--mute); text-align:center; padding:60px 20px; font-size:13px; }
-  footer { padding:12px 20px; border-top:1px solid var(--line); color:var(--mute); font-size:11px; text-align:center; }
-  #term-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:100; }
+  .empty { color:var(--mute); text-align:center; padding:48px 20px; font-size:12px; }
+
+  /* terminal overlay */
+  #term-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.75); z-index:100; }
   #term-overlay.open { display:flex; flex-direction:column; }
-  #term-bar { display:flex; align-items:center; gap:10px; padding:8px 16px; background:var(--card); border-bottom:1px solid var(--line); }
-  #term-bar .name { font-weight:600; font-size:13px; }
-  #term-bar .path { color:var(--mute); font-size:11px; font-family:ui-monospace,monospace; }
-  #term-bar .grow { flex:1; }
-  #term-bar button { background:transparent; color:var(--fg); border:1px solid var(--line); padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px; }
+  #term-bar { display:flex; align-items:center; gap:8px; padding:6px 14px; background:var(--card); border-bottom:1px solid var(--line); }
+  #term-bar .type-tag { font-size:10px; font-weight:600; padding:2px 7px; border-radius:3px; }
+  #term-bar .type-tag.shell   { color:var(--ok); background:rgba(63,185,80,.12); }
+  #term-bar .type-tag.console { color:var(--accent); background:rgba(88,166,255,.12); }
+  #term-bar .name { font-weight:600; font-size:12px; }
+  #term-bar .path { color:var(--mute); font-size:11px; font-family:ui-monospace,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #term-bar .grow { flex:1; min-width:0; }
+  #term-bar button { background:transparent; color:var(--mute); border:1px solid var(--line); padding:3px 10px; border-radius:4px; cursor:pointer; font-size:11px; }
   #term-bar button:hover { border-color:var(--bad); color:var(--bad); }
   #term-container { flex:1; overflow:hidden; }
+
+  /* pair notification banner */
+  .pair-banner { background:rgba(210,153,34,.1); border:1px solid var(--warn); border-radius:8px; padding:10px 14px; margin-bottom:12px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .pair-banner .pair-info { flex:1; min-width:200px; }
+  .pair-banner .pair-code { font-family:ui-monospace,monospace; font-weight:700; font-size:15px; color:var(--warn); letter-spacing:2px; }
+  .pair-banner .pair-device { color:var(--mute); font-size:11px; }
+  .pair-banner .pair-actions { display:flex; gap:6px; }
+  .pair-banner .pair-actions button { font-size:11px; padding:4px 12px; border-radius:5px; cursor:pointer; border:1px solid var(--line); background:transparent; color:var(--fg); }
+  .pair-banner .pair-actions .approve { background:var(--ok); color:#0d1117; border-color:var(--ok); font-weight:600; }
+  .pair-banner .pair-actions .reject:hover { border-color:var(--bad); color:var(--bad); }
+
+  /* footer */
+  footer { padding:10px 24px; border-top:1px solid var(--line); color:var(--mute); font-size:10px; text-align:center; opacity:.6; }
 </style>
 </head>
 <body>
@@ -287,30 +506,31 @@ const HTML_PAGE = `<!doctype html>
   <h1>ccv launcher</h1>
   <span class="meta" id="meta">loading…</span>
   <span class="grow"></span>
-  <button id="btn-new">+ New instance</button>
+  <button id="btn-new">+ New</button>
 </header>
-<main id="list"><div class="empty">loading instances…</div></main>
-<footer>ccv launcher · plugin: <code>launcher.mjs</code></footer>
+<div id="pair-zone" style="max-width:960px;margin:0 auto;padding:12px 24px 0"></div>
+<div class="content" id="list"><div class="empty">loading…</div></div>
+<footer>ccv-launcher</footer>
 
 <div id="term-overlay">
   <div id="term-bar">
+    <span class="type-tag" id="term-type"></span>
     <span class="name" id="term-name"></span>
-    <span class="path" id="term-path"></span>
-    <span class="grow"></span>
-    <button id="term-close">Close terminal</button>
+    <span class="grow"><span class="path" id="term-path"></span></span>
+    <button id="term-close">Close</button>
   </div>
   <div id="term-container"></div>
 </div>
 
 <dialog id="dlg">
-  <h2>Launch a new ccv instance</h2>
-  <div style="color:var(--mute);font-size:12px">cwd:</div>
+  <h2>Launch new instance</h2>
+  <div style="color:var(--mute);font-size:11px;margin-bottom:4px">Directory:</div>
   <input id="cwd" placeholder="/path/to/project">
   <div class="tree" id="tree"></div>
   <div class="err" id="err" hidden></div>
   <div class="row">
-    <button id="btn-cancel">Cancel</button>
-    <button class="primary" id="btn-launch">Launch</button>
+    <button class="btn" id="btn-cancel">Cancel</button>
+    <button class="btn primary" id="btn-launch">Launch</button>
   </div>
 </dialog>
 
@@ -351,49 +571,51 @@ const HTML_PAGE = `<!doctype html>
     const total = items.length + (history || []).length;
     metaEl.textContent = items.length + ' running' + (history && history.length ? ' · ' + history.length + ' recent' : '');
     if (!total) {
-      listEl.innerHTML = '<div class="empty">no ccv instances. Click "+ New instance" to launch one.</div>';
+      listEl.innerHTML = '<div class="empty">No instances yet. Click "+ New" to launch one.</div>';
       return;
     }
     items.sort((a,b) => (b.isHub?1:0) - (a.isHub?1:0) || (a.port||0) - (b.port||0));
-    let html = items.map(it => {
+    let html = '<div class="section-hd"><span class="dot green"></span>Running (' + items.length + ')</div>';
+    html += items.map(it => {
       const cls = it.isHub ? 'card hub' : 'card running';
       const name = escape(it.projectName || '?');
       const path = escape(it.cwd || '');
       const pub = escape(it.publicUrl || '');
       const lan = escape(it.lanUrl || '');
-      const stopBtn = it.isHub
-        ? ''
-        : '<button class="danger" data-act="stop" data-pid="'+it.pid+'" data-name="'+name+'">Stop</button>';
-      const termBtn = it.isHub
-        ? ''
-        : '<button data-act="terminal" data-port="'+(it.port||'')+'" data-token="'+(it.token||'')+'" data-name="'+name+'" data-path="'+path+'" data-pub="'+(it.publicUrl||'')+'" data-lan="'+(it.lanUrl||'')+'">Terminal</button>';
       const openHref = pub || lan || '#';
+      let actions = ''
+        + '<button class="btn primary" data-act="open" data-href="'+escape(openHref)+'">Open</button>'
+        + '<button class="btn" data-act="copy" data-text="'+(pub||lan)+'">Copy URL</button>';
+      if (!it.isHub) {
+        actions += '<button class="btn" data-act="openterm" data-cwd="'+path+'" data-name="'+name+'">Shell</button>';
+        actions += '<button class="btn" data-act="console" data-port="'+(it.port||'')+'" data-token="'+(it.token||'')+'" data-name="'+name+'" data-path="'+path+'" data-pub="'+(it.publicUrl||'')+'" data-lan="'+(it.lanUrl||'')+'">Console</button>';
+        actions += '<button class="btn danger" data-act="stop" data-pid="'+it.pid+'" data-name="'+name+'">Stop</button>';
+      }
       return ''
         + '<div class="'+cls+'" data-pid="'+it.pid+'">'
-        +   '<span class="badge"></span>'
-        +   '<div>'
-        +     '<div class="name">'+name+(it.isHub ? ' <span style="color:var(--accent);font-size:11px">[hub]</span>':'')+'</div>'
-        +     '<div class="path">'+path+'</div>'
-        +     '<div class="stats"><span>:'+(it.port||'?')+'</span><span>pid '+it.pid+'</span><span>up '+fmtAge(it.startedAt)+'</span><span>'+escape(it.version||'')+'</span></div>'
-        +     '<details><summary>show URLs · QR</summary>'
-        +       (lan ? '<div class="url">local:&nbsp; <a href="#" data-act="copy" data-text="'+lan+'">'+lan+'</a></div>':'')
-        +       (pub ? '<div class="url">public: <a href="#" data-act="copy" data-text="'+pub+'">'+pub+'</a></div>':'')
-        +       (pub ? '<div class="qr"><canvas data-qr="'+pub+'"></canvas></div>':'')
-        +     '</details>'
+        +   '<div class="card-head">'
+        +     '<span class="name">'+name+'</span>'
+        +     (it.isHub ? '<span class="hub-tag">HUB</span>' : '')
         +   '</div>'
-        +   '<div class="actions">'
-        +     '<button data-act="open" data-href="'+escape(openHref)+'">Open</button>'
-        +     '<button data-act="copy" data-text="'+(pub||lan)+'">Copy URL</button>'
-        +     '<button data-act="openterm" data-cwd="'+path+'">Terminal</button>'
-        +     termBtn
-        +     stopBtn
+        +   '<div class="card-path" title="'+path+'">'+path+'</div>'
+        +   '<div class="card-meta">'
+        +     '<span class="tag">:' + (it.port||'?') + '</span>'
+        +     '<span class="tag">pid ' + it.pid + '</span>'
+        +     '<span class="tag">up ' + fmtAge(it.startedAt) + '</span>'
+        +     (it.version ? '<span class="tag">' + escape(it.version) + '</span>' : '')
         +   '</div>'
+        +   '<details><summary>URLs &middot; QR</summary>'
+        +     (lan ? '<div class="url-row">LAN: <a href="#" data-act="copy" data-text="'+lan+'">'+lan+'</a></div>':'')
+        +     (pub ? '<div class="url-row">Public: <a href="#" data-act="copy" data-text="'+pub+'">'+pub+'</a></div>':'')
+        +     (pub ? '<div class="qr" data-qr="'+pub+'"></div>':'')
+        +   '</details>'
+        +   '<div class="card-actions">' + actions + '</div>'
         + '</div>';
     }).join('');
-    // idle history items
+
     if (history && history.length) {
-      html += '<div style="padding:8px 0 4px;color:var(--mute);font-size:12px;border-top:1px solid var(--line);margin-top:8px">Recent projects (not running)</div>';
       history.sort((a,b) => new Date(b.lastUsed) - new Date(a.lastUsed));
+      html += '<div class="section-hd" style="margin-top:16px"><span class="dot gray"></span>Recent (' + history.length + ')</div>';
       html += history.map(h => {
         const name = escape(h.projectName || '?');
         const path = escape(h.cwd || '');
@@ -401,25 +623,57 @@ const HTML_PAGE = `<!doctype html>
         const logs = h.logCount ? h.logCount + ' logs' : '';
         return ''
           + '<div class="card idle">'
-          +   '<span class="badge"></span>'
-          +   '<div>'
-          +     '<div class="name">'+name+'</div>'
-          +     '<div class="path">'+path+'</div>'
-          +     '<div class="stats"><span>not running</span>'+(ago?'<span>last used '+ago+'</span>':'')+(logs?'<span>'+logs+'</span>':'')+'</div>'
+          +   '<div class="card-head"><span class="name">'+name+'</span></div>'
+          +   '<div class="card-path" title="'+path+'">'+path+'</div>'
+          +   '<div class="card-meta">'
+          +     (ago ? '<span class="tag">' + ago + '</span>' : '')
+          +     (logs ? '<span class="tag">' + logs + '</span>' : '')
           +   '</div>'
-          +   '<div class="actions">'
-          +     '<button data-act="launch" data-cwd="'+path+'">Launch</button>'
-          +     '<button data-act="openterm" data-cwd="'+path+'">Terminal</button>'
-          +     '<button class="danger" data-act="forget" data-wsid="'+(h.wsId||'')+'">Forget</button>'
+          +   '<div class="card-actions">'
+          +     '<button class="btn primary" data-act="launch" data-cwd="'+path+'">Launch</button>'
+          +     '<button class="btn" data-act="openterm" data-cwd="'+path+'" data-name="'+name+'">Shell</button>'
+          +     '<button class="btn danger" data-act="forget" data-wsid="'+(h.wsId||'')+'">Forget</button>'
           +   '</div>'
           + '</div>';
       }).join('');
     }
-    listEl.innerHTML = html;
-    listEl.querySelectorAll('canvas[data-qr]').forEach(c => {
-      try { QRCode.toCanvas(c, c.dataset.qr, { width:130, margin:1 }); } catch(e){}
+    // Preserve open details state across re-renders
+    const openPids = new Set();
+    listEl.querySelectorAll('details[open]').forEach(d => {
+      const card = d.closest('[data-pid]');
+      if (card) openPids.add(card.dataset.pid);
     });
+    listEl.innerHTML = html;
+    // Restore open state and render QR for previously open details
+    if (openPids.size) {
+      listEl.querySelectorAll('[data-pid]').forEach(card => {
+        if (!openPids.has(card.dataset.pid)) return;
+        const d = card.querySelector('details');
+        if (!d) return;
+        d.open = true;
+        d.querySelectorAll('.qr[data-qr]').forEach(el => {
+          if (el.dataset.qrDone) return;
+          try { new QRCode(el, { text: el.dataset.qr, width: 120, height: 120, colorDark: '#000', colorLight: '#fff' }); el.dataset.qrDone = '1'; } catch(e) {}
+        });
+      });
+    }
   }
+
+  // Render QR codes when <summary> is clicked (toggle event doesn't bubble, so use click on summary)
+  listEl.addEventListener('click', (ev) => {
+    const summary = ev.target.closest('summary');
+    if (!summary) return;
+    const details = summary.parentElement;
+    // details.open is still the OLD state at click time; after click it flips.
+    // So if it's currently closed, it's about to open.
+    if (details.open) return; // closing
+    requestAnimationFrame(() => {
+      details.querySelectorAll('.qr[data-qr]').forEach(el => {
+        if (el.dataset.qrDone) return;
+        try { new QRCode(el, { text: el.dataset.qr, width: 120, height: 120, colorDark: '#000', colorLight: '#fff' }); el.dataset.qrDone = '1'; } catch(e) {}
+      });
+    });
+  });
 
   listEl.addEventListener('click', async (ev) => {
     const t = ev.target.closest('[data-act]'); if (!t) return;
@@ -440,28 +694,36 @@ const HTML_PAGE = `<!doctype html>
       if (!confirm('Remove this project from history?')) return;
       try { await api('/api/launcher/forget', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ wsId: t.dataset.wsid }) }); refresh(); }
       catch (e) { alert('Forget failed: ' + e.message); }
-    } else if (act === 'terminal') {
-      openTerminal(t.dataset.port, t.dataset.token, t.dataset.name, t.dataset.path, t.dataset.pub, t.dataset.lan);
+    } else if (act === 'console') {
+      openConsole(t.dataset.port, t.dataset.token, t.dataset.name, t.dataset.path, t.dataset.pub, t.dataset.lan);
     } else if (act === 'openterm') {
       openShell(t.dataset.cwd, t.dataset.name || t.dataset.cwd);
     }
   });
 
-  // ---- Terminal ----
+  // ---- Terminal overlay ----
+  const TERM_FONT = "'NerdFont','MesloLGS NF','JetBrainsMono Nerd Font',ui-monospace,SFMono-Regular,Menlo,monospace";
+  let _fontReady = false;
+  // Preload the NerdFont so xterm.js can measure glyphs correctly on first open
+  document.fonts.load('14px NerdFont').then(() => { _fontReady = true; }).catch(() => {});
+
   let _term = null, _termWs = null;
   const termOverlay = document.getElementById('term-overlay');
   const termContainer = document.getElementById('term-container');
+  const termType = document.getElementById('term-type');
   const termName = document.getElementById('term-name');
   const termPath = document.getElementById('term-path');
   document.getElementById('term-close').addEventListener('click', closeTerminal);
 
-  function openTerminal(port, token, name, path, pubUrl, lanUrl) {
+  function openConsole(port, token, name, path, pubUrl, lanUrl) {
     closeTerminal();
+    termType.textContent = 'Console';
+    termType.className = 'type-tag console';
     termName.textContent = name || ':' + port;
     termPath.textContent = path || '';
     termOverlay.classList.add('open');
 
-    _term = new Terminal({ cursorBlink: true, fontSize: 14, theme: { background: '#0f1115', foreground: '#e6e8ec', cursor: '#6ea8fe' } });
+    _term = new Terminal({ cursorBlink: true, fontSize: 14, fontFamily: TERM_FONT, theme: { background: '#0f1115', foreground: '#e6e8ec', cursor: '#6ea8fe' } });
     const fitAddon = new FitAddon.FitAddon();
     _term.loadAddon(fitAddon);
     _term.open(termContainer);
@@ -518,15 +780,18 @@ const HTML_PAGE = `<!doctype html>
     const ro = new ResizeObserver(() => { try { fitAddon.fit(); } catch {} });
     ro.observe(termContainer);
     termOverlay._ro = ro;
+    if (!_fontReady) document.fonts.ready.then(() => { _fontReady = true; if (_term) { _term.options.fontFamily = TERM_FONT; fitAddon.fit(); } });
   }
 
   function openShell(cwd, name) {
     closeTerminal();
+    termType.textContent = 'Shell';
+    termType.className = 'type-tag shell';
     termName.textContent = name || cwd;
     termPath.textContent = cwd || '';
     termOverlay.classList.add('open');
 
-    _term = new Terminal({ cursorBlink: true, fontSize: 14, theme: { background: '#0f1115', foreground: '#e6e8ec', cursor: '#6ea8fe' } });
+    _term = new Terminal({ cursorBlink: true, fontSize: 14, fontFamily: TERM_FONT, theme: { background: '#0f1115', foreground: '#e6e8ec', cursor: '#6ea8fe' } });
     const fitAddon = new FitAddon.FitAddon();
     _term.loadAddon(fitAddon);
     _term.open(termContainer);
@@ -562,6 +827,7 @@ const HTML_PAGE = `<!doctype html>
     const ro = new ResizeObserver(() => { try { fitAddon.fit(); } catch {} });
     ro.observe(termContainer);
     termOverlay._ro = ro;
+    if (!_fontReady) document.fonts.ready.then(() => { _fontReady = true; if (_term) { _term.options.fontFamily = TERM_FONT; fitAddon.fit(); } });
   }
 
   function closeTerminal() {
@@ -645,6 +911,46 @@ const HTML_PAGE = `<!doctype html>
   // background polling only catches out-of-band changes (e.g. another tab
   // spawned, hub auto-restarted). Public bandwidth concern beats latency here.
   visibilityPoll(refresh, 30000);
+
+  // ---- Pair notification polling ----
+  const pairZone = document.getElementById('pair-zone');
+  async function refreshPairs() {
+    try {
+      const data = await api('/api/launcher/pair-list');
+      if (!data.pending || !data.pending.length) { pairZone.innerHTML = ''; return; }
+      pairZone.innerHTML = data.pending.map(p => ''
+        + '<div class="pair-banner">'
+        +   '<div class="pair-info">'
+        +     '<span class="pair-code">' + escape(p.code) + '</span> '
+        +     '<span class="pair-device">' + escape(p.device) + ' &middot; ' + escape(p.ip) + ' &middot; ' + p.age + 's ago</span>'
+        +   '</div>'
+        +   '<div class="pair-actions">'
+        +     '<button class="approve" data-pair-code="'+escape(p.code)+'">Approve</button>'
+        +     '<button class="reject" data-pair-reject="'+escape(p.code)+'">Reject</button>'
+        +   '</div>'
+        + '</div>'
+      ).join('');
+    } catch {}
+  }
+  pairZone.addEventListener('click', async (ev) => {
+    const approveBtn = ev.target.closest('[data-pair-code]');
+    const rejectBtn = ev.target.closest('[data-pair-reject]');
+    if (approveBtn) {
+      try {
+        await api('/api/launcher/pair-approve', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code: approveBtn.dataset.pairCode }) });
+        approveBtn.textContent = 'Approved';
+        approveBtn.disabled = true;
+        setTimeout(refreshPairs, 1000);
+      } catch (e) { alert('Approve failed: ' + e.message); }
+    } else if (rejectBtn) {
+      try {
+        await api('/api/launcher/pair-reject', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code: rejectBtn.dataset.pairReject }) });
+        refreshPairs();
+      } catch {}
+    }
+  });
+  refreshPairs();
+  visibilityPoll(refreshPairs, 5000);
 })();
 </script>
 </body>
@@ -672,21 +978,156 @@ function readBody(req, max = 64 * 1024) {
 // True when this request belongs to the launcher's own surface
 // (hub-only HTML + JSON API). These bypass ccv's token auth on purpose so the
 // public bookmark `https://ccv.xiaoyuervae.cn:9990/launcher` works without the
-// caller knowing the hub's per-process token. NPM Basic Auth still gates
-// inbound traffic from the public Internet.
+// caller knowing the hub's per-process token.
 function isLauncherPath(pathname) {
-  return pathname === '/launcher' || pathname.startsWith('/api/launcher/');
+  return pathname === '/launcher' || pathname.startsWith('/launcher/') || pathname.startsWith('/api/launcher/') || pathname === '/healthz';
+}
+
+// Paths that don't require session auth (pair flow itself + healthz for monitors)
+function isPairPath(pathname) {
+  return pathname === '/launcher/pair' || pathname === '/launcher/pair/complete' || pathname.startsWith('/api/launcher/pair-') || pathname === '/healthz';
 }
 
 async function dispatchLauncherRoute(req, res, parsedUrl) {
   const url = parsedUrl.pathname;
   const method = req.method;
 
-  // CORS — mirror ccv's defaults so cross-origin tools behave consistently.
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  // /healthz: lightweight liveness probe for monitors (no auth required).
+  // Returns ok + key counters; never blocks on disk or external state.
+  if (url === '/healthz' && method === 'GET') {
+    sendJson(res, 200, {
+      ok: true,
+      uptimeSec: Math.round(process.uptime()),
+      ptyCount: _shellPtyCount,
+      ptyCap: SHELL_PTY_CAP,
+      instanceCount: instances.size,
+      pendingPairs: pendingPairs.size,
+      sessions: approvedSessions.size,
+    });
+    return;
+  }
+
+  // Auth gate: non-pair launcher paths require session cookie (public only)
+  if (!isPairPath(url) && !isAuthenticated(req)) {
+    res.writeHead(302, { Location: '/launcher/pair' });
+    res.end();
+    return;
+  }
+
+  // ---- Pair routes ----
+
+  if (url === '/launcher/pair' && method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(PAIR_PAGE);
+    return;
+  }
+
+  if (url === '/api/launcher/pair-request' && method === 'POST') {
+    cleanExpiredPairs();
+    const code = generatePairCode();
+    const ip = getClientIp(req);
+    const ua = req.headers['user-agent'] || '';
+    pendingPairs.set(code, { code, userAgent: ua, ip, createdAt: Date.now(), sessionToken: null });
+    log('pair request from', shortUA(ua), ip, '→ code', code);
+    sendJson(res, 200, { code });
+    return;
+  }
+
+  if (url === '/api/launcher/pair-status' && method === 'GET') {
+    const code = parsedUrl.searchParams.get('code');
+    const pair = code && pendingPairs.get(code);
+    if (!pair) { sendJson(res, 200, { approved: false, expired: true }); return; }
+    if (Date.now() - pair.createdAt > PAIR_CODE_TTL_MS) {
+      pendingPairs.delete(code);
+      sendJson(res, 200, { approved: false, expired: true });
+      return;
+    }
+    if (pair.sessionToken) {
+      sendJson(res, 200, { approved: true, redirect: '/launcher/pair/complete?code=' + code });
+    } else {
+      sendJson(res, 200, { approved: false, expired: false });
+    }
+    return;
+  }
+
+  if (url === '/launcher/pair/complete' && method === 'GET') {
+    const code = parsedUrl.searchParams.get('code');
+    const pair = code && pendingPairs.get(code);
+    if (!pair || !pair.sessionToken) {
+      res.writeHead(302, { Location: '/launcher/pair' });
+      res.end();
+      return;
+    }
+    const token = pair.sessionToken;
+    pendingPairs.delete(code);
+    const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+    res.writeHead(302, {
+      Location: '/launcher',
+      'Set-Cookie': `ccv_session=${token}; Path=/; Max-Age=${SESSION_MAX_AGE}; HttpOnly; SameSite=Lax${secure}`,
+    });
+    res.end();
+    return;
+  }
+
+  if (url === '/api/launcher/pair-approve' && method === 'POST') {
+    // Only LAN clients can approve
+    if (!isLanIp(getClientIp(req))) {
+      sendJson(res, 403, { error: 'approve only from LAN' });
+      return;
+    }
+    const raw = await readBody(req);
+    const { code } = JSON.parse(raw || '{}');
+    const pair = code && pendingPairs.get(code);
+    if (!pair) { sendJson(res, 400, { error: 'unknown or expired code' }); return; }
+    const sessionToken = randomBytes(24).toString('hex');
+    pair.sessionToken = sessionToken;
+    approvedSessions.set(sessionToken, { createdAt: Date.now(), userAgent: pair.userAgent, ip: pair.ip });
+    saveSessions();
+    log('pair approved:', code, '→', shortUA(pair.userAgent), pair.ip);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (url === '/api/launcher/pair-reject' && method === 'POST') {
+    if (!isLanIp(getClientIp(req))) {
+      sendJson(res, 403, { error: 'reject only from LAN' });
+      return;
+    }
+    const raw = await readBody(req);
+    const { code } = JSON.parse(raw || '{}');
+    if (code) pendingPairs.delete(code);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (url === '/api/launcher/pair-list' && method === 'GET') {
+    cleanExpiredPairs();
+    const list = [...pendingPairs.values()]
+      .filter(p => !p.sessionToken)
+      .map(p => ({ code: p.code, device: shortUA(p.userAgent), ip: p.ip, age: Math.floor((Date.now() - p.createdAt) / 1000) }));
+    sendJson(res, 200, { pending: list });
+    return;
+  }
+
+  if (url === '/launcher/logout' && method === 'GET') {
+    const cookies = parseCookies(req.headers.cookie);
+    if (cookies.ccv_session) { approvedSessions.delete(cookies.ccv_session); saveSessions(); }
+    const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+    res.writeHead(302, {
+      Location: '/launcher/pair',
+      'Set-Cookie': `ccv_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secure}`,
+    });
+    res.end();
+    return;
+  }
+
+  // ---- Main launcher routes ----
 
   if (url === '/launcher' && method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -865,6 +1306,12 @@ function installShellWebSocket(httpServer) {
   httpServer.on('upgrade', (req, socket, head) => {
     const parsed = new URL(req.url, 'http://localhost');
     if (parsed.pathname === '/ws/shell') {
+      // Auth check for WebSocket: LAN or valid session cookie
+      if (!isAuthenticated(req)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
       return;
     }
@@ -877,6 +1324,15 @@ function installShellWebSocket(httpServer) {
     let cwd = parsed.searchParams.get('cwd') || homedir();
     try { cwd = realpathSync(cwd); } catch { /* keep as-is */ }
     if (!existsSync(cwd)) cwd = homedir();
+
+    if (_shellPtyCount >= SHELL_PTY_CAP) {
+      jlog('ws-shell-cap-hit', { cap: SHELL_PTY_CAP, current: _shellPtyCount, ip: getClientIp(req) });
+      try {
+        ws.send(JSON.stringify({ type: 'data', data: `\\x1b[31mShell capacity reached (${SHELL_PTY_CAP}). Try again later.\\x1b[0m\\r\\n` }));
+      } catch { /* socket may already be gone */ }
+      ws.close(1013, 'capacity'); // 1013 = Try Again Later
+      return;
+    }
 
     const shell = process.env.SHELL || '/bin/zsh';
     let proc;
@@ -893,6 +1349,14 @@ function installShellWebSocket(httpServer) {
       ws.close();
       return;
     }
+    _shellPtyCount++;
+    let _ptyAccounted = true;
+    const releasePty = () => {
+      if (!_ptyAccounted) return;
+      _ptyAccounted = false;
+      _shellPtyCount = Math.max(0, _shellPtyCount - 1);
+    };
+    jlog('ws-shell-spawn', { pid: proc.pid, cwd, current: _shellPtyCount, cap: SHELL_PTY_CAP });
 
     // Heartbeat: detect half-open connections (e.g. iOS Safari background suspends)
     ws.isAlive = true;
@@ -905,6 +1369,7 @@ function installShellWebSocket(httpServer) {
     });
     proc.onExit(({ exitCode }) => {
       if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'exit', exitCode }));
+      releasePty();
       ws.close();
     });
 
@@ -915,7 +1380,10 @@ function installShellWebSocket(httpServer) {
         else if (msg.type === 'resize' && msg.cols && msg.rows) proc.resize(msg.cols, msg.rows);
       } catch { /* ignore malformed */ }
     });
-    ws.on('close', () => { try { proc.kill(); } catch { /* already dead */ } });
+    ws.on('close', () => {
+      try { proc.kill(); } catch { /* already dead */ }
+      releasePty();
+    });
   });
 
   // Server-side heartbeat: ping every 25s, terminate sockets that miss a pong.
@@ -948,6 +1416,7 @@ export default {
         _selfToken = ctx?.token ?? null;
         if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true });
         rescanRuntime();
+        loadSessions();
         startWatcher();
         if (ctx?.httpServer) {
           installRequestMultiplexer(ctx.httpServer, ctx.protocol);
