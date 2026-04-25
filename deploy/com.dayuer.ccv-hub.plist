@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dayuer.ccv-hub</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/opt/homebrew/bin/ccv</string>
+        <string>--d</string>
+        <string>--no-open</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/dayuer</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/dayuer</string>
+        <key>CCV_HUB</key>
+        <string>1</string>
+        <key>CCV_START_PORT</key>
+        <string>7100</string>
+        <key>CCV_MAX_PORT</key>
+        <string>7100</string>
+        <key>CCV_PUBLIC_URL_TEMPLATE</key>
+        <string>https://ccv-{port}.xiaoyuervae.cn:9990/?token={token}</string>
+        <key>CCV_CHILD_PORT_FLOOR</key>
+        <string>7008</string>
+        <key>CCV_CHILD_PORT_CEIL</key>
+        <string>7099</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dayuer/Library/Logs/ccv-hub/stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/dayuer/Library/Logs/ccv-hub/stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
