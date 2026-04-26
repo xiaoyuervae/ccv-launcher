@@ -163,6 +163,30 @@
 
 ---
 
+## 6.6 刘海屏 / 安全区 / PWA standalone / CodeMirror 懒加载（P0+P1.7+P1.8）
+
+**目的**：验证 viewport-fit=cover + env(safe-area-inset-*) + 100dvh 真的按预期工作；CodeMirror 懒加载不再首屏拖慢；iOS PWA standalone meta 生效。
+
+| 步骤 | 期望 |
+|---|---|
+| iPhone Safari 横屏打开 launcher 主页 | 顶部 / 底部内容都贴着安全区，**不被 Dynamic Island 或 home indicator 遮住** |
+| 同上但竖屏滚动一下，让 Safari URL 栏收起 | 整页**不跳**；底部按钮一直可点（之前 100vh 会闪一下/被压住一截）|
+| 进入某个 ccv 实例的 cc-viewer 主界面，调出键盘输入消息 | 输入栏紧贴键盘上方，发送按钮不被键盘吃掉，键盘收起后回原位无错位 |
+| Safari 分享 → 「添加到主屏幕」→ 输入名 ccv → 添加 | 主屏图标位置出现 `ccv` 入口（图标暂时是 favicon fallback，180×180 待补） |
+| 从主屏图标启动 | **没有 Safari 地址栏**（standalone 模式），状态栏是半透明黑 |
+| Chrome DevTools 远程调试 iPhone Safari，进 cc-viewer 但**只看 chat 不点文件** | Network 中**没有** `vendor-codemirror-*.js` 请求；首屏 JS 总下载量较以前少 ~395KB gzip |
+| 在 cc-viewer 里点开一个文件（触发 FileContentView） | 此时才看到 `vendor-codemirror-*.js` 加载，编辑器正常显示 + 高亮 + 滚动 |
+| 启用 iOS 设置 → 辅助功能 → 动态效果 → 减弱动态效果 | "加载更多历史" 按钮的转圈不再转（仅显示静态边框）；流式发送 spinner 也不转（PB1+本次） |
+
+**桌面验证 fallback**：
+1. Chrome DevTools → Network → 进首页：确认 `dist/index.html` 中 `<link rel="modulepreload">` **不含** `vendor-codemirror-*.js`
+2. `curl -s https://ccv.xiaoyuervae.cn:9990/ | grep -c "vendor-codemirror"` → 应为 0
+3. 进入 chat → grep network 没有 vendor-codemirror；点开文件 → grep network 出现 vendor-codemirror 一次
+
+> 已知 TODO：图标资产（`apple-touch-icon.png` 180×180 + `manifest.webmanifest` + icon-192/-512）尚未生成。本机没装 imagemagick 也没有 SVG 源图，留给后续补；当前 PWA 只是 standalone + status-bar 配色生效，主屏图标走 favicon fallback。
+
+---
+
 ## 7. 验收门槛
 
 **全部通过即合格**：
@@ -174,6 +198,7 @@
 - [ ] 5 多轮循环不累积内存/连接
 - [ ] 6 移动端字体/scrollback 生效
 - [ ] 6.5 iPhone 首屏 SSE URL 带 `?limit=50`，重连带 `Last-Event-ID`，无 `load_start` 重发
+- [ ] 6.6 安全区不被 home indicator 遮、URL 栏收起不跳、standalone 启动无地址栏；cc-viewer 首屏 Network 无 `vendor-codemirror-*.js`，开文件后才加载
 
 **任一不过 → DM team-lead，注明：iPhone 型号、iOS 版本、Safari/Chrome 版本、`/healthz` 输出、DevTools console 中所有 `[resilient]` 行**。
 
