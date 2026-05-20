@@ -5,7 +5,6 @@
 // value untouched if the env var is absent so default behavior is preserved.
 
 const PREFIX = '[ccv-launcher]';
-const DEFAULT_TEMPLATE = 'https://ccv-{port}.xiaoyuervae.cn:9990/?token={token}';
 
 function renderTemplate(template, vars) {
   return template.replace(/\{(\w+)\}/g, (match, key) => {

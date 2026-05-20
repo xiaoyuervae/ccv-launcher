@@ -11,27 +11,44 @@
 // they do not become hubs themselves.
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, realpathSync, statSync, unlinkSync, watch } from 'node:fs';
-import { join, basename, resolve as resolvePath } from 'node:path';
+import { dirname, join, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { getWorkspaces, removeWorkspace } from '/opt/homebrew/lib/node_modules/cc-viewer/workspace-registry.js';
-// PB2 module — resumable PTY sessions. Lives only in the fork today (npm
-// build is older). Once P0.3 switches launchd to the fork the parent dir is
-// the same; the absolute path here keeps working either way.
-import { PtySessionManager } from '/Users/dayuer/Projects/cc-viewer/lib/pty-session-manager.js';
 import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 const require = createRequire(import.meta.url);
+
+// cc-viewer ships workspace-registry.js at the install root and
+// pty-session-manager.js under lib/. Resolve relative to the running
+// cli.js (process.argv[1]) so the plugin works for npm-global, Homebrew,
+// or a local fork without baking in a path. Override via CCV_LIB_DIR.
+const CCV_LIB_DIR = process.env.CCV_LIB_DIR
+  || dirname(realpathSync(process.argv[1]));
+// Scoped require so bare names like 'node-pty' / 'ws' resolve from
+// cc-viewer's node_modules (the plugin's own dir has no deps installed).
+const ccvRequire = createRequire(
+  pathToFileURL(join(CCV_LIB_DIR, 'package.json')).href
+);
+const { getWorkspaces, removeWorkspace } = await import(
+  pathToFileURL(join(CCV_LIB_DIR, 'workspace-registry.js')).href
+);
+const { PtySessionManager } = await import(
+  pathToFileURL(join(CCV_LIB_DIR, 'lib/pty-session-manager.js')).href
+);
 
 const PREFIX = '[ccv-launcher]';
 const HUB_ENABLED = process.env.CCV_HUB === '1';
 const RUNTIME_DIR = join(homedir(), '.claude', 'cc-viewer', 'runtime');
-const PUBLIC_TEMPLATE = process.env.CCV_PUBLIC_URL_TEMPLATE
-  || 'https://ccv-{port}.xiaoyuervae.cn:9990/?token={token}';
-// Children land in 7008-7099 (matches the public reverse-proxy rule
-// `ccv-(7000-7099).xiaoyuervae.cn:9990`). The hub itself runs on 7100,
-// outside that range, and is reached via the dedicated subdomain
-// `ccv.xiaoyuervae.cn:9990` so children don't collide with it.
+// Public URL template for child instances exposed via a reverse proxy.
+// When unset, buildPublicUrl returns '' and the UI shows only the LAN URL.
+// Placeholders: {port} {token} {host} {ip}. Example:
+//   CCV_PUBLIC_URL_TEMPLATE='https://ccv-{port}.example.com:9990/?token={token}'
+const PUBLIC_TEMPLATE = process.env.CCV_PUBLIC_URL_TEMPLATE || '';
+// Children land in CCV_CHILD_PORT_FLOOR..CEIL (default 7008-7099) so a
+// reverse-proxy rule like `ccv-(FLOOR-CEIL).<domain>` can match them. The
+// hub itself runs on 7100 (outside that range) and is typically reached
+// via its own dedicated subdomain, so children don't collide with it.
 const HUB_PORT_FLOOR = parseInt(process.env.CCV_CHILD_PORT_FLOOR || '7008', 10);
 const HUB_PORT_CEIL = parseInt(process.env.CCV_CHILD_PORT_CEIL || '7099', 10);
 const SPAWN_TIMEOUT_MS = 15000;
@@ -177,6 +194,7 @@ function renderTemplate(template, vars) {
 }
 
 function buildPublicUrl(entry) {
+  if (!PUBLIC_TEMPLATE) return '';
   return renderTemplate(PUBLIC_TEMPLATE, {
     port: entry.port ?? '',
     token: entry.token ?? '',
@@ -800,7 +818,7 @@ const HTML_PAGE = `<!doctype html>
     let wsUrl;
     const loc = window.location;
     if (pubUrl) {
-      // public: wss://ccv-<port>.xiaoyuervae.cn:9990/ws/terminal
+      // public: wss://<public-host>/ws/terminal (host derived from pubUrl)
       try {
         const u = new URL(pubUrl);
         wsUrl = (u.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + u.host + '/ws/terminal';
@@ -1067,8 +1085,8 @@ function readBody(req, max = 64 * 1024) {
 
 // True when this request belongs to the launcher's own surface
 // (hub-only HTML + JSON API). These bypass ccv's token auth on purpose so the
-// public bookmark `https://ccv.xiaoyuervae.cn:9990/launcher` works without the
-// caller knowing the hub's per-process token.
+// public bookmark `https://<hub-domain>/launcher` works without the caller
+// knowing the hub's per-process token.
 function isLauncherPath(pathname) {
   return pathname === '/launcher' || pathname.startsWith('/launcher/') || pathname.startsWith('/api/launcher/') || pathname === '/healthz';
 }
@@ -1392,12 +1410,12 @@ function installRequestMultiplexer(httpServer, ccvProtocol) {
 function installShellWebSocket(httpServer) {
   let pty;
   try {
-    pty = require('/opt/homebrew/lib/node_modules/cc-viewer/node_modules/node-pty');
+    pty = ccvRequire('node-pty');
   } catch (err) {
     log('node-pty not available, /ws/shell disabled:', err.message);
     return;
   }
-  const { WebSocketServer } = require('/opt/homebrew/lib/node_modules/cc-viewer/node_modules/ws');
+  const { WebSocketServer } = ccvRequire('ws');
   const wss = new WebSocketServer({ noServer: true });
   _shellWss = wss;
 
