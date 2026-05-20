@@ -296,7 +296,7 @@ function waitForChildRuntime(pid, timeoutMs) {
   });
 }
 
-async function doSpawn(targetCwd) {
+async function doSpawn(targetCwd, { force = false } = {}) {
   if (!targetCwd || typeof targetCwd !== 'string') throw new Error('cwd required');
   if (!existsSync(targetCwd) || !statSync(targetCwd).isDirectory()) {
     throw new Error('cwd is not an existing directory');
@@ -306,8 +306,10 @@ async function doSpawn(targetCwd) {
   // already the resolved path, so without this dedup misses on user input
   // that traverses /tmp, /var, etc.
   try { targetCwd = realpathSync(targetCwd); } catch { /* keep original */ }
-  const existing = findRunningByCwd(targetCwd);
-  if (existing) return existing;
+  if (!force) {
+    const existing = findRunningByCwd(targetCwd);
+    if (existing) return existing;
+  }
 
   const port = nextFreePort();
   const cliPath = process.argv[1];
@@ -609,9 +611,10 @@ const HTML_PAGE = `<!doctype html>
       const lan = escape(it.lanUrl || '');
       const openHref = pub || lan || '#';
       let actions = ''
-        + '<button class="btn primary" data-act="open" data-href="'+escape(openHref)+'">Open</button>'
+        + '<button class="btn primary" data-act="open" data-href="'+escape(openHref)+'" data-port="'+(it.port||'')+'">Open</button>'
         + '<button class="btn" data-act="copy" data-text="'+(pub||lan)+'">Copy URL</button>';
       if (!it.isHub) {
+        actions += '<button class="btn" data-act="newhere" data-cwd="'+path+'" data-name="'+name+'" title="Spawn another ccv at the same directory">+ New</button>';
         actions += '<button class="btn" data-act="openterm" data-cwd="'+path+'" data-name="'+name+'">Shell</button>';
         actions += '<button class="btn" data-act="console" data-port="'+(it.port||'')+'" data-token="'+(it.token||'')+'" data-name="'+name+'" data-path="'+path+'" data-pub="'+(it.publicUrl||'')+'" data-lan="'+(it.lanUrl||'')+'">Console</button>';
         actions += '<button class="btn danger" data-act="stop" data-pid="'+it.pid+'" data-name="'+name+'">Stop</button>';
@@ -705,7 +708,12 @@ const HTML_PAGE = `<!doctype html>
     ev.preventDefault();
     const act = t.dataset.act;
     if (act === 'open') {
-      window.open(t.dataset.href, '_blank');
+      // Reuse the per-instance tab on repeat clicks: a stable window name
+      // (keyed by port) makes browsers focus the existing tab instead of
+      // spawning a fresh one that has to reload from scratch.
+      const winName = t.dataset.port ? 'ccv-' + t.dataset.port : '_blank';
+      const w = window.open(t.dataset.href, winName);
+      if (w) { try { w.focus(); } catch {} }
     } else if (act === 'copy') {
       try { await navigator.clipboard.writeText(t.dataset.text || t.textContent); t.style.color='var(--ok)'; setTimeout(()=>t.style.color='', 800); } catch {}
     } else if (act === 'stop') {
@@ -715,6 +723,14 @@ const HTML_PAGE = `<!doctype html>
     } else if (act === 'launch') {
       try { await api('/api/launcher/spawn', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd: t.dataset.cwd }) }); refresh(); }
       catch (e) { alert('Launch failed: ' + e.message); }
+    } else if (act === 'newhere') {
+      const prev = t.textContent;
+      t.disabled = true; t.textContent = 'Launching…';
+      try {
+        await api('/api/launcher/spawn', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd: t.dataset.cwd, force: true }) });
+        refresh();
+      } catch (e) { alert('Launch failed: ' + e.message); }
+      finally { t.disabled = false; t.textContent = prev; }
     } else if (act === 'forget') {
       if (!confirm('Remove this project from history?')) return;
       try { await api('/api/launcher/forget', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ wsId: t.dataset.wsid }) }); refresh(); }
@@ -1274,8 +1290,8 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
   if (url === '/api/launcher/spawn' && method === 'POST') {
     try {
       const raw = await readBody(req);
-      const { cwd } = JSON.parse(raw || '{}');
-      const entry = await serializeSpawn(() => doSpawn(cwd));
+      const { cwd, force } = JSON.parse(raw || '{}');
+      const entry = await serializeSpawn(() => doSpawn(cwd, { force: !!force }));
       sendJson(res, 200, { ok: true, instance: entry });
     } catch (err) {
       log('spawn error:', err.message);
