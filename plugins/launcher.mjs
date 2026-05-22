@@ -1458,24 +1458,26 @@ function parseJsonlFilenameTime(filePath) {
   return Number.isFinite(ms) ? ms : 0;
 }
 
-// Pick the jsonl that represents an instance's "primary" session.
+// Pick the jsonl that represents each peer's currently-active session.
 //
-// Key insight: filename time = the moment ccv intercepted that session's first
-// request. So a ccv's *own* session has a filename time near (>=) startedAt.
-// A jsonl with filename time before startedAt means that ccv resumed an older
-// session.
+// Background: a ccv pid often goes through several jsonl files during its
+// lifetime — every /clear or fresh `claude` launch starts a new file. So the
+// "first file made after startedAt" assumption is fragile: it pins a peer to
+// its earliest session forever, and once the user starts a second session the
+// status badge goes stale ("idle 5h ago" while the new session is actively
+// writing).
 //
-// Algorithm (greedy, latest peer first so each can claim its exact match):
-//   1. Sort peers by startedAt DESC.
-//   2. For each peer, among jsonls not yet taken by another peer:
-//      a. Prefer the smallest fnameMs that is >= startedAt - SLACK_MS
-//         (= the file ccv created at or shortly after launch).
-//      b. If none qualify, fall back to the largest fnameMs < startedAt
-//         (= most recent old session this ccv could have resumed).
-//      c. If neither, fall back to mtime-newest among remaining candidates.
-//   3. Mark picked, move on.
-//
-// This unifies solo and multi-peer cases — solo just runs the loop once.
+// Algorithm:
+//   1. Sort peers by startedAt ASC; each peer owns the fname-time window
+//      [startedAt - slack, next_peer.startedAt - slack). The newest peer's
+//      window extends to +Infinity.
+//   2. Walk peers newest-first (so the freshest peer claims its currently
+//      active file first).
+//   3. For each peer, among unclaimed candidates within its window, pick the
+//      one with the HIGHEST mtime — that's the file currently being written
+//      to. Falls back to "most recent file before startedAt" (resumed
+//      session) or "most recent unclaimed file anywhere" if the window is
+//      empty.
 const PEER_PICKER_SLACK_MS = 60_000;
 function pickInstanceLogs(projectName, instances) {
   if (!projectName || !instances.length) return new Map();
@@ -1496,28 +1498,40 @@ function pickInstanceLogs(projectName, instances) {
   } catch { return new Map(); }
   if (!candidates.length) return new Map();
 
-  const sortedPeers = [...instances].sort((a, b) => {
+  const sortedAsc = [...instances].sort((a, b) => {
     const ta = a.startedAt ? new Date(a.startedAt).getTime() : 0;
     const tb = b.startedAt ? new Date(b.startedAt).getTime() : 0;
-    return tb - ta; // newest first
+    return ta - tb;
+  });
+  const windows = sortedAsc.map((p, i) => {
+    const start = p.startedAt ? new Date(p.startedAt).getTime() : 0;
+    const next = i + 1 < sortedAsc.length
+      ? (sortedAsc[i + 1].startedAt ? new Date(sortedAsc[i + 1].startedAt).getTime() : Infinity)
+      : Infinity;
+    return { pid: p.pid, start, next };
   });
 
   const taken = new Set();
-  const result = new Map(); // pid -> candidate
-
-  for (const peer of sortedPeers) {
-    const startedAt = peer.startedAt ? new Date(peer.startedAt).getTime() : 0;
+  const result = new Map();
+  // Newest peer first so it gets its currently-active file.
+  for (let i = windows.length - 1; i >= 0; i--) {
+    const { pid, start, next } = windows[i];
     const remaining = candidates.filter(c => !taken.has(c.path));
     if (!remaining.length) break;
 
     let pick = null;
-    if (startedAt > 0) {
-      const after = remaining.filter(c => c.fnameMs >= startedAt - PEER_PICKER_SLACK_MS);
-      if (after.length) {
-        after.sort((a, b) => a.fnameMs - b.fnameMs);
-        pick = after[0];
+    if (start > 0) {
+      const inWindow = remaining.filter(c =>
+        c.fnameMs >= start - PEER_PICKER_SLACK_MS &&
+        c.fnameMs < next - PEER_PICKER_SLACK_MS
+      );
+      if (inWindow.length) {
+        // Currently active = most recently written.
+        inWindow.sort((a, b) => b.mtime - a.mtime);
+        pick = inWindow[0];
       } else {
-        const before = remaining.filter(c => c.fnameMs < startedAt - PEER_PICKER_SLACK_MS);
+        // No new file in window → this peer must have resumed an older session.
+        const before = remaining.filter(c => c.fnameMs < start - PEER_PICKER_SLACK_MS);
         if (before.length) {
           before.sort((a, b) => b.fnameMs - a.fnameMs);
           pick = before[0];
@@ -1530,7 +1544,7 @@ function pickInstanceLogs(projectName, instances) {
     }
     if (pick) {
       taken.add(pick.path);
-      result.set(peer.pid, pick);
+      result.set(pid, pick);
     }
   }
 
@@ -1734,7 +1748,7 @@ function inspectToolFlow(entries) {
   // Search entries in reverse
   for (let i = entries.length - 1; i >= 0 && !lastToolUse; i--) {
     const e = entries[i];
-    const content = e?.response?.content;
+    const content = e?.response?.body?.content;
     if (!Array.isArray(content)) continue;
     for (let j = content.length - 1; j >= 0; j--) {
       const b = content[j];
@@ -1786,7 +1800,7 @@ function summarizeEntry(e) {
   // Used in drawer "recent events" list
   const ts = e?.timestamp || '';
   const userPrompt = lastUserPrompt(e);
-  const respContent = e?.response?.content;
+  const respContent = e?.response?.body?.content;
   let assistantText = '';
   let toolUse = null;
   if (Array.isArray(respContent)) {
@@ -1854,25 +1868,72 @@ function deriveStatus({ entries, pendingAsks, fileMtime }) {
   // in-flight Claude API call
   if (latest?.inProgress && age < 5 * 60_000) {
     // streaming; if we already see a tool_use in partial response, surface it
-    const partialContent = latest?.response?.content;
+    const partialContent = latest?.response?.body?.content;
     if (Array.isArray(partialContent)) {
       const toolUse = partialContent.find(b => b?.type === 'tool_use');
       if (toolUse) return { status: 'tool_running', label: `🛠 ${summarizeToolInput(toolUse.name, toolUse.input)}` };
     }
     return { status: 'thinking', label: '🔵 thinking…' };
   }
-  // Tool launched but no result yet → agent (Claude Code) is running it
+  // Tool launched but no result yet → either claude-code is running it, or
+  // the run is gated on the user (permission prompt, long-running cmd they're
+  // ignoring). Use age to split: < 30s = working, ≥ 30s = waiting (most slow
+  // tools that legitimately take >30s do so because they're waiting on
+  // human input — permission approval, foreground bash, etc).
   const { lastToolUse, hasMatchingResult } = inspectToolFlow(entries);
   if (lastToolUse && !hasMatchingResult) {
     const toolAge = now - new Date(lastToolUse.ts).getTime();
-    if (toolAge < 10 * 60_000) {
+    if (toolAge < 30_000) {
       return { status: 'tool_running', label: `🛠 ${summarizeToolInput(lastToolUse.name, lastToolUse.input)}` };
     }
+    if (toolAge < 30 * 60_000) {
+      return { status: 'waiting_tool', label: `⏸ ${summarizeToolInput(lastToolUse.name, lastToolUse.input)} · ${ageString(toolAge)}` };
+    }
+    // ≥ 30 min unanswered → treat as abandoned, fall through to idle
   }
-  if (age > 30 * 60_000) {
-    return { status: 'idle', label: `🟢 idle ${ageString(age)}` };
+  // Assistant finished its turn (text response, no pending tool) and is
+  // waiting for the next user prompt. Within 10 min = actively waiting;
+  // beyond that = user walked away → idle.
+  const lastTextTs = findRecentAssistantTextTs(entries);
+  if (lastTextTs) {
+    const textAge = now - lastTextTs;
+    if (textAge < 10 * 60_000) {
+      return { status: 'waiting_input', label: `⌨ awaiting prompt · ${ageString(textAge)}` };
+    }
   }
   return { status: 'idle', label: `🟢 idle ${ageString(age)}` };
+}
+
+// Walk entries backward. Skip entries with empty response.body.content (cache /
+// placeholder writes). Return the timestamp of the most recent assistant
+// response that contains user-facing text, BUT only if we didn't encounter a
+// tool_use first (a later tool_use means the model is still mid-task, not
+// waiting on the human).
+function findRecentAssistantTextTs(entries) {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const content = entries[i]?.response?.body?.content;
+    if (!Array.isArray(content) || !content.length) continue;
+    if (content.some(b => b?.type === 'tool_use')) return null;
+    if (content.some(b => b?.type === 'text' && (b.text || '').trim())) {
+      const ts = entries[i].timestamp;
+      return ts ? new Date(ts).getTime() : null;
+    }
+  }
+  return null;
+}
+
+// True when the entry is an assistant response containing user-facing text
+// AND no still-pending tool_use (i.e. claude finished talking; the next move
+// is the user's).
+function isAssistantTextEnd(entry) {
+  const content = entry?.response?.body?.content;
+  if (!Array.isArray(content)) return false;
+  let hasText = false;
+  for (const b of content) {
+    if (b?.type === 'tool_use') return false;
+    if (b?.type === 'text' && (b.text || '').trim()) hasText = true;
+  }
+  return hasText;
 }
 
 // ---------- ccusage-style usage / cost reducer ----------
@@ -3382,12 +3443,14 @@ const HTML_PAGE = `<!doctype html>
   /* activity status */
   .activity-row { display:flex; align-items:center; gap:8px; margin:4px 0 8px; font-size:11px; min-height:18px; }
   .badge { display:inline-flex; align-items:center; gap:4px; font-size:10px; font-weight:600; padding:2px 8px; border-radius:10px; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
-  .badge.thinking     { color:#58a6ff; background:rgba(88,166,255,.12); }
-  .badge.tool_running { color:#d29922; background:rgba(210,153,34,.15); }
-  .badge.waiting_ask  { color:#f85149; background:rgba(248,81,73,.15); animation:pulseAsk 1.5s ease-in-out infinite; }
-  .badge.idle         { color:#3fb950; background:rgba(63,185,80,.10); }
-  .badge.no_session   { color:var(--mute); background:var(--tag-bg); }
-  .badge.error        { color:#f85149; background:rgba(248,81,73,.10); }
+  .badge.thinking      { color:#58a6ff; background:rgba(88,166,255,.12); }
+  .badge.tool_running  { color:#d29922; background:rgba(210,153,34,.15); }
+  .badge.waiting_ask   { color:#f85149; background:rgba(248,81,73,.15); animation:pulseAsk 1.5s ease-in-out infinite; }
+  .badge.waiting_input { color:#a371f7; background:rgba(163,113,247,.15); }
+  .badge.waiting_tool  { color:#e3b341; background:rgba(227,179,65,.15); }
+  .badge.idle          { color:#3fb950; background:rgba(63,185,80,.10); }
+  .badge.no_session    { color:var(--mute); background:var(--tag-bg); }
+  .badge.error         { color:#f85149; background:rgba(248,81,73,.10); }
   @keyframes pulseAsk { 0%,100%{opacity:1} 50%{opacity:.55} }
   .preview { color:var(--mute); font-size:11px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   .activity-toggle { background:transparent; border:0; color:var(--mute); cursor:pointer; font-size:11px; padding:0 4px; user-select:none; }
@@ -3744,11 +3807,21 @@ const HTML_PAGE = `<!doctype html>
   </div>
 </dialog>
 
+<dialog id="restart-dlg" style="max-width:420px;width:90%">
+  <h2 style="font-size:14px;margin-bottom:4px">Restart with ccuse profile</h2>
+  <div id="restart-target" style="color:var(--mute);font-size:11px;margin-bottom:10px;font-family:ui-monospace,monospace;word-break:break-all"></div>
+  <div id="restart-profiles" style="display:flex;flex-direction:column;gap:6px"></div>
+  <div class="err" id="restart-err" hidden></div>
+  <div class="row" style="margin-top:14px">
+    <button class="btn" id="restart-cancel">Cancel</button>
+  </div>
+</dialog>
+
 <dialog id="help-dlg">
   <h2>Keyboard shortcuts</h2>
   <table class="kb-table">
     <tr class="kb-row-hd"><td colspan="2">Navigation</td></tr>
-    <tr><td>j  /  n</td><td>jump to next <strong>waiting_ask</strong> instance</td></tr>
+    <tr><td>j  /  n</td><td>jump to next <strong>waiting</strong> instance (ask &gt; tool &gt; input)</td></tr>
     <tr><td>/</td><td>focus tag filter</td></tr>
     <tr><td>?</td><td>show this help</td></tr>
     <tr><td>Esc</td><td>close dialog / overlay</td></tr>
@@ -3806,6 +3879,7 @@ const HTML_PAGE = `<!doctype html>
       + '<button class="btn" data-act="copy" data-text="'+(pub||lan)+'">Copy</button>';
     if (!it.isHub) {
       actions += '<button class="btn" data-act="console" data-port="'+(it.port||'')+'" data-token="'+(it.token||'')+'" data-name="'+name+'" data-path="'+path+'" data-pub="'+(it.publicUrl||'')+'" data-lan="'+(it.lanUrl||'')+'">Console</button>';
+      actions += '<button class="btn" data-act="restart" data-pid="'+it.pid+'" data-cwd="'+path+'" data-name="'+name+'" data-current="'+escape(it.ccuseProfile || '')+'" title="重启换 ccuse profile (当前: '+escape(it.ccuseProfile || '默认')+')">↻ ccuse</button>';
       actions += '<button class="btn danger" data-act="stop" data-pid="'+it.pid+'" data-name="'+name+'">Stop</button>';
     }
     return ''
@@ -3914,15 +3988,17 @@ const HTML_PAGE = `<!doctype html>
   // place to map them to single-char icons + short labels (the longer
   // statusLabel from backend stays available as a tooltip via title=).
   const STATUS_VIEW = {
-    thinking:     { icon: '⏳', short: 'thinking' },
-    tool_running: { icon: '●',  short: 'working'  },
-    waiting_ask:  { icon: '◐',  short: 'waiting'  },
-    idle:         { icon: '○',  short: 'idle'     },
-    no_session:   { icon: '○',  short: 'no log'   },
-    error:        { icon: '⚠',  short: 'error'    },
+    thinking:      { icon: '⏳', short: 'thinking' },
+    tool_running:  { icon: '●',  short: 'working'  },
+    waiting_ask:   { icon: '◐',  short: 'waiting'  },
+    waiting_input: { icon: '⌨',  short: 'await msg'},
+    waiting_tool:  { icon: '⏸',  short: 'tool wait'},
+    idle:          { icon: '○',  short: 'idle'     },
+    no_session:    { icon: '○',  short: 'no log'   },
+    error:         { icon: '⚠',  short: 'error'    },
   };
   function colForStatus(s) {
-    if (s === 'waiting_ask') return 'waiting';
+    if (s === 'waiting_ask' || s === 'waiting_input' || s === 'waiting_tool') return 'waiting';
     if (s === 'thinking' || s === 'tool_running') return 'working';
     return 'idle'; // idle / no_session / error
   }
@@ -4132,6 +4208,13 @@ const HTML_PAGE = `<!doctype html>
       if (!confirm('Stop ccv "'+t.dataset.name+'" (pid '+t.dataset.pid+')?')) return;
       try { await api('/api/launcher/kill', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ pid: parseInt(t.dataset.pid,10) }) }); refresh(); }
       catch (e) { alert('Stop failed: ' + e.message); }
+    } else if (act === 'restart') {
+      openRestartDlg({
+        pid: parseInt(t.dataset.pid, 10),
+        cwd: t.dataset.cwd,
+        name: t.dataset.name,
+        current: t.dataset.current || '',
+      });
     } else if (act === 'launch') {
       try { await api('/api/launcher/spawn', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd: t.dataset.cwd }) }); refresh(); }
       catch (e) { alert('Launch failed: ' + e.message); }
@@ -4237,7 +4320,7 @@ const HTML_PAGE = `<!doctype html>
       const r = await api('/api/launcher/instances/' + pid + '/git-push', {
         method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ force: false }),
       });
-      alert('Pushed:\n' + (r.output || '').slice(0, 1200));
+      alert('Pushed:\\n' + (r.output || '').slice(0, 1200));
       reloadGitTab(pid);
     } catch (e) {
       if (/non-fast-forward|rejected/i.test(e.message) && confirm('Push rejected (non-fast-forward). Retry with --force-with-lease?')) {
@@ -4245,7 +4328,7 @@ const HTML_PAGE = `<!doctype html>
           const r2 = await api('/api/launcher/instances/' + pid + '/git-push', {
             method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ force: true }),
           });
-          alert('Force-pushed:\n' + (r2.output || '').slice(0, 1200));
+          alert('Force-pushed:\\n' + (r2.output || '').slice(0, 1200));
           reloadGitTab(pid);
         } catch (e2) { alert('Force push failed: ' + e2.message); }
       } else {
@@ -4266,7 +4349,7 @@ const HTML_PAGE = `<!doctype html>
         body: JSON.stringify({ title: title.trim(), body, base: base.trim() }),
       });
       if (r.ok === false && r.error) { alert('Open PR failed: ' + r.error); return; }
-      if (r.url) { alert('PR created:\n' + r.url); try { window.open(r.url, '_blank', 'noopener'); } catch {} }
+      if (r.url) { alert('PR created:\\n' + r.url); try { window.open(r.url, '_blank', 'noopener'); } catch {} }
       else { alert('PR created (no URL returned)'); }
     } catch (e) { alert('Open PR failed: ' + e.message); }
   }
@@ -4318,7 +4401,7 @@ const HTML_PAGE = `<!doctype html>
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path, content: ta.value }),
       });
-      alert('Saved · ' + (r.size || 0) + ' bytes' + (r.backup ? '\nbackup: ' + r.backup : ''));
+      alert('Saved · ' + (r.size || 0) + ' bytes' + (r.backup ? '\\nbackup: ' + r.backup : ''));
       // Refresh the Memory tab so size/mtime update
       const container = memRow.closest('[data-tabs-for]');
       if (container) {
@@ -5031,7 +5114,7 @@ const HTML_PAGE = `<!doctype html>
         html += ''
           + '<div class="mem-row" data-mem-path="' + escape(f.path) + '">'
           +   '<div class="mr-hd" data-act="mem-open">'
-          +     '<span class="mr-path" title="' + escape(f.path) + '">' + escape(f.path.replace(/^.*\//, '')) + '</span>'
+          +     '<span class="mr-path" title="' + escape(f.path) + '">' + escape(f.path.replace(/^.*\\//, '')) + '</span>'
           +     '<span class="mr-dir" title="' + escape(f.path) + '">' + escape(dirnameJs(f.path)) + '</span>'
           +     '<span class="mr-meta">' + sizeKB + ' KB · ' + escape(ago) + '</span>'
           +   '</div>'
@@ -5348,6 +5431,74 @@ const HTML_PAGE = `<!doctype html>
     } catch { /* graceful: dropdown stays minimal */ }
   }
 
+  // ---- Restart-with-profile dialog ----
+  // Click ↻ ccuse on a card → list available profiles as buttons; one click
+  // restarts the instance with that profile (SIGTERM + respawn at same cwd).
+  // Current profile is rendered disabled with a "current" badge so the user
+  // doesn't fire a no-op restart by accident.
+  const restartDlg = document.getElementById('restart-dlg');
+  const restartTarget = document.getElementById('restart-target');
+  const restartList = document.getElementById('restart-profiles');
+  const restartErr = document.getElementById('restart-err');
+  let _restartCtx = null;
+  async function openRestartDlg(ctx) {
+    _restartCtx = ctx;
+    restartErr.hidden = true;
+    restartTarget.textContent = (ctx.name || ('pid ' + ctx.pid)) + '  ·  ' + (ctx.cwd || '');
+    restartList.innerHTML = '<div style="color:var(--mute);font-size:12px">loading profiles…</div>';
+    restartDlg.showModal();
+    try {
+      const data = await api('/api/launcher/prefs');
+      const profiles = data.availableProfiles || [];
+      const def = data.defaultCcuseProfile || '';
+      const cur = ctx.current || '';
+      const rows = [];
+      // "default (no ccuse switch)" option matches the spawn dialog's empty value
+      const isDefaultCurrent = cur === '';
+      rows.push(renderProfileBtn('', '— 不切 (launcher 默认)', def === '', isDefaultCurrent));
+      for (const p of profiles) {
+        rows.push(renderProfileBtn(p, p, p === def, p === cur));
+      }
+      restartList.innerHTML = rows.join('') || '<div style="color:var(--mute);font-size:12px">no ccuse profiles found (检查 ~/.zshrc 的 ccuse 函数)</div>';
+    } catch (e) {
+      restartList.innerHTML = '';
+      restartErr.textContent = 'Failed to load profiles: ' + e.message;
+      restartErr.hidden = false;
+    }
+  }
+  function renderProfileBtn(value, label, isDefault, isCurrent) {
+    const tag = (isDefault ? ' <span style="color:var(--mute);font-size:10px">默认</span>' : '')
+              + (isCurrent ? ' <span style="color:var(--accent);font-size:10px">· 当前</span>' : '');
+    const disabled = isCurrent ? 'disabled style="opacity:.5;cursor:default"' : '';
+    return '<button class="btn" data-restart-profile="' + escape(value) + '" ' + disabled + ' style="text-align:left;justify-content:flex-start;padding:8px 12px">'
+      + escape(label) + tag
+      + '</button>';
+  }
+  document.getElementById('restart-cancel').onclick = () => restartDlg.close();
+  restartList.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('[data-restart-profile]');
+    if (!btn || btn.disabled || !_restartCtx) return;
+    const profile = btn.dataset.restartProfile;
+    const label = profile || '默认';
+    restartErr.hidden = true;
+    // Mark in-flight
+    [...restartList.querySelectorAll('button')].forEach(b => b.disabled = true);
+    btn.textContent = '⏳ restarting with ' + label + '…';
+    try {
+      const r = await api('/api/launcher/restart', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ pid: _restartCtx.pid, ccuseProfile: profile }),
+      });
+      restartDlg.close();
+      refresh();
+      // Brief toast via title for the new card; full UX is just the card flipping over.
+    } catch (e) {
+      restartErr.textContent = 'Restart failed: ' + e.message;
+      restartErr.hidden = false;
+      [...restartList.querySelectorAll('button')].forEach(b => b.disabled = false);
+    }
+  });
+
   // Page Visibility-aware poller: pauses when tab is hidden (no point polling
   // a backgrounded iOS Safari tab whose connections may already be suspended)
   // and fires once immediately on visibilitychange→visible so the user sees
@@ -5604,15 +5755,22 @@ const HTML_PAGE = `<!doctype html>
     });
   }
 
-  // j/n: scroll the next waiting_ask instance into view, briefly flash it.
-  // Cycles through all visible (filter-respecting) waiting cards.
+  // j/n: scroll the next waiting instance into view, briefly flash it.
+  // Cycles through all visible (filter-respecting) waiting cards. Priority:
+  // waiting_ask (structured question) > waiting_tool (stalled tool) >
+  // waiting_input (just finished, awaiting next prompt). If the highest tier
+  // has candidates we only cycle within it; else fall back to next tier.
   function jumpToNextWaiting() {
-    const candidates = [...listEl.querySelectorAll('.instance[data-pid]')].filter(el => {
-      // skip filter-hidden groups (offsetParent === null when display:none)
+    const cards = [...listEl.querySelectorAll('.instance[data-pid]')].filter(el => {
       if (el.offsetParent === null) return false;
-      const pid = Number(el.dataset.pid);
-      return _statusByPid.get(pid) === 'waiting_ask';
+      return ['waiting_ask','waiting_tool','waiting_input'].includes(_statusByPid.get(Number(el.dataset.pid)));
     });
+    const tiers = ['waiting_ask','waiting_tool','waiting_input'];
+    let candidates = [];
+    for (const tier of tiers) {
+      candidates = cards.filter(el => _statusByPid.get(Number(el.dataset.pid)) === tier);
+      if (candidates.length) break;
+    }
     if (!candidates.length) return false;
     _jumpIdx = (_jumpIdx + 1) % candidates.length;
     const target = candidates[_jumpIdx];
@@ -5682,9 +5840,9 @@ const HTML_PAGE = `<!doctype html>
           body: JSON.stringify({ paths, force }),
         });
         const msg = ['removed ' + (r.removed || []).length + ' worktree(s)'];
-        if ((r.rejected || []).length) msg.push('rejected:\n' + r.rejected.map(x => '  ' + x.path + ' — ' + x.reason).join('\n'));
-        if (r.needsConfirm) msg.push('\ntip: check "force" to override the safety gate');
-        alert(msg.join('\n'));
+        if ((r.rejected || []).length) msg.push('rejected:\\n' + r.rejected.map(x => '  ' + x.path + ' — ' + x.reason).join('\\n'));
+        if (r.needsConfirm) msg.push('\\ntip: check "force" to override the safety gate');
+        alert(msg.join('\\n'));
         await openWorktreeDlg();
         refreshWorktreeCounter();
         refresh();
@@ -6185,6 +6343,56 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
       sendJson(res, 200, { ok: true });
     } catch (err) {
       log('kill error:', err.message);
+      sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  // Restart an instance with a different ccuse profile.
+  //
+  // Use case: a ccv is running on profile A (e.g. an internal API gateway),
+  // user wants to switch to profile B (e.g. "official" with direct Anthropic
+  // credentials) without manually killing + re-launching from the dialog.
+  //
+  // Semantics: SIGTERM the existing pid, wait briefly for cleanup, then
+  // spawn a fresh ccv at the SAME cwd (which may already BE a worktree path)
+  // with the new profile. We never wrap an existing worktree in another
+  // worktree, so useWorktree is forced false on restart.
+  if (url === '/api/launcher/restart' && method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      const { pid, ccuseProfile } = JSON.parse(raw || '{}');
+      const numericPid = parseInt(pid, 10);
+      if (!Number.isFinite(numericPid)) throw new Error('pid required');
+      if (numericPid === process.pid) throw new Error('cannot restart hub itself');
+      const inst = instances.get(numericPid);
+      if (!inst) throw new Error('unknown pid');
+      if (inst.isHub) throw new Error('cannot restart hub');
+      const cwd = inst.cwd;
+      if (!cwd) throw new Error('instance has no cwd');
+      const profile = typeof ccuseProfile === 'string' ? ccuseProfile.trim() : '';
+      // Persist so the new spawn (and any later spawns at this cwd) pick it up.
+      setCcuseProfile(cwd, profile);
+      // SIGTERM old. Best-effort — if pid is already gone, just continue.
+      try { process.kill(numericPid, 'SIGTERM'); } catch (e) {
+        if (e.code !== 'ESRCH') throw e;
+      }
+      instances.delete(numericPid);
+      // Give the runtime watcher a moment to observe the runtime/<pid>.json
+      // deletion so doSpawn's port allocator and registry view are coherent.
+      await new Promise(r => setTimeout(r, 500));
+      const entry = await serializeSpawn(() => doSpawn(cwd, {
+        ccuseProfile: profile,
+        useWorktree: false,
+      }));
+      sendJson(res, 200, {
+        ok: true,
+        instance: entry,
+        oldPid: numericPid,
+        ccuseProfile: profile,
+      });
+    } catch (err) {
+      log('restart error:', err.message);
       sendJson(res, 400, { error: err.message });
     }
     return;
