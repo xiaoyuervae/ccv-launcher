@@ -28,6 +28,11 @@ import {
   getWorktreeDefault, setWorktreeDefault,
   listCcuseProfiles,
 } from '../src/launcher/prefs.mjs';
+import {
+  pendingPairs, approvedSessions, PAIR_CODE_TTL_MS, SESSION_MAX_AGE,
+  loadSessions, saveSessions, generatePairCode, cleanExpiredPairs,
+  parseCookies, isLanIp, getClientIp, isAuthenticated, shortUA, subjectIdFor,
+} from '../src/launcher/auth.mjs';
 const require = createRequire(import.meta.url);
 
 // cc-viewer ships workspace-registry.js at the install root (≤1.6.266) or
@@ -87,88 +92,6 @@ const HUB_PORT_FLOOR = parseInt(process.env.CCV_CHILD_PORT_FLOOR || '7008', 10);
 const HUB_PORT_CEIL = parseInt(process.env.CCV_CHILD_PORT_CEIL || '7099', 10);
 const SPAWN_TIMEOUT_MS = 15000;
 
-// ---------- pairing auth ----------
-// pendingPairs: code → { code, userAgent, ip, createdAt }
-const pendingPairs = new Map();
-// approvedSessions: sessionToken → { createdAt, userAgent, ip }
-const approvedSessions = new Map();
-const PAIR_CODE_TTL_MS = 5 * 60 * 1000; // 5 min
-const SESSION_MAX_AGE = 30 * 24 * 3600;  // 30 days in seconds
-const SESSIONS_FILE = join(homedir(), '.claude', 'cc-viewer', 'sessions.json');
-function loadSessions() {
-  try {
-    const data = JSON.parse(readFileSync(SESSIONS_FILE, 'utf-8'));
-    const now = Date.now();
-    for (const [token, info] of Object.entries(data)) {
-      if (now - info.createdAt < SESSION_MAX_AGE * 1000) {
-        approvedSessions.set(token, info);
-      }
-    }
-    log(`loaded ${approvedSessions.size} sessions from disk`);
-  } catch { /* file doesn't exist yet */ }
-}
-
-function saveSessions() {
-  try {
-    const dir = join(homedir(), '.claude', 'cc-viewer');
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    const obj = Object.fromEntries(approvedSessions);
-    writeFileSync(SESSIONS_FILE, JSON.stringify(obj, null, 2));
-  } catch (err) { log('saveSessions error:', err.message); }
-}
-
-function generatePairCode() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
-function cleanExpiredPairs() {
-  const now = Date.now();
-  for (const [code, p] of pendingPairs) {
-    if (now - p.createdAt > PAIR_CODE_TTL_MS) pendingPairs.delete(code);
-  }
-}
-
-function parseCookies(cookieHeader) {
-  const cookies = {};
-  if (!cookieHeader) return cookies;
-  for (const part of cookieHeader.split(';')) {
-    const eq = part.indexOf('=');
-    if (eq < 0) continue;
-    cookies[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
-  }
-  return cookies;
-}
-
-function isLanIp(ip) {
-  if (!ip) return false;
-  if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return true;
-  const v4 = ip.startsWith('::ffff:') ? ip.slice(7) : ip;
-  return v4.startsWith('192.168.') || v4.startsWith('10.') || /^172\.(1[6-9]|2\d|3[01])\./.test(v4);
-}
-
-function getClientIp(req) {
-  return req.headers['x-real-ip'] || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '';
-}
-
-function isAuthenticated(req) {
-  // LAN requests skip auth
-  if (isLanIp(getClientIp(req))) return true;
-  const cookies = parseCookies(req.headers.cookie);
-  const token = cookies.ccv_session;
-  return token && approvedSessions.has(token);
-}
-
-function shortUA(ua) {
-  if (!ua) return 'Unknown';
-  if (/iPhone/i.test(ua)) return 'iPhone';
-  if (/iPad/i.test(ua)) return 'iPad';
-  if (/Android/i.test(ua)) return 'Android';
-  if (/Mac/i.test(ua)) return 'Mac';
-  if (/Windows/i.test(ua)) return 'Windows';
-  if (/Linux/i.test(ua)) return 'Linux';
-  return 'Browser';
-}
-
 // in-memory instance map: pid → runtime payload (with augmented urls / status)
 const instances = new Map();
 let _selfPort = null;
@@ -190,16 +113,6 @@ let _shellWss = null;
 // installShellWebSocket so node-pty/ws resolution failures are isolated to
 // /ws/shell setup, not the whole plugin.
 let _ptyManager = null;
-
-// Stable subject id for PtySessionManager. Public requests carry the HMAC
-// session cookie (one per paired device → per-device sessions). LAN requests
-// have no cookie; we fall back to `lan:<ip>` so two devices on the same LAN
-// don't share each other's session pool.
-function subjectIdFor(req) {
-  const cookies = parseCookies(req.headers.cookie);
-  if (cookies.ccv_session) return 'sess:' + cookies.ccv_session;
-  return 'lan:' + (getClientIp(req) || 'unknown');
-}
 
 function safeJson(filePath) {
   try { return JSON.parse(readFileSync(filePath, 'utf-8')); } catch { return null; }
