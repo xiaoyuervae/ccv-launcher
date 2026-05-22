@@ -1,5 +1,18 @@
 # M2 — worktree + commit/push + Open PR test plan
 
+> ⚠ DANGER — read before running any step:
+> - **NEVER** touch port **7100** — that's the prod launchd hub (`com.dayuer.ccv-hub`).
+>   Always bring up a separate test hub on port **7200**.
+> - **NEVER** run any `launchctl` command (`kickstart`, `unload`, `bootout`, …)
+>   against the prod hub. KeepAlive will respawn it but real children + active
+>   sessions get interrupted.
+> - **NEVER** write to `~/.claude/CLAUDE.md` or any file under `~/.claude/` as
+>   part of this test — that's the user's real global config (Conventional
+>   Commits rules, internal-network gotchas, vault paths). Loss is silent +
+>   permanent. Use the `/tmp/ccv-*-fixture` directories below instead.
+>
+> If you need to verify behavior on the prod hub, **ask the user first.**
+
 Backend + UI for spawning ccv instances in dedicated git worktrees, then
 committing / pushing / opening PRs from the launcher dashboard's per-card Git
 tab.
@@ -45,21 +58,41 @@ push / cleanup gating) was validated in-process via
 - push to local bare remote via `--set-upstream origin <branch>:<branch>` works
 - cleanup refuses when `dirty=true`; allows when clean + ahead=0
 
-## 2. End-to-end with the live hub
+## 2. End-to-end with an isolated TEST hub on port 7200
 
-The user's launchd hub (`com.dayuer.ccv-hub`) loads `plugins/launcher.mjs` via
-the symlink `~/.claude/cc-viewer/plugins/launcher.mjs`. To pick up the M2
-changes:
+The user's prod hub at port 7100 (`com.dayuer.ccv-hub`) MUST stay running and
+MUST NOT be kickstart-ed. Bring up a separate test hub on port 7200 from the
+same `plugins/launcher.mjs` source (via the existing
+`~/.claude/cc-viewer/plugins/launcher.mjs` symlink):
 
 ```sh
-launchctl kickstart -k gui/$UID/com.dayuer.ccv-hub
-# KeepAlive=true respawns within ~1s; verify:
-sleep 2 && curl -s http://127.0.0.1:7100/healthz
+# 0. Make sure 7200 is free; bail loud if something else owns it.
+lsof -nP -iTCP:7200 -sTCP:LISTEN || echo "port 7200 free, ok"
+# If anything is on 7200 from a previous run, find + kill it (NEVER 7100):
+TEST_HUB_PID=$(lsof -nP -iTCP:7200 -sTCP:LISTEN -t || true)
+[ -n "$TEST_HUB_PID" ] && kill "$TEST_HUB_PID" && sleep 1
+
+# 1. Start the test hub bound to 7200 only. NOT under launchctl —
+#    it dies cleanly with ^C / kill, never restarts itself, never
+#    interferes with the prod hub.
+CCV_HUB=1 \
+CCV_START_PORT=7200 CCV_MAX_PORT=7200 \
+CCV_CHILD_PORT_FLOOR=7008 CCV_CHILD_PORT_CEIL=7099 \
+ccv --d --no-open &
+
+# 2. Verify it's up
+sleep 2 && curl -s http://127.0.0.1:7200/healthz
+```
+
+When you're done with the test session, kill the test hub:
+
+```sh
+kill $(lsof -nP -iTCP:7200 -sTCP:LISTEN -t)
 ```
 
 ### 2.1 Spawn with worktree (UI)
 
-1. Open `http://127.0.0.1:7100/launcher` in a browser.
+1. Open `http://127.0.0.1:7200/launcher` in a browser.
 2. Click **+ New**, select `/tmp/ccv-m2-demo`, tick `新建 git worktree`, click **Launch**.
 3. Card appears in dashboard with branch chip `🌿 ccv/ccv-m2-demo-<hex>` in the head row.
 4. Top bar shows `🌿 1` counter.
@@ -89,7 +122,7 @@ echo "// new line by m2 test" >> /tmp/ccv-m2-demo/.claude/worktrees/ccv-m2-demo-
 curl equivalent (substitute the pid from `/api/launcher/list`):
 
 ```sh
-curl -s http://127.0.0.1:7100/api/launcher/instances/<pid>/git-diff | jq
+curl -s http://127.0.0.1:7200/api/launcher/instances/<pid>/git-diff | jq
 ```
 
 ### 2.4 Commit
@@ -101,7 +134,7 @@ curl -s http://127.0.0.1:7100/api/launcher/instances/<pid>/git-diff | jq
 curl equivalent:
 
 ```sh
-curl -s -X POST http://127.0.0.1:7100/api/launcher/instances/<pid>/git-commit \
+curl -s -X POST http://127.0.0.1:7200/api/launcher/instances/<pid>/git-commit \
   -H 'Content-Type: application/json' \
   -d '{"message": "feat: add a line via launcher"}'
 # → { "ok": true, "sha": "<full-sha>", "output": "[ccv/... <short>] feat: ..." }
@@ -123,7 +156,7 @@ git -C /tmp/ccv-m2-remote branch --list
 curl equivalent:
 
 ```sh
-curl -s -X POST http://127.0.0.1:7100/api/launcher/instances/<pid>/git-push \
+curl -s -X POST http://127.0.0.1:7200/api/launcher/instances/<pid>/git-push \
   -H 'Content-Type: application/json' -d '{"force": false}'
 ```
 
@@ -157,8 +190,8 @@ checkbox and retry → confirms destructive intent, then removes.
 curl equivalents:
 
 ```sh
-curl -s http://127.0.0.1:7100/api/launcher/worktrees | jq
-curl -s -X POST http://127.0.0.1:7100/api/launcher/worktrees/cleanup \
+curl -s http://127.0.0.1:7200/api/launcher/worktrees | jq
+curl -s -X POST http://127.0.0.1:7200/api/launcher/worktrees/cleanup \
   -H 'Content-Type: application/json' \
   -d '{"paths": ["/tmp/ccv-m2-demo/.claude/worktrees/ccv-m2-demo-<hex>"], "force": false}'
 ```
