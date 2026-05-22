@@ -11,7 +11,7 @@
 // the last-known value (or a {pending:true} sentinel) plus a background
 // refresh; the next caller gets fresh data without blocking the first.
 
-import { existsSync, statSync, readFileSync, writeFileSync, createReadStream, mkdirSync, realpathSync } from 'node:fs';
+import { existsSync, statSync, readFileSync, writeFileSync, readdirSync, createReadStream, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -35,6 +35,10 @@ import { getCompactThreshold } from './prefs.mjs';
 const PLUGIN_DIR = dirname(realpathSync(fileURLToPath(import.meta.url)));
 const PRICING_PATH = join(PLUGIN_DIR, '..', '..', 'vendor', 'pricing.json');
 const MODELS_PATH = join(PLUGIN_DIR, '..', '..', 'vendor', 'models.json');
+// Claude Code's native session jsonl root — distinct from ccv's intercepted
+// log dir (LOG_DIR in activity.mjs). One subdir per cwd, with cwd encoded
+// by replacing "/" with "-".
+const PROJECTS_DIR = join(homedir(), '.claude', 'projects');
 export const USAGE_CACHE_FILE = join(homedir(), '.claude', 'cc-viewer', 'launcher-cache.json');
 export const USAGE_CACHE_TTL_MS = 60_000;
 
