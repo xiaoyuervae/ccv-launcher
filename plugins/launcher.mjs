@@ -4028,13 +4028,19 @@ const HTML_PAGE = `<!doctype html>
         srcTag.removeAttribute('title');
       }
 
-      const tip = ['source: ' + q.source];
-      if (q.plan_name) tip.push('plan: ' + q.plan_name);
-      if (q.burn_rate) tip.push('burn: ' + Math.round(q.burn_rate) + ' tok/min');
-      if (q.projection_minutes) tip.push('to limit: ' + fmtMinutes(q.projection_minutes));
+      // Always render the full field set so the user sees the schema; missing
+      // values (common for ccline_cache, which omits plan/burn/projection)
+      // fall back to "—" instead of being silently skipped.
+      const dash = '—';
+      const tip = ['source: ' + (q.source || dash)];
+      tip.push('plan: ' + (q.plan_name || dash));
+      tip.push('burn: ' + (q.burn_rate ? Math.round(q.burn_rate) + ' tok/min' : dash));
+      tip.push('to limit: ' + (q.projection_minutes ? fmtMinutes(q.projection_minutes) : dash));
       if (q.reset_at) {
         const remain = (new Date(q.reset_at).getTime() - Date.now()) / 60000;
-        if (remain > 0) tip.push('reset in: ' + fmtMinutes(remain));
+        tip.push('reset in: ' + (remain > 0 ? fmtMinutes(remain) : dash));
+      } else {
+        tip.push('reset in: ' + dash);
       }
       el.title = tip.join('\\n');
     } catch {
