@@ -1103,25 +1103,42 @@ const MD_PREVIEW_BYTES = 200;
 const MD_BACKUP_KEEP = 5;
 const HOME_CLAUDE_DIR = join(homedir(), '.claude');
 
+// Resolve any symlinks on absPath. If the leaf doesn't exist yet (legitimate
+// for first-time create writes), fall back to realpath(parent) + basename so
+// the parent's real location is what we whitelist-check. Returns null if
+// neither the path nor its parent can be realpath'd (path is unreachable).
+function safeRealpath(absPath) {
+  try { return realpathSync(absPath); } catch { /* leaf may not exist */ }
+  try {
+    const parentReal = realpathSync(dirname(absPath));
+    return join(parentReal, basename(absPath));
+  } catch { return null; }
+}
+
 function isAllowedMdPath(absPath) {
-  // resolvePath instead of realpath so we work for files that don't exist
-  // yet (first-time save into a new CLAUDE.md). Caller is responsible for
-  // passing an absolute path.
-  const resolved = resolvePath(absPath);
-  if (!resolved.endsWith('.md')) return false;
+  // Two-stage check: shape on the raw resolved path, then *real* path
+  // (symlinks expanded) against the whitelist roots. Without the realpath
+  // expansion, an attacker who can write to ~/.claude/ (a user-writable dir)
+  // can plant a symlink ~/.claude/x.md → /etc/passwd and read/write any
+  // user-accessible file via /api/launcher/file. Caller passes an absolute
+  // path.
+  const lexical = resolvePath(absPath);
+  if (!lexical.endsWith('.md')) return false;
+  const real = safeRealpath(lexical);
+  if (!real || !real.endsWith('.md')) return false;
   // Allowed root 1: anywhere under ~/.claude (CLAUDE.md, rules/*.md, etc.)
-  if (isInsideDir(resolved, HOME_CLAUDE_DIR)) return true;
+  if (isInsideDir(real, HOME_CLAUDE_DIR)) return true;
   // Allowed roots 2 & 3: for any known instance cwd —
   //   (a) a file named CLAUDE.md anywhere on the cwd's ancestor chain
   //   (b) any .md file under cwd/.claude/ (skills, memory, etc.)
-  const base = basename(resolved);
-  const dir = dirname(resolved);
+  const base = basename(real);
+  const dir = dirname(real);
   for (const inst of instances.values()) {
     const cwd = inst && inst.cwd;
     if (!cwd) continue;
     if (base === 'CLAUDE.md' && isInsideDir(cwd, dir)) return true;
     const dotClaude = join(cwd, '.claude');
-    if (isInsideDir(resolved, dotClaude)) return true;
+    if (isInsideDir(real, dotClaude)) return true;
   }
   return false;
 }
