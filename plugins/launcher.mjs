@@ -3325,6 +3325,24 @@ const HTML_PAGE = `<!doctype html>
   .err-group .eg-tool { color:var(--bad); font-weight:600; min-width:60px; flex-shrink:0; }
   .err-group .eg-pattern { flex:1; min-width:0; color:#f0a4a0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .err-group .eg-count { color:var(--mute); flex-shrink:0; }
+  /* Git tab */
+  .git-summary { display:flex; flex-wrap:wrap; gap:8px; align-items:baseline; padding:4px 0 8px; border-bottom:1px dotted var(--line); margin-bottom:6px; font-family:ui-monospace,monospace; font-size:11px; }
+  .git-summary .g-branch { color:#a5d6ff; font-weight:600; }
+  .git-summary .g-stat-add { color:var(--ok); }
+  .git-summary .g-stat-del { color:var(--bad); }
+  .git-summary .g-stat-files { color:var(--mute); }
+  .git-summary .g-ahead { color:var(--warn); }
+  .git-summary .g-ahead.g-muted { color:var(--mute); }
+  .git-files { max-height:160px; overflow-y:auto; margin-bottom:8px; }
+  .g-file { display:flex; gap:8px; align-items:baseline; font-family:ui-monospace,monospace; font-size:10px; padding:2px 0; border-bottom:1px dotted var(--line); }
+  .g-file:last-child { border-bottom:0; }
+  .g-file .g-path { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--fg); }
+  .g-file.g-untracked .g-path { color:#8ddc94; }
+  .g-file .g-tag-new { font-size:9px; color:var(--ok); background:rgba(63,185,80,.10); padding:0 5px; border-radius:8px; margin-left:4px; }
+  .g-file .g-loc { color:var(--mute); flex-shrink:0; }
+  .git-actions { display:flex; gap:6px; flex-wrap:wrap; padding-top:4px; border-top:1px dotted var(--line); }
+  .git-actions .btn[disabled] { opacity:.4; cursor:not-allowed; }
+  .instance-head .wt-tag { font-size:10px; color:#8ddc94; background:rgba(63,185,80,.10); padding:1px 6px; border-radius:3px; font-family:ui-monospace,monospace; }
   .err-group .eg-samples { display:none; padding:4px 0 0 0; }
   .err-group.open .eg-samples { display:block; }
   .err-sample { font-family:ui-monospace,monospace; font-size:10px; color:var(--mute); padding:3px 0; white-space:pre-wrap; word-break:break-all; border-left:2px solid var(--line); padding-left:8px; margin:4px 0; }
@@ -3589,6 +3607,7 @@ const HTML_PAGE = `<!doctype html>
       +     '<span class="tag">up '+fmtAge(it.startedAt)+'</span>'
       +     (it.version ? '<span class="tag">'+escape(it.version)+'</span>' : '')
       +     (it.external ? '<span class="ext-tag" title="外部发现 — 此 ccv 在 launcher 插件加载前就已经启动，没自动注册到 runtime/，由 launcher 通过 lsof + /api/version-info 反向发现并接管">外部</span>' : '')
+      +     (it.worktree ? '<span class="wt-tag" title="git worktree: ' + escape(it.worktree.path || '') + ' (base ' + escape(it.worktree.baseRef || '') + ')">🌿 ' + escape(it.worktree.branch || '') + '</span>' : '')
       +     (it.isHub ? '' : '<span class="tag cost" data-cost-for="' + it.pid + '" hidden></span>')
       +   '</div>'
       +   '<div class="card-title" data-title-for="' + it.pid + '"></div>'
@@ -3606,7 +3625,7 @@ const HTML_PAGE = `<!doctype html>
               + (pub ? '<div class="url-row">Public: <a href="#" data-act="copy" data-text="'+pub+'">'+pub+'</a></div>' : '')
               + (pub ? '<div class="qr" data-qr="'+pub+'"></div>' : '')
               + '</details>'
-            : '<details><summary>Details &middot; URLs &middot; Summary &middot; Edits &middot; Errors</summary>'
+            : '<details><summary>Details &middot; URLs &middot; Summary &middot; Edits &middot; Errors' + (it.worktree ? ' &middot; Git' : '') + '</summary>'
               + '<div class="card-tabs" data-tabs-for="' + it.pid + '">'
               +   '<div class="tab-strip" role="tablist">'
               +     '<button class="tab-btn active" data-tab-btn="urls"    data-pid="' + it.pid + '">URLs &middot; QR</button>'
@@ -3614,6 +3633,7 @@ const HTML_PAGE = `<!doctype html>
               +     '<button class="tab-btn"        data-tab-btn="edits"   data-pid="' + it.pid + '">Edits</button>'
               +     '<button class="tab-btn"        data-tab-btn="errors"  data-pid="' + it.pid + '">Errors</button>'
               +     '<button class="tab-btn"        data-tab-btn="threshold" data-pid="' + it.pid + '" data-cwd="' + escape(it.cwd || '') + '">Threshold</button>'
+              +     (it.worktree ? '<button class="tab-btn" data-tab-btn="git" data-pid="' + it.pid + '">Git</button>' : '')
               +   '</div>'
               +   '<div class="tab-panel" data-tab-panel="urls" data-pid="' + it.pid + '">'
               +     (lan ? '<div class="url-row">LAN: <a href="#" data-act="copy" data-text="'+lan+'">'+lan+'</a></div>' : '')
@@ -3625,6 +3645,7 @@ const HTML_PAGE = `<!doctype html>
               +   '<div class="tab-panel" data-tab-panel="edits"   data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>'
               +   '<div class="tab-panel" data-tab-panel="errors"  data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>'
               +   '<div class="tab-panel" data-tab-panel="threshold" data-pid="' + it.pid + '" data-cwd="' + escape(it.cwd || '') + '" hidden><div class="tab-empty">click to load…</div></div>'
+              +   (it.worktree ? '<div class="tab-panel" data-tab-panel="git" data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>' : '')
               + '</div>'
               + '</details>')
       +   '<div class="instance-actions">' + actions + '</div>'
@@ -3972,6 +3993,83 @@ const HTML_PAGE = `<!doctype html>
         if (_lastListData.items.length) render(_lastListData.items, _lastListData.history, _lastListData.localCc);
       } catch (e) { alert('删除标签失败: ' + e.message); }
     }
+  });
+
+  // ---- M2: Git tab actions (commit / push / open PR) ----
+  // Three buttons inside the Git tab — each opens a tiny inline dialog (no
+  // <dialog> markup; prompt() / textarea modal is enough for now). Refresh
+  // the tab after each successful op so the file list / ahead counter update.
+  function reloadGitTab(pid) {
+    const st = _tabState.get(pid); if (st) st.cache.git = null;
+    loadTabData(pid, 'git');
+  }
+  async function gitCommitFlow(pid) {
+    const container = document.querySelector('[data-tabs-for="' + pid + '"]');
+    const aliasOrName = (container && container.closest('.group')) ? (container.closest('.group').querySelector('.group-name')?.textContent || '') : '';
+    const template = aliasOrName ? aliasOrName + ': ' : '';
+    const message = window.prompt('Commit message (worktree branch):', template);
+    if (message == null) return;
+    if (!message.trim()) { alert('Commit message required'); return; }
+    try {
+      const r = await api('/api/launcher/instances/' + pid + '/git-commit', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ message }),
+      });
+      if (r.nothingToCommit) { alert('Nothing to commit (working tree clean)'); }
+      else { alert('Committed ' + (r.sha || '').slice(0,8)); }
+      reloadGitTab(pid);
+    } catch (e) { alert('Commit failed: ' + e.message); }
+  }
+  async function gitPushFlow(pid) {
+    if (!confirm('Push worktree branch to origin (--force-with-lease only when retrying)?')) return;
+    try {
+      const r = await api('/api/launcher/instances/' + pid + '/git-push', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ force: false }),
+      });
+      alert('Pushed:\n' + (r.output || '').slice(0, 1200));
+      reloadGitTab(pid);
+    } catch (e) {
+      if (/non-fast-forward|rejected/i.test(e.message) && confirm('Push rejected (non-fast-forward). Retry with --force-with-lease?')) {
+        try {
+          const r2 = await api('/api/launcher/instances/' + pid + '/git-push', {
+            method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ force: true }),
+          });
+          alert('Force-pushed:\n' + (r2.output || '').slice(0, 1200));
+          reloadGitTab(pid);
+        } catch (e2) { alert('Force push failed: ' + e2.message); }
+      } else {
+        alert('Push failed: ' + e.message);
+      }
+    }
+  }
+  async function gitOpenPrFlow(pid) {
+    const container = document.querySelector('[data-tabs-for="' + pid + '"]');
+    const aliasOrName = (container && container.closest('.group')) ? (container.closest('.group').querySelector('.group-name')?.textContent || '') : '';
+    const title = window.prompt('PR title:', aliasOrName ? aliasOrName + ': ' : '');
+    if (title == null || !title.trim()) return;
+    const body = window.prompt('PR body (markdown ok; empty = blank):', '') || '';
+    const base = window.prompt('Base branch (blank = auto-detect):', '') || '';
+    try {
+      const r = await api('/api/launcher/instances/' + pid + '/open-pr', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ title: title.trim(), body, base: base.trim() }),
+      });
+      if (r.ok === false && r.error) { alert('Open PR failed: ' + r.error); return; }
+      if (r.url) { alert('PR created:\n' + r.url); try { window.open(r.url, '_blank', 'noopener'); } catch {} }
+      else { alert('PR created (no URL returned)'); }
+    } catch (e) { alert('Open PR failed: ' + e.message); }
+  }
+  listEl.addEventListener('click', (ev) => {
+    const t = ev.target.closest('[data-act]');
+    if (!t) return;
+    const act = t.dataset.act;
+    if (act !== 'git-commit' && act !== 'git-push' && act !== 'git-pr') return;
+    ev.preventDefault();
+    const pid = parseInt(t.dataset.pid, 10);
+    if (!Number.isFinite(pid)) return;
+    if (act === 'git-commit') gitCommitFlow(pid);
+    else if (act === 'git-push') gitPushFlow(pid);
+    else if (act === 'git-pr') gitOpenPrFlow(pid);
   });
 
   // ---- Terminal overlay ----
@@ -4451,11 +4549,12 @@ const HTML_PAGE = `<!doctype html>
     try { return new Date(ts).toLocaleTimeString([], { hour12: false }); } catch { return ''; }
   }
 
-  const TAB_LABEL = { urls: 'URLs · QR', summary: 'Summary', edits: 'Edits', errors: 'Errors', threshold: 'Threshold' };
+  const TAB_LABEL = { urls: 'URLs · QR', summary: 'Summary', edits: 'Edits', errors: 'Errors', threshold: 'Threshold', git: 'Git' };
   const TAB_ENDPOINT = {
     summary: pid => '/api/launcher/instances/' + pid + '/run-summary',
     edits:   pid => '/api/launcher/instances/' + pid + '/recent-edits',
     errors:  pid => '/api/launcher/instances/' + pid + '/errors',
+    git:     pid => '/api/launcher/instances/' + pid + '/git-diff',
     // 'threshold' has no fetch endpoint — it's a per-cwd form driven by
     // compactStatus from the activity payload and by POSTing to
     // /api/launcher/prefs/compact-threshold on Save.
@@ -4513,6 +4612,7 @@ const HTML_PAGE = `<!doctype html>
     if (tab === 'summary') n = data.totalEvents != null ? data.totalEvents : (data.events ? data.events.length : 0);
     else if (tab === 'edits') n = data.totalUniqueTargets != null ? data.totalUniqueTargets : ((data.files || []).length + (data.bash || []).length);
     else if (tab === 'errors') n = data.total != null ? data.total : (data.groups ? data.groups.length : 0);
+    else if (tab === 'git') n = (data.files || []).length;
     btn.innerHTML = escape(TAB_LABEL[tab]) + (n ? ' <span class="tab-count">' + n + '</span>' : '');
     if (tab === 'errors') btn.classList.toggle('has-error', n > 0);
   }
@@ -4521,6 +4621,7 @@ const HTML_PAGE = `<!doctype html>
     if (tab === 'summary')     panel.innerHTML = renderRunSummaryHTML(data);
     else if (tab === 'edits')  panel.innerHTML = renderRecentEditsHTML(data);
     else if (tab === 'errors') panel.innerHTML = renderErrorsHTML(data);
+    else if (tab === 'git')    panel.innerHTML = renderGitHTML(pid, data);
   }
 
   const EVENT_ICON = {
@@ -4605,6 +4706,36 @@ const HTML_PAGE = `<!doctype html>
         +   '<div class="eg-samples">' + samples + '</div>'
         + '</div>';
     }).join('');
+  }
+
+  function renderGitHTML(pid, d) {
+    const stat = d.stat || { additions: 0, deletions: 0, files: 0 };
+    const wt = d.worktree || {};
+    const files = d.files || [];
+    const ahead = d.ahead || 0;
+    const head = ''
+      + '<div class="git-summary">'
+      +   '<span class="g-branch" title="base: ' + escape(wt.baseRef || '') + '">🌿 ' + escape(wt.branch || '?') + '</span>'
+      +   '<span class="g-stat-add">+' + stat.additions + '</span>'
+      +   '<span class="g-stat-del">-' + stat.deletions + '</span>'
+      +   '<span class="g-stat-files">in ' + stat.files + ' file' + (stat.files === 1 ? '' : 's') + '</span>'
+      +   (ahead ? '<span class="g-ahead">· ' + ahead + ' ahead of origin</span>' : '<span class="g-ahead g-muted">· in sync with origin</span>')
+      + '</div>';
+    const fileRows = files.length
+      ? '<div class="git-files">' + files.map(f => ''
+          + '<div class="g-file' + (f.untracked ? ' g-untracked' : '') + '">'
+          +   '<span class="g-path" title="' + escape(f.path || '') + '">' + escape(f.path || '') + (f.untracked ? ' <span class="g-tag-new">new</span>' : '') + '</span>'
+          +   '<span class="g-loc">+' + (f.additions || 0) + ' -' + (f.deletions || 0) + '</span>'
+          + '</div>'
+        ).join('') + '</div>'
+      : '<div class="tab-empty">working tree clean' + (ahead ? ' · ' + ahead + ' commit' + (ahead === 1 ? '' : 's') + ' ready to push' : '') + '</div>';
+    const actions = ''
+      + '<div class="git-actions">'
+      +   '<button class="btn primary" data-act="git-commit" data-pid="' + pid + '"' + (files.length ? '' : ' disabled') + '>Commit</button>'
+      +   '<button class="btn" data-act="git-push" data-pid="' + pid + '"' + (ahead || files.length ? '' : ' disabled title="nothing to push"') + '>Push</button>'
+      +   '<button class="btn" data-act="git-pr" data-pid="' + pid + '">Open PR</button>'
+      + '</div>';
+    return head + fileRows + actions;
   }
 
   function renderCompactAlert(el, status) {
@@ -4737,7 +4868,7 @@ const HTML_PAGE = `<!doctype html>
         container.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tabBtn === st.activeTab));
         container.querySelectorAll('.tab-panel').forEach(p => p.hidden = p.dataset.tabPanel !== st.activeTab);
       }
-      for (const t of ['summary', 'edits', 'errors']) {
+      for (const t of ['summary', 'edits', 'errors', 'git']) {
         if (!st.cache[t]) continue;
         const panel = container.querySelector('[data-tab-panel="' + t + '"]');
         if (panel) renderTabPanel(pid, t, panel, st.cache[t]);
@@ -5900,6 +6031,211 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
         total: r ? r.total : 0,
         computedAt: r ? r.computedAt : Date.now(),
       });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ---- M2: git operations on a worktree-spawned instance ----
+  // All four endpoints below resolve `pid → instance.cwd` from our in-memory
+  // `instances` Map, then refuse if that pid has no entry in `_pidWorktrees`
+  // (i.e. it wasn't spawned via useWorktree=true). This keeps git mutations
+  // confined to the dedicated worktree branch — we never run commit/push
+  // against the user's main checkout.
+  const gitDiffM = url.match(/^\/api\/launcher\/instances\/(\d+)\/git-diff$/);
+  if (gitDiffM && method === 'GET') {
+    try {
+      const pid = parseInt(gitDiffM[1], 10);
+      const inst = instances.get(pid);
+      if (!inst) { sendJson(res, 404, { error: 'instance not found' }); return; }
+      const wt = worktreeForPid(pid);
+      if (!wt) { sendJson(res, 400, { error: 'instance not spawned in a worktree' }); return; }
+      // numstat: "<added>\t<deleted>\t<path>" per line. Includes both staged
+      // (HEAD vs index) and unstaged (index vs working) by diffing HEAD vs
+      // working tree directly. For untracked files git diff is silent, so we
+      // surface them via `git status --porcelain` and synthesize a row with
+      // +<line_count> -0 (best-effort line count from cat).
+      let files = [];
+      try {
+        const out = gitInCwd(wt.path, ['diff', 'HEAD', '--numstat', '--no-color', '-z']);
+        // -z mode: each record is `<added>\t<deleted>\t<path>\0`. For renames
+        // the format is `<added>\t<deleted>\t\0<from>\0<to>\0` which we don't
+        // try to parse in detail; render as `to` only.
+        const parts = out.split('\0').filter(Boolean);
+        for (let i = 0; i < parts.length; i++) {
+          const rec = parts[i];
+          const tab1 = rec.indexOf('\t');
+          const tab2 = rec.indexOf('\t', tab1 + 1);
+          if (tab1 < 0 || tab2 < 0) continue;
+          const added = rec.slice(0, tab1);
+          const deleted = rec.slice(tab1 + 1, tab2);
+          let path = rec.slice(tab2 + 1);
+          if (!path) {
+            // rename: next two tokens are <from> and <to>; take <to>
+            path = parts[i + 2] || '';
+            i += 2;
+          }
+          if (!path) continue;
+          files.push({
+            path,
+            additions: added === '-' ? null : parseInt(added, 10) || 0,
+            deletions: deleted === '-' ? null : parseInt(deleted, 10) || 0,
+          });
+        }
+      } catch (err) { /* empty diff → out=='' so files stays [] */ }
+      let untracked = [];
+      try {
+        const out = gitInCwd(wt.path, ['status', '--porcelain=v1', '-z', '--untracked-files=normal']);
+        const parts = out.split('\0').filter(Boolean);
+        for (const rec of parts) {
+          if (rec.length < 3) continue;
+          const code = rec.slice(0, 2);
+          const path = rec.slice(3);
+          if (code === '??') untracked.push(path);
+        }
+      } catch { /* ignore */ }
+      for (const path of untracked) {
+        if (files.some(f => f.path === path)) continue;
+        // count lines of new file (cheap; capped via maxBuffer).
+        let lines = 0;
+        try {
+          const buf = execFileSync('/usr/bin/wc', ['-l', join(wt.path, path)], { encoding: 'utf-8', timeout: 4000 });
+          lines = parseInt(buf.trim().split(/\s+/)[0], 10) || 0;
+        } catch { /* binary or missing → 0 */ }
+        files.push({ path, additions: lines, deletions: 0, untracked: true });
+      }
+      // ahead count vs upstream (origin/<branch>). If no upstream, ahead=0.
+      let ahead = 0;
+      try {
+        const out = gitInCwd(wt.path, ['rev-list', '--count', '@{u}..HEAD']).trim();
+        ahead = parseInt(out, 10) || 0;
+      } catch { /* no upstream — first push not yet done */ }
+      const totalAdd = files.reduce((s, f) => s + (f.additions || 0), 0);
+      const totalDel = files.reduce((s, f) => s + (f.deletions || 0), 0);
+      sendJson(res, 200, {
+        pid,
+        worktree: wt,
+        stat: { additions: totalAdd, deletions: totalDel, files: files.length },
+        files,
+        hasUncommitted: files.length > 0,
+        ahead,
+      });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  const gitCommitM = url.match(/^\/api\/launcher\/instances\/(\d+)\/git-commit$/);
+  if (gitCommitM && method === 'POST') {
+    try {
+      const pid = parseInt(gitCommitM[1], 10);
+      const inst = instances.get(pid);
+      if (!inst) { sendJson(res, 404, { error: 'instance not found' }); return; }
+      const wt = worktreeForPid(pid);
+      if (!wt) { sendJson(res, 400, { error: 'instance not spawned in a worktree' }); return; }
+      const body = JSON.parse(await readBody(req) || '{}');
+      const message = typeof body.message === 'string' ? body.message : '';
+      if (!message.trim()) { sendJson(res, 400, { error: 'message required' }); return; }
+      // commit message passed via stdin (`-F -`) so newlines + quotes never
+      // hit a shell. Limit length to keep stdin write bounded.
+      if (message.length > 8192) { sendJson(res, 400, { error: 'message too long (>8KB)' }); return; }
+      gitInCwd(wt.path, ['add', '-A']);
+      let commitOut = '';
+      try {
+        commitOut = gitInCwd(wt.path, ['commit', '-F', '-', '--allow-empty-message'], { input: message });
+      } catch (err) {
+        const stderr = (err.stderr || '').toString().trim();
+        const stdout = (err.stdout || '').toString().trim();
+        // "nothing to commit" is exit code 1 from git but not really an error;
+        // surface to caller so UI can show "no changes" instead of red toast.
+        if (/nothing to commit/i.test(stdout + stderr)) {
+          sendJson(res, 200, { ok: false, nothingToCommit: true });
+          return;
+        }
+        throw new Error(stderr || stdout || err.message);
+      }
+      const head = gitInCwd(wt.path, ['rev-parse', 'HEAD']).trim();
+      sendJson(res, 200, { ok: true, sha: head, output: commitOut.trim().slice(0, 2000) });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  const gitPushM = url.match(/^\/api\/launcher\/instances\/(\d+)\/git-push$/);
+  if (gitPushM && method === 'POST') {
+    try {
+      const pid = parseInt(gitPushM[1], 10);
+      const inst = instances.get(pid);
+      if (!inst) { sendJson(res, 404, { error: 'instance not found' }); return; }
+      const wt = worktreeForPid(pid);
+      if (!wt) { sendJson(res, 400, { error: 'instance not spawned in a worktree' }); return; }
+      const body = JSON.parse(await readBody(req) || '{}');
+      const force = !!body.force;
+      // Push only the worktree's own branch to origin. Always
+      // --force-with-lease (never plain --force) so we refuse to clobber
+      // remote work the local doesn't know about.
+      const args = ['push', '--set-upstream', 'origin', wt.branch + ':' + wt.branch];
+      if (force) args.push('--force-with-lease');
+      let out = '';
+      try {
+        out = gitInCwd(wt.path, args, { timeout: 30000 });
+      } catch (err) {
+        const stderr = (err.stderr || '').toString().trim();
+        throw new Error(stderr || err.message);
+      }
+      sendJson(res, 200, { ok: true, output: out.trim().slice(0, 4000) });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  const openPrM = url.match(/^\/api\/launcher\/instances\/(\d+)\/open-pr$/);
+  if (openPrM && method === 'POST') {
+    try {
+      const pid = parseInt(openPrM[1], 10);
+      const inst = instances.get(pid);
+      if (!inst) { sendJson(res, 404, { error: 'instance not found' }); return; }
+      const wt = worktreeForPid(pid);
+      if (!wt) { sendJson(res, 400, { error: 'instance not spawned in a worktree' }); return; }
+      const body = JSON.parse(await readBody(req) || '{}');
+      const title = typeof body.title === 'string' ? body.title.trim() : '';
+      const prBody = typeof body.body === 'string' ? body.body : '';
+      const base = typeof body.base === 'string' && body.base.trim() ? body.base.trim() : (wt.baseRef || 'main').replace(/^origin\//, '');
+      if (!title) { sendJson(res, 400, { error: 'title required' }); return; }
+      if (title.length > 256) { sendJson(res, 400, { error: 'title too long' }); return; }
+      if (prBody.length > 64 * 1024) { sendJson(res, 400, { error: 'body too long (>64KB)' }); return; }
+      if (!BRANCH_NAME_RE.test(base)) { sendJson(res, 400, { error: 'base branch name invalid' }); return; }
+      // Verify gh is installed + authenticated before attempting the create —
+      // gh's own error messages on missing auth are verbose; we want a clean
+      // signal the UI can render as "需要 gh auth login".
+      try {
+        execFileSync('gh', ['auth', 'status'], { timeout: 5000, stdio: ['ignore', 'ignore', 'pipe'] });
+      } catch (err) {
+        sendJson(res, 200, { ok: false, error: '需要 gh auth login (gh CLI 未登录)' });
+        return;
+      }
+      // Pass body via stdin (--body-file -) so newlines/backticks/quotes
+      // can't leak into a shell. gh prints the PR URL on stdout on success.
+      let out = '';
+      try {
+        out = execFileSync('gh', ['pr', 'create', '--title', title, '--body-file', '-', '--base', base, '--head', wt.branch], {
+          cwd: wt.path,
+          encoding: 'utf-8',
+          timeout: 30000,
+          input: prBody,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+      } catch (err) {
+        const stderr = (err.stderr || '').toString().trim();
+        const stdout = (err.stdout || '').toString().trim();
+        throw new Error(stderr || stdout || err.message);
+      }
+      const urlLine = out.split('\n').map(s => s.trim()).find(s => /^https?:\/\//.test(s)) || out.trim();
+      sendJson(res, 200, { ok: true, url: urlLine });
     } catch (err) {
       sendJson(res, 500, { error: err.message });
     }
