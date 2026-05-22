@@ -3134,6 +3134,15 @@ const HTML_PAGE = `<!doctype html>
   #tag-filter::placeholder { color:var(--mute); }
   #btn-help { background:transparent; color:var(--mute); border:1px solid var(--line); padding:5px 10px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; }
   #btn-help:hover { color:var(--accent); border-color:var(--accent); }
+  #btn-wt { background:transparent; color:#8ddc94; border:1px solid var(--line); padding:5px 10px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; font-family:ui-monospace,monospace; }
+  #btn-wt:hover { border-color:#8ddc94; }
+  #wt-list .wt-row { display:flex; gap:8px; align-items:center; padding:6px 4px; border-bottom:1px dotted var(--line); }
+  #wt-list .wt-row:last-child { border-bottom:0; }
+  #wt-list .wt-branch { color:#a5d6ff; font-weight:600; min-width:160px; }
+  #wt-list .wt-path { color:var(--mute); flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #wt-list .wt-status { font-size:10px; color:var(--mute); }
+  #wt-list .wt-status.alive { color:var(--ok); }
+  #wt-list .wt-status.dirty { color:var(--warn); }
   .group[data-filter-hidden] { display:none; }
   /* j/n flash highlight */
   @keyframes jumpFlash {
@@ -3475,6 +3484,7 @@ const HTML_PAGE = `<!doctype html>
   </div>
   <span class="grow"></span>
   <input type="text" id="tag-filter" placeholder="filter tags (/)" autocomplete="off" spellcheck="false">
+  <button id="btn-wt" title="git worktrees (click to manage)" hidden>🌿 <span id="btn-wt-count">0</span></button>
   <button id="btn-help" title="Keyboard shortcuts (?)">?</button>
   <button id="btn-new">+ New</button>
 </header>
@@ -3528,10 +3538,30 @@ const HTML_PAGE = `<!doctype html>
   <select id="ccuse-select" style="width:100%;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px;font-size:12px">
     <option value="">— 不切 (用 launcher 默认) —</option>
   </select>
+  <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;color:var(--fg);cursor:pointer">
+    <input type="checkbox" id="use-worktree">
+    <span>新建 git worktree (隔离分支，避免多实例同 cwd 互踩)</span>
+  </label>
   <div class="err" id="err" hidden></div>
   <div class="row">
     <button class="btn" id="btn-cancel">Cancel</button>
     <button class="btn primary" id="btn-launch">Launch</button>
+  </div>
+</dialog>
+
+<dialog id="wt-dlg" style="max-width:760px;width:90%">
+  <h2>Worktrees</h2>
+  <div id="wt-list" style="max-height:50vh;overflow-y:auto;border:1px solid var(--line);border-radius:6px;padding:8px;font-family:ui-monospace,monospace;font-size:11px">loading…</div>
+  <div class="row" style="margin-top:10px;justify-content:space-between">
+    <div style="display:flex;gap:8px;align-items:center">
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--mute);cursor:pointer">
+        <input type="checkbox" id="wt-force"> force (clobber uncommitted / unpushed)
+      </label>
+    </div>
+    <div style="display:flex;gap:6px">
+      <button class="btn" id="wt-close">Close</button>
+      <button class="btn danger" id="wt-cleanup">Clean selected</button>
+    </div>
   </div>
 </dialog>
 
@@ -4980,7 +5010,19 @@ const HTML_PAGE = `<!doctype html>
   cwdInput.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') { ev.preventDefault(); loadDir(cwdInput.value.trim()); }
   });
-  document.getElementById('btn-new').onclick = () => { errEl.hidden = true; loadDir(_curDir || ''); loadCcuseProfiles(); dlg.showModal(); };
+  document.getElementById('btn-new').onclick = () => {
+    errEl.hidden = true;
+    loadDir(_curDir || '');
+    loadCcuseProfiles();
+    // Pre-fill useWorktree from prefs.worktreeDefault so power users who
+    // always want a fresh branch get one without an extra click. Falls back
+    // to unchecked on prefs load error.
+    const wt = document.getElementById('use-worktree');
+    if (wt) {
+      api('/api/launcher/prefs').then(p => { wt.checked = !!p.worktreeDefault; }).catch(() => { wt.checked = false; });
+    }
+    dlg.showModal();
+  };
   document.getElementById('btn-cancel').onclick = () => dlg.close();
   document.getElementById('btn-launch').onclick = async () => {
     errEl.hidden = true;
@@ -4989,9 +5031,11 @@ const HTML_PAGE = `<!doctype html>
     const btn = document.getElementById('btn-launch');
     const ccuseSelect = document.getElementById('ccuse-select');
     const ccuseProfile = ccuseSelect ? ccuseSelect.value : '';
-    btn.disabled = true; btn.textContent = 'Launching…';
+    const wtEl = document.getElementById('use-worktree');
+    const useWorktree = !!(wtEl && wtEl.checked);
+    btn.disabled = true; btn.textContent = useWorktree ? 'Creating worktree…' : 'Launching…';
     try {
-      await api('/api/launcher/spawn', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd, ccuseProfile }) });
+      await api('/api/launcher/spawn', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd, ccuseProfile, useWorktree }) });
       dlg.close(); refresh();
     } catch (e) { errEl.textContent = 'Launch failed: ' + e.message; errEl.hidden = false; }
     finally { btn.disabled = false; btn.textContent = 'Launch'; }
@@ -5303,6 +5347,71 @@ const HTML_PAGE = `<!doctype html>
   const helpDlg = document.getElementById('help-dlg');
   document.getElementById('btn-help').addEventListener('click', () => helpDlg.showModal());
   document.getElementById('help-close').addEventListener('click', () => helpDlg.close());
+
+  // ---- M2: worktrees top-bar counter + cleanup dialog ----
+  const wtBtn = document.getElementById('btn-wt');
+  const wtCountEl = document.getElementById('btn-wt-count');
+  const wtDlg = document.getElementById('wt-dlg');
+  const wtListEl = document.getElementById('wt-list');
+  async function refreshWorktreeCounter() {
+    try {
+      const data = await api('/api/launcher/worktrees');
+      const n = (data.worktrees || []).length;
+      if (wtCountEl) wtCountEl.textContent = String(n);
+      if (wtBtn) wtBtn.hidden = n === 0;
+    } catch { /* ignore — keep last known count */ }
+  }
+  async function openWorktreeDlg() {
+    if (!wtDlg) return;
+    wtListEl.innerHTML = '<div class="tab-empty">loading…</div>';
+    wtDlg.showModal();
+    try {
+      const data = await api('/api/launcher/worktrees');
+      const list = data.worktrees || [];
+      if (!list.length) { wtListEl.innerHTML = '<div class="tab-empty">no worktrees</div>'; return; }
+      wtListEl.innerHTML = list.map((w, i) => {
+        const statusCls = w.alive ? 'alive' : (w.hasUncommitted || w.ahead ? 'dirty' : '');
+        const statusTxt = w.alive ? 'alive (pid ' + w.pid + ')' : (w.exists ? 'orphan' : 'missing');
+        const dirty = w.hasUncommitted ? '✎' : '';
+        const ahead = w.ahead ? ' +' + w.ahead : '';
+        return ''
+          + '<label class="wt-row">'
+          +   '<input type="checkbox" data-wt-path="' + escape(w.path) + '"' + (w.alive ? ' disabled title="stop the instance first"' : '') + '>'
+          +   '<span class="wt-branch">' + escape(w.branch || '?') + '</span>'
+          +   '<span class="wt-path" title="' + escape(w.path) + '">' + escape(w.path) + '</span>'
+          +   '<span class="wt-status ' + statusCls + '">' + escape(statusTxt + ' ' + dirty + ahead) + '</span>'
+          + '</label>';
+      }).join('');
+    } catch (e) {
+      wtListEl.innerHTML = '<div class="tab-error">load failed: ' + escape(e.message) + '</div>';
+    }
+  }
+  if (wtBtn) wtBtn.addEventListener('click', openWorktreeDlg);
+  if (wtDlg) {
+    document.getElementById('wt-close').addEventListener('click', () => wtDlg.close());
+    document.getElementById('wt-cleanup').addEventListener('click', async () => {
+      const boxes = wtListEl.querySelectorAll('input[type=checkbox][data-wt-path]:checked');
+      const paths = Array.from(boxes).map(b => b.dataset.wtPath);
+      if (!paths.length) { alert('select at least one worktree'); return; }
+      const force = !!document.getElementById('wt-force').checked;
+      if (force && !confirm('Force delete ' + paths.length + ' worktree(s)? Uncommitted / unpushed work will be lost.')) return;
+      try {
+        const r = await api('/api/launcher/worktrees/cleanup', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ paths, force }),
+        });
+        const msg = ['removed ' + (r.removed || []).length + ' worktree(s)'];
+        if ((r.rejected || []).length) msg.push('rejected:\n' + r.rejected.map(x => '  ' + x.path + ' — ' + x.reason).join('\n'));
+        if (r.needsConfirm) msg.push('\ntip: check "force" to override the safety gate');
+        alert(msg.join('\n'));
+        await openWorktreeDlg();
+        refreshWorktreeCounter();
+        refresh();
+      } catch (e) { alert('Cleanup failed: ' + e.message); }
+    });
+  }
+  visibilityPoll(refreshWorktreeCounter, 10000);
+  refreshWorktreeCounter();
 
   // Single global keydown listener — bails out when typing or when a
   // modal/overlay owns the keyboard. Other ESC handlers (term-overlay /
@@ -5877,6 +5986,105 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
       sendJson(res, 200, { ok: true, worktreeDefault: getWorktreeDefault() });
     } catch (err) {
       sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  // ---- M2 commit 3: worktree dashboard + cleanup ----
+  // /worktrees enumerates every tracked worktree (live pid OR orphaned by
+  // child exit), augmented with per-worktree porcelain + ahead so the UI can
+  // gate cleanup on a clean tree. /worktrees/cleanup removes them via
+  // `git worktree remove`; refuses dirty trees unless `force:true`.
+  if (url === '/api/launcher/worktrees' && method === 'GET') {
+    try {
+      const livePids = new Set(instances.keys());
+      const out = [];
+      for (const [pid, wt] of _pidWorktrees) {
+        const alive = livePids.has(pid);
+        let hasUncommitted = false;
+        let ahead = 0;
+        let exists = existsSync(wt.path);
+        if (exists) {
+          try {
+            const status = gitInCwd(wt.path, ['status', '--porcelain=v1', '-z']);
+            hasUncommitted = status.length > 0;
+          } catch { /* worktree path gone or not a git wt */ exists = false; }
+          try {
+            const a = gitInCwd(wt.path, ['rev-list', '--count', '@{u}..HEAD']).trim();
+            ahead = parseInt(a, 10) || 0;
+          } catch { /* no upstream */ }
+        }
+        out.push({
+          pid: alive ? pid : null,
+          alive,
+          exists,
+          path: wt.path,
+          branch: wt.branch,
+          baseRef: wt.baseRef,
+          originalCwd: wt.originalCwd,
+          hasUncommitted,
+          ahead,
+        });
+      }
+      sendJson(res, 200, { worktrees: out, count: out.length });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  if (url === '/api/launcher/worktrees/cleanup' && method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const paths = Array.isArray(body.paths) ? body.paths : [];
+      const force = !!body.force;
+      if (!paths.length) { sendJson(res, 400, { error: 'paths required' }); return; }
+      const removed = [];
+      const rejected = [];
+      for (const p of paths) {
+        if (typeof p !== 'string' || !p) {
+          rejected.push({ path: String(p), reason: 'invalid path' });
+          continue;
+        }
+        // Only allow paths we tracked. Defense against arbitrary
+        // `git worktree remove` on the user's own worktrees.
+        let wt = null;
+        let trackedPid = null;
+        for (const [pid, info] of _pidWorktrees) {
+          if (info.path === p) { wt = info; trackedPid = pid; break; }
+        }
+        if (!wt) { rejected.push({ path: p, reason: 'not a launcher-tracked worktree' }); continue; }
+        if (instances.has(trackedPid)) {
+          rejected.push({ path: p, reason: 'instance still alive — stop the ccv first' });
+          continue;
+        }
+        if (!force) {
+          let dirty = false;
+          let ahead = 0;
+          try {
+            const status = gitInCwd(wt.path, ['status', '--porcelain=v1', '-z']);
+            dirty = status.length > 0;
+          } catch { /* path gone — treat as removable */ }
+          try {
+            const a = gitInCwd(wt.path, ['rev-list', '--count', '@{u}..HEAD']).trim();
+            ahead = parseInt(a, 10) || 0;
+          } catch { /* no upstream */ }
+          if (dirty || ahead > 0) {
+            rejected.push({ path: p, reason: (dirty ? 'uncommitted changes' : '') + (dirty && ahead ? ' + ' : '') + (ahead ? ahead + ' commits ahead of origin' : '') });
+            continue;
+          }
+        }
+        try {
+          if (existsSync(wt.path)) removeWorktree(wt.originalCwd, wt.path, { force });
+          _pidWorktrees.delete(trackedPid);
+          removed.push(p);
+        } catch (err) {
+          rejected.push({ path: p, reason: err.message });
+        }
+      }
+      sendJson(res, 200, { ok: true, removed, rejected, needsConfirm: rejected.length > 0 && !force });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
     }
     return;
   }
