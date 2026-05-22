@@ -2497,6 +2497,54 @@ const HTML_PAGE = `<!doctype html>
   header button { background:var(--accent); color:#0d1117; border:0; padding:6px 14px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; transition:opacity .15s; }
   header button:hover { opacity:.85; }
 
+  /* topbar stats (T6: cost + 5h quota) */
+  .topbar-stats { display:flex; align-items:center; gap:10px; font-size:11px; }
+  .stat { display:flex; align-items:center; gap:6px; padding:4px 10px; border:1px solid var(--line); border-radius:6px; background:var(--card); white-space:nowrap; user-select:none; transition:border-color .15s, opacity .15s; }
+  .stat .stat-icon { font-size:12px; opacity:.85; }
+  .stat .stat-label { color:var(--mute); }
+  .stat .stat-val { color:var(--fg); font-weight:600; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .stat.is-stale .stat-val::after { content:' ↻'; color:var(--accent); font-size:9px; opacity:.7; }
+  .stat.is-loading { opacity:.55; }
+  .stat-cost { cursor:pointer; position:relative; }
+  .stat-cost:hover { border-color:var(--accent); }
+  .stat-cost .cost-popover { display:none; position:absolute; top:calc(100% + 6px); right:0; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; box-shadow:0 4px 16px rgba(0,0,0,.4); z-index:11; min-width:220px; }
+  .stat-cost:hover .cost-popover { display:block; }
+  .cost-popover .cp-hd { color:var(--mute); font-size:10px; text-transform:uppercase; letter-spacing:.5px; padding-bottom:4px; border-bottom:1px solid var(--line); margin-bottom:5px; }
+  .cost-popover .cp-row { display:flex; justify-content:space-between; gap:12px; padding:3px 0; font-size:11px; }
+  .cost-popover .cp-model { color:var(--mute); font-family:ui-monospace,monospace; max-width:160px; overflow:hidden; text-overflow:ellipsis; }
+  .cost-popover .cp-val { color:var(--fg); font-weight:600; font-family:ui-monospace,monospace; }
+  .cost-popover .cp-total { border-top:1px solid var(--line); margin-top:5px; padding-top:6px; }
+  .cost-popover .cp-empty { color:var(--mute); font-size:11px; padding:2px 0; }
+  .stat-quota .quota-bar { width:54px; height:4px; background:var(--line); border-radius:2px; overflow:hidden; }
+  .stat-quota .quota-fill { height:100%; background:var(--ok); transition:width .3s, background .3s; }
+  .stat-quota .quota-fill.warn { background:var(--warn); }
+  .stat-quota .quota-fill.bad  { background:var(--bad); }
+  .stat-quota .src-tag { font-size:9px; padding:1px 5px; border-radius:3px; font-weight:600; letter-spacing:.2px; }
+  .stat-quota .src-tag.computed { color:var(--warn); background:rgba(210,153,34,.14); }
+  .stat-quota.unavailable { opacity:.55; }
+
+  /* per-card context bar (T6: H2) */
+  .context-row { display:flex; align-items:center; gap:8px; margin:0 0 8px; font-size:10px; color:var(--mute); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .context-row[hidden] { display:none; }
+  .context-row .ctx-bar { flex:0 0 auto; width:120px; height:4px; background:var(--line); border-radius:2px; overflow:hidden; }
+  .context-row .ctx-fill { height:100%; background:var(--ok); transition:width .3s, background .3s; }
+  .context-row .ctx-fill.warn { background:var(--warn); }
+  .context-row .ctx-fill.hot  { background:#f0883e; }
+  .context-row .ctx-fill.bad  { background:var(--bad); }
+  .context-row .ctx-pct { font-weight:600; color:var(--fg); }
+  .context-row .ctx-model { opacity:.7; max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  /* mobile narrow: shrink stats, hide labels, recenter popover */
+  @media (max-width:680px) {
+    .topbar-stats { gap:6px; font-size:10px; }
+    .stat { padding:3px 7px; gap:4px; }
+    .stat .stat-label { display:none; }
+    .stat-cost .cost-popover { right:auto; left:50%; transform:translateX(-50%); min-width:200px; }
+    .stat-quota .quota-bar { width:36px; }
+    .context-row .ctx-bar { width:80px; }
+    .context-row .ctx-model { max-width:90px; }
+  }
+
   /* sections */
   .content { max-width:960px; margin:0 auto; padding:16px 24px 32px; }
   .section-hd { display:flex; align-items:center; gap:8px; padding:12px 0 8px; font-size:12px; font-weight:600; color:var(--mute); text-transform:uppercase; letter-spacing:.5px; }
@@ -2686,6 +2734,24 @@ const HTML_PAGE = `<!doctype html>
 <header>
   <h1>ccv launcher</h1>
   <span class="meta" id="meta">loading…</span>
+  <div class="topbar-stats" id="topbar-stats">
+    <div class="stat stat-cost is-loading" id="stat-cost" title="点击切换范围 today/week/month">
+      <span class="stat-icon">$</span>
+      <span class="stat-label" id="stat-cost-range">today</span>
+      <span class="stat-val" id="stat-cost-val">—</span>
+      <div class="cost-popover" id="stat-cost-popover">
+        <div class="cp-hd">By model · <span id="cp-range">today</span></div>
+        <div id="cp-list"><div class="cp-empty">loading…</div></div>
+      </div>
+    </div>
+    <div class="stat stat-quota is-loading" id="stat-quota" title="5h sliding window">
+      <span class="stat-icon">⏱</span>
+      <span class="stat-label">5h</span>
+      <span class="stat-val" id="stat-quota-val">—</span>
+      <div class="quota-bar"><div class="quota-fill" id="stat-quota-fill" style="width:0"></div></div>
+      <span class="src-tag" id="stat-quota-src" hidden></span>
+    </div>
+  </div>
   <span class="grow"></span>
   <button id="btn-new">+ New</button>
 </header>
@@ -2809,6 +2875,7 @@ const HTML_PAGE = `<!doctype html>
       +     '<span class="preview"></span>'
       +     (it.isHub ? '' : '<button class="activity-toggle" data-act="actdrawer" data-pid="' + it.pid + '" title="show recent activity">▾</button>')
       +   '</div>'
+      +   (it.isHub ? '' : '<div class="context-row" data-ctx-for="' + it.pid + '" hidden></div>')
       +   (it.isHub ? '' : '<div class="activity-drawer" data-act-drawer="' + it.pid + '"></div>')
       +   '<details><summary>URLs &middot; QR</summary>'
       +     (lan ? '<div class="url-row">LAN: <a href="#" data-act="copy" data-text="'+lan+'">'+lan+'</a></div>':'')
@@ -3417,12 +3484,43 @@ const HTML_PAGE = `<!doctype html>
           titleEl.removeAttribute('title');
         }
       }
+      const ctxRow = document.querySelector('[data-ctx-for="' + act.pid + '"]');
+      if (ctxRow) renderContextRow(ctxRow, act.contextUsage);
       const drawer = document.querySelector('[data-act-drawer="' + act.pid + '"]');
       if (drawer) {
         drawer.dataset.payload = JSON.stringify(act);
         if (drawer.classList.contains('open')) drawer.innerHTML = renderDrawer(act);
       }
     }
+  }
+
+  // ---- T6: per-card context bar (H2) ----
+  // Color thresholds match optimization-web.md: 60% warn, 80% hot, 95% bad.
+  function ctxClass(pct) {
+    if (pct >= 95) return 'bad';
+    if (pct >= 80) return 'hot';
+    if (pct >= 60) return 'warn';
+    return '';
+  }
+  function renderContextRow(row, ctx) {
+    if (!ctx || !ctx.limit) {
+      row.hidden = true;
+      row.innerHTML = '';
+      return;
+    }
+    const pct = Math.max(0, Math.min(100, Number(ctx.percent) || 0));
+    const used = Number(ctx.used || 0);
+    const limit = Number(ctx.limit || 0);
+    const usedK = used >= 1000 ? (used/1000).toFixed(1) + 'k' : String(used);
+    const limitK = limit >= 1000 ? Math.round(limit/1000) + 'k' : String(limit);
+    const cls = ctxClass(pct);
+    const display = ctx.displayName || ctx.model || '';
+    row.hidden = false;
+    row.innerHTML =
+        '<span class="ctx-model" title="' + escape(display) + '">' + escape(display) + '</span>'
+      + '<span class="ctx-bar"><span class="ctx-fill ' + cls + '" style="width:' + pct.toFixed(1) + '%"></span></span>'
+      + '<span class="ctx-pct">' + pct.toFixed(0) + '%</span>'
+      + '<span>' + usedK + ' / ' + limitK + '</span>';
   }
 
   // Drawer toggle (delegate click)
@@ -3550,6 +3648,128 @@ const HTML_PAGE = `<!doctype html>
   // background polling only catches out-of-band changes (e.g. another tab
   // spawned, hub auto-restarted). Public bandwidth concern beats latency here.
   visibilityPoll(refresh, 30000);
+
+  // ---- T6: top bar stats (H1 cost + H3 5h quota) ----
+  const COST_RANGES = ['today', 'week', 'month'];
+  let _costRangeIdx = 0;
+  function fmtUSD(n) {
+    if (n == null || isNaN(n)) return '—';
+    if (n === 0) return '$0';
+    if (n < 0.01) return '$' + n.toFixed(4);
+    if (n < 1)    return '$' + n.toFixed(3);
+    return '$' + n.toFixed(2);
+  }
+  function fmtMinutes(min) {
+    if (min == null || min <= 0) return '';
+    const total = Math.round(min);
+    const h = Math.floor(total/60), m = total % 60;
+    if (h >= 24) return Math.floor(h/24) + 'd';
+    if (h > 0)   return h + 'h' + (m ? ' ' + m + 'm' : '');
+    return m + 'm';
+  }
+  function fmtTokensK(n) {
+    if (n == null) return '—';
+    if (n >= 1000) return (n/1000).toFixed(n >= 10000 ? 0 : 1) + 'k';
+    return String(n);
+  }
+
+  async function refreshUsage() {
+    const range = COST_RANGES[_costRangeIdx];
+    const costEl = document.getElementById('stat-cost');
+    if (!costEl) return;
+    document.getElementById('stat-cost-range').textContent = range;
+    document.getElementById('cp-range').textContent = range;
+    try {
+      const data = await api('/api/launcher/usage/summary?range=' + range);
+      costEl.classList.remove('is-loading');
+      costEl.classList.toggle('is-stale', !!data.stale);
+      const total = Number(data.totalUSD || 0);
+      document.getElementById('stat-cost-val').textContent = fmtUSD(total);
+      const list = document.getElementById('cp-list');
+      const breakdown = data.byModelUSD || {};
+      const entries = Object.entries(breakdown).sort((a, b) => b[1] - a[1]);
+      if (!entries.length) {
+        list.innerHTML = '<div class="cp-empty">No usage in this range yet.</div>';
+      } else {
+        const rows = entries.map(([m, v]) =>
+          '<div class="cp-row"><span class="cp-model" title="' + escape(m) + '">' + escape(m) + '</span><span class="cp-val">' + fmtUSD(v) + '</span></div>'
+        ).join('');
+        const totalRow = '<div class="cp-row cp-total"><span class="cp-model">Total · ' + (data.requestCount || 0) + ' req</span><span class="cp-val">' + fmtUSD(total) + '</span></div>';
+        list.innerHTML = rows + totalRow;
+      }
+    } catch {
+      costEl.classList.add('is-loading');
+    }
+  }
+
+  async function refreshQuota() {
+    const el = document.getElementById('stat-quota');
+    if (!el) return;
+    const valEl = document.getElementById('stat-quota-val');
+    const fillEl = document.getElementById('stat-quota-fill');
+    const srcTag = document.getElementById('stat-quota-src');
+    try {
+      const q = await api('/api/launcher/quota/5h');
+      el.classList.remove('is-loading');
+      el.classList.toggle('is-stale', !!q.stale);
+      el.classList.remove('unavailable');
+
+      if (q.source === 'unavailable') {
+        el.classList.add('unavailable');
+        valEl.textContent = '—';
+        fillEl.style.width = '0%';
+        fillEl.className = 'quota-fill';
+        srcTag.hidden = true;
+        el.title = '5h quota unavailable: ' + (q.reason || 'install ccline or wait for usage data');
+        return;
+      }
+
+      const pct = Math.max(0, Math.min(100, Number(q.percent || 0)));
+      fillEl.style.width = pct.toFixed(1) + '%';
+      fillEl.className = 'quota-fill' + (pct >= 95 ? ' bad' : pct >= 80 ? ' warn' : '');
+
+      let valText;
+      if (q.used != null && q.limit != null) {
+        valText = pct.toFixed(0) + '%  ' + fmtTokensK(q.used) + '/' + fmtTokensK(q.limit);
+      } else {
+        valText = pct.toFixed(0) + '%';
+      }
+      valEl.textContent = valText;
+
+      if (q.source === 'jsonl_compute') {
+        srcTag.hidden = false;
+        srcTag.className = 'src-tag computed';
+        srcTag.textContent = '推算';
+      } else {
+        srcTag.hidden = true;
+      }
+
+      const tip = ['source: ' + q.source];
+      if (q.plan_name) tip.push('plan: ' + q.plan_name);
+      if (q.burn_rate) tip.push('burn: ' + Math.round(q.burn_rate) + ' tok/min');
+      if (q.projection_minutes) tip.push('to limit: ' + fmtMinutes(q.projection_minutes));
+      if (q.reset_at) {
+        const remain = (new Date(q.reset_at).getTime() - Date.now()) / 60000;
+        if (remain > 0) tip.push('reset in: ' + fmtMinutes(remain));
+      }
+      el.title = tip.join('\\n');
+    } catch {
+      el.classList.add('is-loading');
+    }
+  }
+
+  function refreshTopStats() { refreshUsage(); refreshQuota(); }
+
+  // Cost block click cycles range today → week → month → today.
+  // Popover stays interactive: clicks inside it shouldn't trigger a cycle.
+  document.getElementById('stat-cost').addEventListener('click', (e) => {
+    if (e.target.closest('.cost-popover')) return;
+    _costRangeIdx = (_costRangeIdx + 1) % COST_RANGES.length;
+    refreshUsage();
+  });
+
+  refreshTopStats();
+  visibilityPoll(refreshTopStats, 10000);
 
   // ---- Pair notification polling ----
   const pairZone = document.getElementById('pair-zone');
