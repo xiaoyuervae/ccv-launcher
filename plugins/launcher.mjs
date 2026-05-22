@@ -3149,6 +3149,65 @@ const HTML_PAGE = `<!doctype html>
   .qr { padding:8px; background:#fff; border-radius:6px; display:inline-block; margin-top:6px; }
   .qr canvas { display:block; }
 
+  /* card tabs panel (T11: M1 Run Summary + M3 Recent Edits + Errors) */
+  .card-tabs { margin-top:6px; }
+  .tab-strip { display:flex; gap:0; border-bottom:1px solid var(--line); margin-bottom:6px; flex-wrap:wrap; }
+  .tab-btn { background:transparent; color:var(--mute); border:0; padding:5px 12px; font-size:11px; font-family:inherit; cursor:pointer; border-bottom:2px solid transparent; transition:color .15s, border-color .15s; }
+  .tab-btn:hover { color:var(--fg); }
+  .tab-btn.active { color:var(--accent); border-bottom-color:var(--accent); }
+  .tab-btn .tab-count { display:inline-block; margin-left:4px; font-size:10px; opacity:.75; }
+  .tab-btn.has-error { color:var(--bad); }
+  .tab-btn.has-error.active { border-bottom-color:var(--bad); color:var(--bad); }
+  .tab-panel { padding:6px 4px; max-height:280px; overflow-y:auto; font-size:11px; }
+  .tab-panel[hidden] { display:none; }
+  .tab-empty { color:var(--mute); padding:10px 8px; text-align:center; font-style:italic; opacity:.7; }
+  .tab-loading { color:var(--mute); padding:10px 8px; text-align:center; opacity:.8; }
+  .tab-error { color:var(--bad); padding:10px 8px; font-family:ui-monospace,monospace; font-size:10px; }
+  /* Run Summary timeline */
+  .run-totals { display:flex; flex-wrap:wrap; gap:6px; padding:0 0 8px; border-bottom:1px dotted var(--line); margin-bottom:8px; font-size:10px; color:var(--mute); }
+  .run-totals .rt-chip { background:var(--card); padding:1px 8px; border-radius:10px; font-family:ui-monospace,monospace; }
+  .run-totals .rt-chip.err { color:var(--bad); background:rgba(248,81,73,.10); }
+  .run-event-row { display:flex; gap:8px; align-items:baseline; padding:3px 0; border-bottom:1px dotted var(--line); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:10px; }
+  .run-event-row:last-child { border-bottom:0; }
+  .run-event-row .re-ts { color:var(--mute); min-width:60px; flex-shrink:0; }
+  .run-event-row .re-icon { width:14px; text-align:center; flex-shrink:0; }
+  .run-event-row.t-prompt          .re-icon { color:#a5d6ff; }
+  .run-event-row.t-slash_command   .re-icon { color:var(--accent); }
+  .run-event-row.t-auto_compact    .re-icon { color:var(--warn); }
+  .run-event-row.t-tool_error      .re-icon { color:var(--bad); }
+  .run-event-row.t-subagent        .re-icon { color:#bc8cff; }
+  .run-event-row.t-hook_event      .re-icon { color:var(--mute); }
+  .run-event-row .re-label { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--fg); }
+  .run-event-row.t-tool_error .re-label { color:#f0a4a0; }
+  /* Recent Edits */
+  .edits-section { margin-bottom:10px; }
+  .edits-section:last-child { margin-bottom:0; }
+  .edits-section .es-hd { font-size:10px; color:var(--mute); text-transform:uppercase; letter-spacing:.5px; margin-bottom:5px; }
+  .edit-row { padding:5px 0; border-bottom:1px dotted var(--line); }
+  .edit-row:last-child { border-bottom:0; }
+  .edit-row .er-line1 { display:flex; gap:8px; align-items:baseline; font-family:ui-monospace,monospace; font-size:10px; }
+  .edit-row .er-tool { color:var(--mute); min-width:60px; flex-shrink:0; }
+  .edit-row .er-path { color:var(--fg); flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .edit-row .er-meta { color:var(--mute); flex-shrink:0; font-size:10px; }
+  .edit-row .er-preview { color:var(--mute); font-family:ui-monospace,monospace; font-size:10px; padding:3px 0 0 68px; opacity:.85; white-space:pre-wrap; word-break:break-all; max-height:64px; overflow:hidden; }
+  .edit-row .er-preview:empty { display:none; }
+  /* Errors clustering */
+  .err-group { padding:6px 0; border-bottom:1px dotted var(--line); }
+  .err-group:last-child { border-bottom:0; }
+  .err-group .eg-hd { display:flex; gap:8px; align-items:baseline; font-family:ui-monospace,monospace; font-size:10px; cursor:pointer; user-select:none; }
+  .err-group .eg-tool { color:var(--bad); font-weight:600; min-width:60px; flex-shrink:0; }
+  .err-group .eg-pattern { flex:1; min-width:0; color:#f0a4a0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .err-group .eg-count { color:var(--mute); flex-shrink:0; }
+  .err-group .eg-samples { display:none; padding:4px 0 0 0; }
+  .err-group.open .eg-samples { display:block; }
+  .err-sample { font-family:ui-monospace,monospace; font-size:10px; color:var(--mute); padding:3px 0; white-space:pre-wrap; word-break:break-all; border-left:2px solid var(--line); padding-left:8px; margin:4px 0; }
+  .err-sample .es-ts { color:#7d8590; font-size:9px; opacity:.7; display:block; margin-bottom:2px; }
+  /* compactStatus card-level alert (no_inject_channel manual /compact hint) */
+  .compact-alert { margin:0 0 8px; padding:6px 10px; background:rgba(248,81,73,.08); border:1px solid rgba(248,81,73,.35); border-left-width:3px; border-radius:6px; font-size:11px; color:#f0a4a0; line-height:1.4; display:flex; align-items:flex-start; gap:8px; }
+  .compact-alert[hidden] { display:none; }
+  .compact-alert .ca-icon { flex-shrink:0; color:var(--bad); font-weight:600; }
+  .compact-alert .ca-cmd { font-family:ui-monospace,monospace; font-weight:600; color:#ffaba3; padding:1px 6px; background:rgba(248,81,73,.18); border-radius:3px; }
+
   /* dialog */
   dialog { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:10px; padding:20px; max-width:500px; width:92%; }
   dialog::backdrop { background:rgba(0,0,0,.55); }
@@ -3399,12 +3458,33 @@ const HTML_PAGE = `<!doctype html>
       +     (it.isHub ? '' : '<button class="activity-toggle" data-act="actdrawer" data-pid="' + it.pid + '" title="show recent activity">▾</button>')
       +   '</div>'
       +   (it.isHub ? '' : '<div class="context-row" data-ctx-for="' + it.pid + '" hidden></div>')
+      +   (it.isHub ? '' : '<div class="compact-alert" data-compact-for="' + it.pid + '" hidden></div>')
       +   (it.isHub ? '' : '<div class="activity-drawer" data-act-drawer="' + it.pid + '"></div>')
-      +   '<details><summary>URLs &middot; QR</summary>'
-      +     (lan ? '<div class="url-row">LAN: <a href="#" data-act="copy" data-text="'+lan+'">'+lan+'</a></div>':'')
-      +     (pub ? '<div class="url-row">Public: <a href="#" data-act="copy" data-text="'+pub+'">'+pub+'</a></div>':'')
-      +     (pub ? '<div class="qr" data-qr="'+pub+'"></div>':'')
-      +   '</details>'
+      +   (it.isHub
+            ? '<details><summary>URLs &middot; QR</summary>'
+              + (lan ? '<div class="url-row">LAN: <a href="#" data-act="copy" data-text="'+lan+'">'+lan+'</a></div>' : '')
+              + (pub ? '<div class="url-row">Public: <a href="#" data-act="copy" data-text="'+pub+'">'+pub+'</a></div>' : '')
+              + (pub ? '<div class="qr" data-qr="'+pub+'"></div>' : '')
+              + '</details>'
+            : '<details><summary>Details &middot; URLs &middot; Summary &middot; Edits &middot; Errors</summary>'
+              + '<div class="card-tabs" data-tabs-for="' + it.pid + '">'
+              +   '<div class="tab-strip" role="tablist">'
+              +     '<button class="tab-btn active" data-tab-btn="urls"    data-pid="' + it.pid + '">URLs &middot; QR</button>'
+              +     '<button class="tab-btn"        data-tab-btn="summary" data-pid="' + it.pid + '">Summary</button>'
+              +     '<button class="tab-btn"        data-tab-btn="edits"   data-pid="' + it.pid + '">Edits</button>'
+              +     '<button class="tab-btn"        data-tab-btn="errors"  data-pid="' + it.pid + '">Errors</button>'
+              +   '</div>'
+              +   '<div class="tab-panel" data-tab-panel="urls" data-pid="' + it.pid + '">'
+              +     (lan ? '<div class="url-row">LAN: <a href="#" data-act="copy" data-text="'+lan+'">'+lan+'</a></div>' : '')
+              +     (pub ? '<div class="url-row">Public: <a href="#" data-act="copy" data-text="'+pub+'">'+pub+'</a></div>' : '')
+              +     (pub ? '<div class="qr" data-qr="'+pub+'"></div>' : '')
+              +     (!lan && !pub ? '<div class="tab-empty">no URLs</div>' : '')
+              +   '</div>'
+              +   '<div class="tab-panel" data-tab-panel="summary" data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>'
+              +   '<div class="tab-panel" data-tab-panel="edits"   data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>'
+              +   '<div class="tab-panel" data-tab-panel="errors"  data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>'
+              + '</div>'
+              + '</details>')
       +   '<div class="instance-actions">' + actions + '</div>'
       + '</div>';
   }
@@ -3639,6 +3719,8 @@ const HTML_PAGE = `<!doctype html>
     }
     // Re-apply current tag filter against the new DOM (T8)
     applyTagFilter();
+    // Re-apply per-pid tab state + re-render cached tab content (T11)
+    rehydrateTabs();
   }
 
   // Render QR codes when <summary> is clicked (toggle event doesn't bubble, so use click on summary)
@@ -4144,6 +4226,11 @@ const HTML_PAGE = `<!doctype html>
           costTag.removeAttribute('title');
         }
       }
+      // T11: compactStatus card-level banner. Surface only when the threshold
+      // has tripped but backend couldn't auto-inject /compact (ccv has no
+      // inject channel), so the user knows to run /compact manually.
+      const compactEl = document.querySelector('[data-compact-for="' + act.pid + '"]');
+      if (compactEl) renderCompactAlert(compactEl, act.compactStatus);
       const drawer = document.querySelector('[data-act-drawer="' + act.pid + '"]');
       if (drawer) {
         drawer.dataset.payload = JSON.stringify(act);
@@ -4205,6 +4292,237 @@ const HTML_PAGE = `<!doctype html>
       + '<span class="ctx-pct">' + pct.toFixed(0) + '%</span>'
       + '<span>' + usedK + ' / ' + limitK + '</span>';
   }
+
+  // ---- T11: card tabs panel (M1 Run Summary + M3 Recent Edits + Errors) ----
+  // Per-pid tab state survives render() re-runs so the active tab + cached
+  // payloads aren't lost when refreshActivity triggers a Kanban repaint.
+  const _tabState = new Map();
+  function getTabState(pid) {
+    if (!_tabState.has(pid)) _tabState.set(pid, { activeTab: 'urls', cache: {}, fetching: {} });
+    return _tabState.get(pid);
+  }
+
+  function fmtAbsTime(ts) {
+    if (!ts) return '';
+    try { return new Date(ts).toLocaleTimeString([], { hour12: false }); } catch { return ''; }
+  }
+
+  const TAB_LABEL = { urls: 'URLs · QR', summary: 'Summary', edits: 'Edits', errors: 'Errors' };
+  const TAB_ENDPOINT = {
+    summary: pid => '/api/launcher/instances/' + pid + '/run-summary',
+    edits:   pid => '/api/launcher/instances/' + pid + '/recent-edits',
+    errors:  pid => '/api/launcher/instances/' + pid + '/errors',
+  };
+
+  function setActiveTab(pid, tab) {
+    const st = getTabState(pid);
+    st.activeTab = tab;
+    const container = document.querySelector('[data-tabs-for="' + pid + '"]');
+    if (!container) return;
+    container.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tabBtn === tab));
+    container.querySelectorAll('.tab-panel').forEach(p => p.hidden = p.dataset.tabPanel !== tab);
+    // Lazy-load on first activation of a non-URLs tab; subsequent
+    // activations show cached content immediately.
+    if (tab !== 'urls') {
+      const panel = container.querySelector('[data-tab-panel="' + tab + '"]');
+      if (st.cache[tab]) {
+        if (panel) renderTabPanel(pid, tab, panel, st.cache[tab]);
+      } else {
+        loadTabData(pid, tab);
+      }
+    }
+  }
+
+  async function loadTabData(pid, tab) {
+    const st = getTabState(pid);
+    if (st.fetching[tab]) return;
+    if (!TAB_ENDPOINT[tab]) return;
+    st.fetching[tab] = true;
+    const panel = document.querySelector('[data-tab-panel="' + tab + '"][data-pid="' + pid + '"]');
+    if (panel && !st.cache[tab]) panel.innerHTML = '<div class="tab-loading">loading…</div>';
+    try {
+      const data = await api(TAB_ENDPOINT[tab](pid));
+      st.cache[tab] = data;
+      const stillActive = getTabState(pid).activeTab === tab;
+      if (panel && stillActive) renderTabPanel(pid, tab, panel, data);
+      updateTabBadges(pid, tab, data);
+    } catch (e) {
+      if (panel && !st.cache[tab]) panel.innerHTML = '<div class="tab-error">load failed: ' + escape(e.message) + '</div>';
+    } finally {
+      st.fetching[tab] = false;
+    }
+  }
+
+  function updateTabBadges(pid, tab, data) {
+    const btn = document.querySelector('[data-tabs-for="' + pid + '"] [data-tab-btn="' + tab + '"]');
+    if (!btn) return;
+    let n = 0;
+    if (tab === 'summary') n = data.totalEvents != null ? data.totalEvents : (data.events ? data.events.length : 0);
+    else if (tab === 'edits') n = data.totalUniqueTargets != null ? data.totalUniqueTargets : ((data.files || []).length + (data.bash || []).length);
+    else if (tab === 'errors') n = data.total != null ? data.total : (data.groups ? data.groups.length : 0);
+    btn.innerHTML = escape(TAB_LABEL[tab]) + (n ? ' <span class="tab-count">' + n + '</span>' : '');
+    if (tab === 'errors') btn.classList.toggle('has-error', n > 0);
+  }
+
+  function renderTabPanel(pid, tab, panel, data) {
+    if (tab === 'summary')     panel.innerHTML = renderRunSummaryHTML(data);
+    else if (tab === 'edits')  panel.innerHTML = renderRecentEditsHTML(data);
+    else if (tab === 'errors') panel.innerHTML = renderErrorsHTML(data);
+  }
+
+  const EVENT_ICON = {
+    prompt:        '✎',
+    slash_command: '/',
+    auto_compact:  '⇣',
+    tool_error:    '⚠',
+    subagent:      '⌬',
+    hook_event:    '⚙',
+  };
+
+  function renderRunSummaryHTML(d) {
+    const t = d.totals || {};
+    const totalsHtml = ''
+      + '<div class="run-totals">'
+      +   '<span class="rt-chip">' + (t.prompts || 0) + ' prompts</span>'
+      +   '<span class="rt-chip">' + (t.tools || 0) + ' tools</span>'
+      +   (t.slash_commands ? '<span class="rt-chip">' + t.slash_commands + ' /cmds</span>' : '')
+      +   (t.compacts ? '<span class="rt-chip">' + t.compacts + ' compact</span>' : '')
+      +   (t.subagents ? '<span class="rt-chip">' + t.subagents + ' subagent</span>' : '')
+      +   (t.errors ? '<span class="rt-chip err">' + t.errors + ' errors</span>' : '')
+      +   (t.hooks ? '<span class="rt-chip">' + t.hooks + ' hooks</span>' : '')
+      + '</div>';
+    const events = (d.events || []).slice().reverse(); // newest first
+    if (!events.length) return totalsHtml + '<div class="tab-empty">no events yet</div>';
+    const rows = events.map(ev => {
+      const icon = EVENT_ICON[ev.type] || '·';
+      const lineHint = ev.jsonlLine ? 'jsonl line ' + ev.jsonlLine : '';
+      return '<div class="run-event-row t-' + escape(ev.type || '') + '"' + (lineHint ? ' title="' + lineHint + '"' : '') + '>'
+        + '<span class="re-ts">' + escape(fmtAbsTime(ev.ts)) + '</span>'
+        + '<span class="re-icon">' + escape(icon) + '</span>'
+        + '<span class="re-label">' + escape(ev.label || ev.type || '') + '</span>'
+        + '</div>';
+    }).join('');
+    return totalsHtml + rows;
+  }
+
+  function renderRecentEditsHTML(d) {
+    const files = d.files || [];
+    const bash = d.bash || [];
+    if (!files.length && !bash.length) return '<div class="tab-empty">no recent edits or commands</div>';
+    const renderItem = (it, defaultTool) => ''
+      + '<div class="edit-row">'
+      +   '<div class="er-line1">'
+      +     '<span class="er-tool">' + escape(it.tool || defaultTool || '') + '</span>'
+      +     '<span class="er-path" title="' + escape(it.path || '') + '">' + escape(it.path || '') + '</span>'
+      +     '<span class="er-meta">×' + (it.count || 0) + (it.lastTs ? ' · ' + fmtAge(it.lastTs) + ' ago' : '') + '</span>'
+      +   '</div>'
+      +   (it.lastDiffPreview ? '<div class="er-preview">' + escape(it.lastDiffPreview) + '</div>' : '')
+      + '</div>';
+    let html = '';
+    if (files.length) {
+      html += '<div class="edits-section"><div class="es-hd">Files (' + files.length + ')</div>';
+      html += files.map(f => renderItem(f, 'Edit')).join('');
+      html += '</div>';
+    }
+    if (bash.length) {
+      html += '<div class="edits-section"><div class="es-hd">Bash (' + bash.length + ')</div>';
+      html += bash.map(b => renderItem(b, 'Bash')).join('');
+      html += '</div>';
+    }
+    return html;
+  }
+
+  function renderErrorsHTML(d) {
+    const groups = d.groups || [];
+    if (!groups.length) return '<div class="tab-empty">no errors</div>';
+    return groups.map((g, i) => {
+      const samples = (g.samples || []).map(s => ''
+        + '<div class="err-sample">'
+        +   (s.ts ? '<span class="es-ts">' + escape(fmtAbsTime(s.ts)) + '</span>' : '')
+        +   escape(s.fullMessage || '')
+        + '</div>'
+      ).join('');
+      return ''
+        + '<div class="err-group" data-err-group="' + i + '">'
+        +   '<div class="eg-hd" title="click to toggle samples">'
+        +     '<span class="eg-tool">' + escape(g.toolName || '?') + '</span>'
+        +     '<span class="eg-pattern">' + escape(g.errorPattern || '') + '</span>'
+        +     '<span class="eg-count">×' + (g.count || 0) + (g.lastTs ? ' · ' + fmtAge(g.lastTs) + ' ago' : '') + '</span>'
+        +   '</div>'
+        +   '<div class="eg-samples">' + samples + '</div>'
+        + '</div>';
+    }).join('');
+  }
+
+  function renderCompactAlert(el, status) {
+    if (!status || !status.enabled) { el.hidden = true; el.innerHTML = ''; return; }
+    // Only surface the manual-/compact nudge when the threshold tripped AND
+    // backend couldn't auto-inject. Other states stay silent.
+    if (status.lastResult === 'skipped' && status.reason === 'no_inject_channel') {
+      const ago = status.lastTriggeredAt ? ' (' + fmtAge(status.lastTriggeredAt) + ' ago)' : '';
+      const threshold = status.auto_compact_at ? fmtTokensK(status.auto_compact_at) : '?';
+      el.hidden = false;
+      el.innerHTML = ''
+        + '<span class="ca-icon">⚠</span>'
+        + '<div>context window 超过阈值 <span class="ca-cmd">' + escape(threshold) + ' tok</span>，'
+        +   'ccv 暂无 inject 通道无法自动注入。请在该 session 内手动运行 <span class="ca-cmd">/compact</span>'
+        +   escape(ago) + '。</div>';
+      return;
+    }
+    el.hidden = true;
+    el.innerHTML = '';
+  }
+
+  // Re-apply persisted tab state after a full re-render (called from render()
+  // after innerHTML write + details-open restoration).
+  function rehydrateTabs() {
+    listEl.querySelectorAll('[data-tabs-for]').forEach(container => {
+      const pid = Number(container.dataset.tabsFor);
+      const st = _tabState.get(pid);
+      if (!st) return;
+      if (st.activeTab && st.activeTab !== 'urls') {
+        container.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tabBtn === st.activeTab));
+        container.querySelectorAll('.tab-panel').forEach(p => p.hidden = p.dataset.tabPanel !== st.activeTab);
+      }
+      for (const t of ['summary', 'edits', 'errors']) {
+        if (!st.cache[t]) continue;
+        const panel = container.querySelector('[data-tab-panel="' + t + '"]');
+        if (panel) renderTabPanel(pid, t, panel, st.cache[t]);
+        updateTabBadges(pid, t, st.cache[t]);
+      }
+    });
+  }
+
+  // Tab click + err-group expand delegation (separate from the action-data
+  // delegate so it doesn't slow that path with extra closest() walks).
+  listEl.addEventListener('click', (ev) => {
+    const tabBtn = ev.target.closest('[data-tab-btn]');
+    if (tabBtn) {
+      ev.preventDefault();
+      const pid = Number(tabBtn.dataset.pid);
+      setActiveTab(pid, tabBtn.dataset.tabBtn);
+      return;
+    }
+    const errHd = ev.target.closest('.err-group .eg-hd');
+    if (errHd) {
+      ev.preventDefault();
+      errHd.parentElement.classList.toggle('open');
+    }
+  });
+
+  // Auto-refresh active non-URLs tab while its details is open. 5s matches
+  // the backend per-instance scan cache, so polling is cheap.
+  function refreshOpenTabs() {
+    listEl.querySelectorAll('details[open]').forEach(d => {
+      const container = d.querySelector('[data-tabs-for]');
+      if (!container) return;
+      const pid = Number(container.dataset.tabsFor);
+      const st = _tabState.get(pid);
+      if (!st || st.activeTab === 'urls') return;
+      loadTabData(pid, st.activeTab);
+    });
+  }
+  visibilityPoll(refreshOpenTabs, 5000);
 
   // Drawer toggle (delegate click)
   listEl.addEventListener('click', (e) => {
