@@ -2534,6 +2534,25 @@ const HTML_PAGE = `<!doctype html>
   .context-row .ctx-pct { font-weight:600; color:var(--fg); }
   .context-row .ctx-model { opacity:.7; max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
+  /* kanban (T7: 3 columns Waiting / Working / Idle) */
+  .kanban { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:12px; align-items:start; }
+  .kanban-col { border:1px solid var(--line); border-radius:10px; min-height:80px; overflow:hidden; }
+  .kanban-col[data-col="waiting"] { border-color:rgba(248,81,73,.28); background:rgba(248,81,73,.04); }
+  .kanban-col[data-col="working"] { border-color:rgba(210,153,34,.25); background:rgba(210,153,34,.04); }
+  .kanban-col[data-col="idle"]    { border-color:var(--line); }
+  .kanban-hd { padding:8px 12px; font-size:11px; color:var(--mute); font-weight:600; text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:6px; background:rgba(13,17,23,.4); }
+  .kanban-hd .col-icon { font-size:13px; line-height:1; }
+  .kanban-col[data-col="waiting"] .kanban-hd .col-icon { color:var(--bad); }
+  .kanban-col[data-col="working"] .kanban-hd .col-icon { color:var(--warn); }
+  .kanban-col[data-col="idle"]    .kanban-hd .col-icon { color:var(--mute); }
+  .kanban-hd .col-count { margin-left:auto; font-size:10px; background:var(--card); padding:1px 7px; border-radius:10px; font-family:ui-monospace,monospace; color:var(--fg); }
+  .kanban-body { padding:8px; display:flex; flex-direction:column; gap:8px; }
+  .kanban-body > .group { margin-bottom:0; } /* override default 10px, gap handles spacing */
+  .col-empty { padding:14px 8px; text-align:center; color:var(--mute); font-size:11px; opacity:.55; }
+  @media (max-width:880px) {
+    .kanban { grid-template-columns: 1fr; gap:10px; }
+  }
+
   /* mobile narrow: shrink stats, hide labels, recenter popover */
   @media (max-width:680px) {
     .topbar-stats { gap:6px; font-size:10px; }
@@ -2918,13 +2937,47 @@ const HTML_PAGE = `<!doctype html>
       + '</div>';
   }
 
+  // ---- T7: status iconography + Kanban column mapping ----
+  // backend deriveStatus returns one of these enum values; UI is the canonical
+  // place to map them to single-char icons + short labels (the longer
+  // statusLabel from backend stays available as a tooltip via title=).
+  const STATUS_VIEW = {
+    thinking:     { icon: '⏳', short: 'thinking' },
+    tool_running: { icon: '●',  short: 'working'  },
+    waiting_ask:  { icon: '◐',  short: 'waiting'  },
+    idle:         { icon: '○',  short: 'idle'     },
+    no_session:   { icon: '○',  short: 'no log'   },
+    error:        { icon: '⚠',  short: 'error'    },
+  };
+  function colForStatus(s) {
+    if (s === 'waiting_ask') return 'waiting';
+    if (s === 'thinking' || s === 'tool_running') return 'working';
+    return 'idle'; // idle / no_session / error
+  }
+  // Pick the most-attention column among instances in a group. waiting > working > idle.
+  function colForGroup(g) {
+    let best = 'idle';
+    for (const it of g.list) {
+      const s = _statusByPid.get(it.pid) || 'no_session';
+      const col = colForStatus(s);
+      if (col === 'waiting') return 'waiting';
+      if (col === 'working') best = 'working';
+    }
+    return best;
+  }
+  const _statusByPid = new Map();
+  let _lastListData = { items: [], history: [], localCc: [] };
+  let _lastColByCwd = new Map();
+
   function render(items, history, localCc) {
+    _lastListData = { items, history: history || [], localCc: localCc || [] };
     const total = items.length + (history || []).length + ((localCc || []).length);
     metaEl.textContent = items.length + ' running'
       + (localCc && localCc.length ? ' · ' + localCc.length + ' local' : '')
       + (history && history.length ? ' · ' + history.length + ' recent' : '');
     if (!total) {
       listEl.innerHTML = '<div class="empty">No instances yet. Click "+ New" to launch one.</div>';
+      _lastColByCwd = new Map();
       return;
     }
     // Group running instances by cwd. Same cwd → one rounded container with a
@@ -2946,11 +2999,40 @@ const HTML_PAGE = `<!doctype html>
     }
     groups.sort((a,b) => (b.hasHub?1:0) - (a.hasHub?1:0) || a.minPort - b.minPort);
 
-    const projectsLabel = groups.length === 1 ? 'project' : 'projects';
+    // Bin groups into Kanban columns. Same cwd group is kept together (per
+    // team-lead constraint) and goes to the column matching its highest-
+    // priority instance status (waiting > working > idle).
+    const cols = { waiting: [], working: [], idle: [] };
+    const newColByCwd = new Map();
+    for (const g of groups) {
+      const col = colForGroup(g);
+      cols[col].push(g);
+      newColByCwd.set(g.cwd, col);
+    }
+    _lastColByCwd = newColByCwd;
+    const colMeta = [
+      { id: 'waiting', icon: '◐', label: 'Waiting' },
+      { id: 'working', icon: '●', label: 'Working' },
+      { id: 'idle',    icon: '○', label: 'Idle' },
+    ];
+
     let html = '';
     if (items.length) {
-      html += '<div class="section-hd"><span class="dot green"></span>Running (' + items.length + ' · ' + groups.length + ' ' + projectsLabel + ')</div>';
-      html += groups.map(renderGroup).join('');
+      html += '<div class="kanban">';
+      for (const cm of colMeta) {
+        const colGroups = cols[cm.id];
+        html += '<div class="kanban-col" data-col="' + cm.id + '">';
+        html +=   '<div class="kanban-hd"><span class="col-icon">' + cm.icon + '</span> ' + cm.label + ' <span class="col-count">' + colGroups.length + '</span></div>';
+        html +=   '<div class="kanban-body" data-col-body="' + cm.id + '">';
+        if (!colGroups.length) {
+          html += '<div class="col-empty">—</div>';
+        } else {
+          html += colGroups.map(renderGroup).join('');
+        }
+        html +=   '</div>';
+        html += '</div>';
+      }
+      html += '</div>';
     }
 
     // Local CC sessions — bare claude processes the user started in a terminal,
@@ -3464,14 +3546,21 @@ const HTML_PAGE = `<!doctype html>
     try { data = await api('/api/launcher/activity'); }
     catch (e) { return; }
     const acts = data.activity || [];
+    let colsDirty = false;
     for (const act of acts) {
       const row = document.querySelector('[data-act-row="' + act.pid + '"]');
       if (!row) continue;
       const badge = row.querySelector('.badge');
       const preview = row.querySelector('.preview');
       if (badge) {
+        const view = STATUS_VIEW[act.status] || { icon: '⚫', short: act.status || 'unknown' };
         badge.className = 'badge ' + (act.status || 'no_session');
-        badge.textContent = act.statusLabel || '';
+        badge.textContent = view.icon + ' ' + view.short;
+        // Backend's verbose statusLabel (e.g. "🛠 Bash: ls -la /tmp/foo") is the
+        // hover tooltip — single-char icon stays compact, full label still
+        // available without leaving the dashboard.
+        if (act.statusLabel) badge.title = act.statusLabel;
+        else badge.removeAttribute('title');
       }
       if (preview) preview.textContent = act.preview || '';
       const titleEl = document.querySelector('[data-title-for="' + act.pid + '"]');
@@ -3491,6 +3580,31 @@ const HTML_PAGE = `<!doctype html>
         drawer.dataset.payload = JSON.stringify(act);
         if (drawer.classList.contains('open')) drawer.innerHTML = renderDrawer(act);
       }
+      // Track per-pid status; if any group's column needs to change, we
+      // re-render once at the end of this tick rather than mutating DOM
+      // (preserves details-open state via render()'s existing logic).
+      if (act.pid != null) {
+        const prev = _statusByPid.get(act.pid);
+        if (prev !== act.status) {
+          _statusByPid.set(act.pid, act.status);
+          colsDirty = true;
+        }
+      }
+    }
+    if (colsDirty && _lastListData.items.length) {
+      // Recompute column for each cwd; only re-render if assignments differ
+      // from what we already painted.
+      const cwds = new Map();
+      for (const it of _lastListData.items) {
+        const key = it.cwd || '';
+        if (!cwds.has(key)) cwds.set(key, []);
+        cwds.get(key).push(it);
+      }
+      let needRender = false;
+      for (const [cwd, list] of cwds) {
+        if (colForGroup({ list }) !== _lastColByCwd.get(cwd)) { needRender = true; break; }
+      }
+      if (needRender) render(_lastListData.items, _lastListData.history, _lastListData.localCc);
     }
   }
 
