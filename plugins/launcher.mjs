@@ -10,13 +10,14 @@
 // produced by runtime-broadcast.mjs. Spawns children with CCV_HUB cleared so
 // they do not become hubs themselves.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, realpathSync, statSync, unlinkSync, watch, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, realpathSync, statSync, unlinkSync, watch, openSync, readSync, closeSync, createReadStream } from 'node:fs';
 import { dirname, join, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn, execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { createInterface } from 'node:readline';
 const require = createRequire(import.meta.url);
 
 // cc-viewer ships workspace-registry.js at the install root (≤1.6.266) or
@@ -1605,6 +1606,373 @@ function deriveStatus({ entries, pendingAsks, fileMtime }) {
   return { status: 'idle', label: `🟢 idle ${ageString(age)}` };
 }
 
+// ---------- ccusage-style usage / cost reducer ----------
+// Reads Claude Code's native session jsonl files at
+// ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl. Each `assistant`-typed
+// entry carries `message.usage` (input_tokens / output_tokens /
+// cache_creation_input_tokens / cache_read_input_tokens) and we dedup by
+// (sessionId, message.id, requestId) because a single turn is rewritten on
+// resume. Pricing comes from vendor/pricing.json (USD per 1M tokens, with
+// optional above_200k tier for the Sonnet 4 1M-context model).
+
+const PLUGIN_DIR = dirname(realpathSync(fileURLToPath(import.meta.url)));
+const PRICING_PATH = join(PLUGIN_DIR, '..', 'vendor', 'pricing.json');
+const MODELS_PATH = join(PLUGIN_DIR, '..', 'vendor', 'models.json');
+const PROJECTS_DIR = join(homedir(), '.claude', 'projects');
+const USAGE_CACHE_FILE = join(homedir(), '.claude', 'cc-viewer', 'launcher-cache.json');
+const USAGE_CACHE_TTL_MS = 60_000;
+
+let _pricingCache = null;
+let _modelsCache = null;
+
+function loadPricing() {
+  if (_pricingCache) return _pricingCache;
+  try {
+    const raw = JSON.parse(readFileSync(PRICING_PATH, 'utf-8'));
+    delete raw._meta;
+    _pricingCache = raw;
+  } catch (err) {
+    log('loadPricing error:', err.message);
+    _pricingCache = {};
+  }
+  return _pricingCache;
+}
+
+function loadModels() {
+  if (_modelsCache) return _modelsCache;
+  try {
+    _modelsCache = JSON.parse(readFileSync(MODELS_PATH, 'utf-8'));
+  } catch (err) {
+    log('loadModels error:', err.message);
+    _modelsCache = { models: {}, fallback: { context_limit: 200000 } };
+  }
+  return _modelsCache;
+}
+
+function priceForModel(modelId) {
+  const pricing = loadPricing();
+  if (modelId && pricing[modelId]) return pricing[modelId];
+  if (typeof modelId === 'string') {
+    if (modelId.includes('opus-4-7')) return pricing['claude-opus-4-7'];
+    if (modelId.includes('opus-4-6')) return pricing['claude-opus-4-6'];
+    if (modelId.includes('opus-4-5')) return pricing['claude-opus-4-5'];
+    if (modelId.includes('opus-4-1')) return pricing['claude-opus-4-1'];
+    if (modelId.includes('opus')) return pricing['claude-opus-4-7'];
+    if (modelId.includes('sonnet-4-7')) return pricing['claude-sonnet-4-7'];
+    if (modelId.includes('sonnet-4-6')) return pricing['claude-sonnet-4-6'];
+    if (modelId.includes('sonnet-4-5')) return pricing['claude-sonnet-4-5'];
+    if (modelId.includes('sonnet-4')) return pricing['claude-sonnet-4-20250514'];
+    if (modelId.includes('haiku')) return pricing['claude-haiku-4-5'];
+  }
+  return null;
+}
+
+function emptyTokenBucket() { return { input: 0, output: 0, cache_creation: 0, cache_read: 0 }; }
+
+// LiteLLM tier semantics: when a request's prompt size > 200k, the entire
+// request bills at the model's above_200k rates (input_above_200k etc.). We
+// compute cost per-entry so the tier is preserved; the aggregator sums dollars
+// across entries.
+function computeCostForEntry(model, usage) {
+  const p = priceForModel(model);
+  if (!p) return 0;
+  const inp = +usage.input_tokens || 0;
+  const out = +usage.output_tokens || 0;
+  const cw = +usage.cache_creation_input_tokens || 0;
+  const cr = +usage.cache_read_input_tokens || 0;
+  const promptSize = inp + cw + cr;
+  const tier = (promptSize > 200000 && p.input_above_200k != null)
+    ? {
+        input: p.input_above_200k,
+        output: p.output_above_200k != null ? p.output_above_200k : p.output,
+        cache_creation: p.cache_creation_above_200k != null ? p.cache_creation_above_200k : p.cache_creation,
+        cache_read: p.cache_read_above_200k != null ? p.cache_read_above_200k : p.cache_read,
+      }
+    : { input: p.input, output: p.output, cache_creation: p.cache_creation, cache_read: p.cache_read };
+  return (inp * tier.input + out * tier.output + cw * tier.cache_creation + cr * tier.cache_read) / 1e6;
+}
+
+// Untiered fallback for already-aggregated buckets — use only when per-request
+// prompt size has been lost. The real reducers compute cost per-entry above.
+function costFromUsage(byModel) {
+  const byModelUSD = {};
+  let total = 0;
+  for (const [m, u] of Object.entries(byModel)) {
+    const p = priceForModel(m);
+    if (!p) { byModelUSD[m] = 0; continue; }
+    const c = (u.input * p.input + u.output * p.output
+              + u.cache_creation * p.cache_creation + u.cache_read * p.cache_read) / 1e6;
+    byModelUSD[m] = c; total += c;
+  }
+  return { total, byModel: byModelUSD };
+}
+
+// In-memory reducer for already-decoded entries. Used when we already have a
+// jsonl tail in hand (avoids re-streaming). Caller passes a Set for dedup
+// scope (same Set across calls = global dedup).
+function usageFromEntries(entries, dedupSet) {
+  const byModel = {};
+  let totalUSD = 0;
+  let requestCount = 0;
+  let lastEntry = null;
+  for (const e of entries || []) {
+    if (!e || e.type !== 'assistant') continue;
+    const msg = e.message;
+    const u = msg && msg.usage;
+    if (!u) continue;
+    const key = (e.sessionId || '') + '|' + ((msg && msg.id) || e.uuid || '') + '|' + (e.requestId || '');
+    if (dedupSet) {
+      if (dedupSet.has(key)) continue;
+      dedupSet.add(key);
+    }
+    const model = (msg && msg.model) || 'unknown';
+    const b = byModel[model] || (byModel[model] = emptyTokenBucket());
+    b.input += +u.input_tokens || 0;
+    b.output += +u.output_tokens || 0;
+    b.cache_creation += +u.cache_creation_input_tokens || 0;
+    b.cache_read += +u.cache_read_input_tokens || 0;
+    totalUSD += computeCostForEntry(model, u);
+    requestCount++;
+    lastEntry = {
+      model,
+      input: +u.input_tokens || 0,
+      output: +u.output_tokens || 0,
+      cache_creation: +u.cache_creation_input_tokens || 0,
+      cache_read: +u.cache_read_input_tokens || 0,
+      ts: e.timestamp || null,
+    };
+  }
+  return { byModel, costUSD: totalUSD, requestCount, lastEntry };
+}
+
+async function readJsonlEntries(path, onEntry) {
+  // Stream a jsonl line-by-line so we can scale to 100s-of-MB session logs
+  // without materializing the whole file.
+  const stream = createReadStream(path, { encoding: 'utf-8' });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+  for await (const line of rl) {
+    if (!line) continue;
+    let obj; try { obj = JSON.parse(line); } catch { continue; }
+    onEntry(obj);
+  }
+}
+
+function rangeStartMs(range) {
+  const now = new Date();
+  if (range === 'today') {
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  }
+  if (range === 'week') {
+    const d = new Date(now); d.setDate(d.getDate() - 6); d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  if (range === 'month') {
+    const d = new Date(now); d.setDate(d.getDate() - 29); d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  return 0;
+}
+
+function listSessionJsonlPaths() {
+  if (!existsSync(PROJECTS_DIR)) return [];
+  const out = [];
+  let projDirs;
+  try { projDirs = readdirSync(PROJECTS_DIR); } catch { return []; }
+  for (const proj of projDirs) {
+    const projDir = join(PROJECTS_DIR, proj);
+    let st; try { st = statSync(projDir); } catch { continue; }
+    if (!st.isDirectory()) continue;
+    let files; try { files = readdirSync(projDir); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith('.jsonl')) continue;
+      out.push(join(projDir, f));
+    }
+  }
+  return out;
+}
+
+async function aggregateUsage({ range = 'today', cwd: cwdFilter = '' } = {}) {
+  const startMs = rangeStartMs(range);
+  const paths = listSessionJsonlPaths();
+  const byModel = {};
+  const byModelUSD = {};
+  let totalUSD = 0;
+  let requestCount = 0;
+  const dedup = new Set();
+  for (const p of paths) {
+    let st; try { st = statSync(p); } catch { continue; }
+    // mtime predates the range → file can't contain in-range turns.
+    if (st.mtimeMs < startMs) continue;
+    await readJsonlEntries(p, (e) => {
+      if (!e || e.type !== 'assistant') return;
+      const ts = e.timestamp ? Date.parse(e.timestamp) : 0;
+      if (ts && ts < startMs) return;
+      if (cwdFilter && e.cwd !== cwdFilter) return;
+      const msg = e.message;
+      const u = msg && msg.usage;
+      if (!u) return;
+      const key = (e.sessionId || '') + '|' + ((msg && msg.id) || e.uuid || '') + '|' + (e.requestId || '');
+      if (dedup.has(key)) return;
+      dedup.add(key);
+      const model = (msg && msg.model) || 'unknown';
+      const b = byModel[model] || (byModel[model] = emptyTokenBucket());
+      b.input += +u.input_tokens || 0;
+      b.output += +u.output_tokens || 0;
+      b.cache_creation += +u.cache_creation_input_tokens || 0;
+      b.cache_read += +u.cache_read_input_tokens || 0;
+      const cost = computeCostForEntry(model, u);
+      byModelUSD[model] = (byModelUSD[model] || 0) + cost;
+      totalUSD += cost;
+      requestCount++;
+    });
+  }
+  return { totalUSD, byModel, byModelUSD, requestCount, range, cwd: cwdFilter, computedAt: Date.now() };
+}
+
+// ---- summary cache (60s TTL, stale-while-revalidate, persisted to disk) ----
+let _usageMem = null;
+const _usageRefreshing = new Set();
+
+function loadUsageCacheFromDisk() {
+  if (_usageMem) return _usageMem;
+  try {
+    if (existsSync(USAGE_CACHE_FILE)) {
+      const raw = JSON.parse(readFileSync(USAGE_CACHE_FILE, 'utf-8'));
+      _usageMem = raw && raw.usage && typeof raw.usage === 'object' ? raw.usage : {};
+    } else _usageMem = {};
+  } catch { _usageMem = {}; }
+  return _usageMem;
+}
+
+function saveUsageCacheToDisk() {
+  try {
+    const dir = dirname(USAGE_CACHE_FILE);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    let cur = {};
+    if (existsSync(USAGE_CACHE_FILE)) {
+      try { cur = JSON.parse(readFileSync(USAGE_CACHE_FILE, 'utf-8')) || {}; } catch { cur = {}; }
+    }
+    cur.usage = _usageMem;
+    writeFileSync(USAGE_CACHE_FILE, JSON.stringify(cur, null, 2));
+  } catch (err) { log('saveUsageCacheToDisk error:', err.message); }
+}
+
+function refreshUsageInBackground(key, params) {
+  if (_usageRefreshing.has(key)) return;
+  _usageRefreshing.add(key);
+  aggregateUsage(params)
+    .then((result) => {
+      const mem = loadUsageCacheFromDisk();
+      mem[key] = result;
+      saveUsageCacheToDisk();
+    })
+    .catch((err) => log('aggregateUsage refresh error:', err.message))
+    .finally(() => _usageRefreshing.delete(key));
+}
+
+async function getCachedUsage(params) {
+  const key = `${params.range}#${params.cwd || ''}`;
+  const mem = loadUsageCacheFromDisk();
+  const hit = mem[key];
+  const now = Date.now();
+  if (hit && now - hit.computedAt < USAGE_CACHE_TTL_MS) {
+    return { ...hit, fromCache: true, stale: false };
+  }
+  if (hit) {
+    refreshUsageInBackground(key, params);
+    return { ...hit, fromCache: true, stale: true };
+  }
+  const result = await aggregateUsage(params);
+  mem[key] = result;
+  saveUsageCacheToDisk();
+  return { ...result, fromCache: false, stale: false };
+}
+
+// ---- per-instance session reducer ----
+// Cache key = jsonl path; invalidated whenever (mtime, size) changes. Native
+// session jsonls grow append-only, so a same-mtime/same-size hit means
+// "nothing new since last scan".
+const _instanceUsageCache = new Map();
+
+async function readInstanceUsage(jsonlPath) {
+  if (!jsonlPath || !existsSync(jsonlPath)) return null;
+  let st; try { st = statSync(jsonlPath); } catch { return null; }
+  const cached = _instanceUsageCache.get(jsonlPath);
+  if (cached && cached.mtime === st.mtimeMs && cached.size === st.size) return cached;
+  const byModel = {};
+  let totalUSD = 0;
+  let requestCount = 0;
+  const dedup = new Set();
+  let lastEntry = null;
+  await readJsonlEntries(jsonlPath, (e) => {
+    if (!e || e.type !== 'assistant') return;
+    const msg = e.message;
+    const u = msg && msg.usage;
+    if (!u) return;
+    const key = (e.sessionId || '') + '|' + ((msg && msg.id) || e.uuid || '') + '|' + (e.requestId || '');
+    if (dedup.has(key)) return;
+    dedup.add(key);
+    const model = (msg && msg.model) || 'unknown';
+    const b = byModel[model] || (byModel[model] = emptyTokenBucket());
+    b.input += +u.input_tokens || 0;
+    b.output += +u.output_tokens || 0;
+    b.cache_creation += +u.cache_creation_input_tokens || 0;
+    b.cache_read += +u.cache_read_input_tokens || 0;
+    totalUSD += computeCostForEntry(model, u);
+    requestCount++;
+    lastEntry = {
+      model,
+      input: +u.input_tokens || 0,
+      output: +u.output_tokens || 0,
+      cache_creation: +u.cache_creation_input_tokens || 0,
+      cache_read: +u.cache_read_input_tokens || 0,
+      ts: e.timestamp || null,
+    };
+  });
+  const totals = emptyTokenBucket();
+  for (const u of Object.values(byModel)) {
+    totals.input += u.input;
+    totals.output += u.output;
+    totals.cache_creation += u.cache_creation;
+    totals.cache_read += u.cache_read;
+  }
+  const result = {
+    mtime: st.mtimeMs, size: st.size,
+    totals, byModel, costUSD: totalUSD, requestCount, lastEntry,
+  };
+  _instanceUsageCache.set(jsonlPath, result);
+  return result;
+}
+
+function encodeCwdToProjectDir(cwd) {
+  // Inverse of decodeProjectDirName: Claude Code flattens "/" → "-".
+  return cwd.replace(/\//g, '-');
+}
+
+// Map an instance to its native Claude Code session jsonl. External claude
+// processes carry the resolved path on the instance (parsed from `ps`); for
+// ccv-managed instances we fall back to the most recently-touched jsonl in
+// the encoded-cwd project dir.
+function resolveNativeJsonl(instance) {
+  if (!instance) return null;
+  if (instance.jsonlPath && existsSync(instance.jsonlPath)) return instance.jsonlPath;
+  if (!instance.cwd) return null;
+  const dir = join(PROJECTS_DIR, encodeCwdToProjectDir(instance.cwd));
+  if (!existsSync(dir)) return null;
+  let files; try { files = readdirSync(dir); } catch { return null; }
+  let best = null;
+  let bestM = 0;
+  for (const f of files) {
+    if (!f.endsWith('.jsonl')) continue;
+    const p = join(dir, f);
+    let st; try { st = statSync(p); } catch { continue; }
+    if (st.mtimeMs > bestM) { bestM = st.mtimeMs; best = p; }
+  }
+  return best;
+}
+
+// ---------- end usage / cost reducer ----------
+
 async function getInstanceActivity(instance) {
   const cached = _activityCache.get(instance.pid);
   const now = Date.now();
@@ -1646,6 +2014,32 @@ async function getInstanceActivity(instance) {
   const preview = userText ? `user: ${truncate(userText, 120)}` : '';
   const recent = entries.slice(-5).map(summarizeEntry).reverse();
 
+  // sessionUsage: per-instance tokens + USD from Claude Code's native session
+  // jsonl. Hubs don't run user sessions so we skip them. Failures are silent —
+  // the launcher should still render even when usage data is unavailable.
+  let sessionUsage = null;
+  if (!instance.isHub) {
+    try {
+      const np = resolveNativeJsonl(instance);
+      if (np) {
+        const u = await readInstanceUsage(np);
+        if (u) {
+          sessionUsage = {
+            input: u.totals.input,
+            output: u.totals.output,
+            cache_creation: u.totals.cache_creation,
+            cache_read: u.totals.cache_read,
+            costUSD: u.costUSD,
+            requestCount: u.requestCount,
+            byModel: u.byModel,
+            lastEntry: u.lastEntry,
+            jsonlPath: np,
+          };
+        }
+      }
+    } catch (err) { log('sessionUsage error:', err.message); }
+  }
+
   const payload = {
     pid: instance.pid,
     status: status.status,
@@ -1659,6 +2053,7 @@ async function getInstanceActivity(instance) {
     logFile: logFileName,
     pendingAsks: pendingAsks.map(a => ({ id: a.id, questions: a.questions, createdAt: a.createdAt })),
     recentEvents: recent,
+    sessionUsage,
   };
   _activityCache.set(instance.pid, { at: now, payload });
   return payload;
@@ -3261,6 +3656,63 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
       sendJson(res, 200, { ok: true, worktreeDefault: getWorktreeDefault() });
     } catch (err) {
       sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  // Usage / cost summary across all native session jsonls. Cached 60s in
+  // memory + persisted to launcher-cache.json (stale-while-revalidate so a
+  // poll never blocks on a cold disk scan).
+  if (url === '/api/launcher/usage/summary' && method === 'GET') {
+    try {
+      const range = (parsedUrl.searchParams.get('range') || 'today').toLowerCase();
+      if (!['today', 'week', 'month'].includes(range)) {
+        throw new Error('range must be today|week|month');
+      }
+      const cwdParam = parsedUrl.searchParams.get('cwd') || '';
+      const result = await getCachedUsage({ range, cwd: cwdParam });
+      sendJson(res, 200, result);
+    } catch (err) {
+      sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  // Per-instance session totals (cumulative across the current jsonl).
+  // mtime/size-keyed cache → re-reading is cheap when the file hasn't grown.
+  const instUsageM = url.match(/^\/api\/launcher\/usage\/instance\/(\d+)$/);
+  if (instUsageM && method === 'GET') {
+    try {
+      const pid = parseInt(instUsageM[1], 10);
+      const inst = instances.get(pid);
+      if (!inst) { sendJson(res, 404, { error: 'instance not found' }); return; }
+      const jp = resolveNativeJsonl(inst);
+      if (!jp) {
+        sendJson(res, 200, {
+          pid,
+          jsonlPath: null,
+          sessionId: inst.sessionId || null,
+          sessionUSD: 0,
+          byModel: {},
+          totals: emptyTokenBucket(),
+          requestCount: 0,
+          lastEntry: null,
+        });
+        return;
+      }
+      const u = await readInstanceUsage(jp);
+      sendJson(res, 200, {
+        pid,
+        jsonlPath: jp,
+        sessionId: inst.sessionId || null,
+        sessionUSD: u ? u.costUSD : 0,
+        byModel: u ? u.byModel : {},
+        totals: u ? u.totals : emptyTokenBucket(),
+        requestCount: u ? u.requestCount : 0,
+        lastEntry: u ? u.lastEntry : null,
+      });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
     }
     return;
   }
