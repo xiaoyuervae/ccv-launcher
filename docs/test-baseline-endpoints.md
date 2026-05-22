@@ -56,8 +56,20 @@ must keep their contract (same method, same response shape).
 
 ### Endpoints expected in Phase 1 (NOT YET PRESENT)
 - `GET /api/launcher/usage/summary?range=today|week|month` — T3
+  - **schema correction (post-test)**: response uses `totalUSD` (number) +
+    `byModelUSD` (map), not `totalCost`. Cached/stale flags exposed as
+    `fromCache` / `stale`. UI matches.
 - `GET /api/launcher/quota/5h` — T5
-- (context % may piggy-back on `/list` or expose own endpoint — T4)
+  - **schema correction (post-test)**: `source` enum
+    `ccline_cache | api_oauth | jsonl_compute | unavailable`. Fields
+    `plan_name / burn_rate / projection_minutes / reset_at` are
+    legitimately `null` under `ccline_cache` (cache file doesn't expose
+    them). UI tooltip must conditionally hide nulls.
+- context % piggy-backs on `/api/launcher/instances/{pid}/activity` AND on
+  the bulk `/api/launcher/activity` — both return `contextUsage:
+  { used, limit, percent, model, displayName, ts }` plus `sessionUsage`
+  with per-model token + cost breakdown. Hub entries (isHub:true) skip
+  contextUsage. — T4
 
 ### Endpoints expected in Phase 2 (NOT YET PRESENT)
 - Run summary timeline — T9
@@ -103,10 +115,15 @@ group (.is-hub variant)
 - top bar / usage bar with cost (today/week/month)
 - 5h-window progress bar with plan name + remaining time
 - per-card context % progress bar
-- Kanban 3-column layout (`.kanban`, `.col-*`, etc.)
+- Kanban 3-column layout — uses `[data-col="waiting|working|idle"]` attribute
+  selectors on `.kanban-col`, not classnames (correction)
 - single-char status icons replacing emoji `🛠 ⏳`
 - tag input + autocomplete UI
 - j/n keyboard navigation jumping to `waiting_ask` cards (only ESC handlers exist now)
+
+> Post-Phase-1 correction: baseline listed `id="code"` and `id="status"` as
+> dashboard ids, but those actually belong to the PAIR_PAGE template, not the
+> dashboard. Dashboard never had them.
 
 ### NOT YET PRESENT (Phase 2 should add)
 - card-tabs (run summary / recent edits / errors)

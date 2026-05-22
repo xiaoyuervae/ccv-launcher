@@ -17,8 +17,14 @@ so the test hub sees the 4 live children + 1 prod hub (total instanceCount=6).
 > update) was confirmed by reading the dashboard HTML markup + JS source
 > served from `/launcher` — actual browser-driven keyboard/mouse behavior
 > was not exercised by this tester (no headless-browser tool wired). Items
-> verified by markup are marked **markup-✓**; items needing a human
-> click-through are marked **needs-manual-UI**.
+> verified by markup are marked **markup-✓** (wired correctly); items needing
+> a human click-through are marked **[需人工验证]**.
+
+> **Phase-1 sign-off verdict (per team-lead 2026-05-22)**: F1 (month
+> cold-cache) and F2 (compact-threshold loose validation) are tracked as
+> **post-Phase-1 follow-ups**, **not Phase-1 failures**. F4 is informational.
+> All 8 checklist items therefore pass; UI behavior-level items below remain
+> [需人工验证].
 
 ## 1. Checklist results
 
@@ -28,7 +34,7 @@ so the test hub sees the 4 live children + 1 prod hub (total instanceCount=6).
 |---|---|---|---|
 | 1.1 | `GET /api/launcher/usage/summary?range=today` returns ok | ✅ | `totalUSD=301.52`, requestCount=1844, 2 models (matches lead's expected ~$301) |
 | 1.2 | `?range=week` | ✅ | `totalUSD=1341.77`, fromCache=true |
-| 1.3 | `?range=month` | ⚠️ see [F1] | works (`totalUSD=3216.92`) but **cold-cache first hit >5s** |
+| 1.3 | `?range=month` | ✅ (see [F1] follow-up) | works (`totalUSD=3216.92`); cold-cache first hit >5s — tracked as backend follow-up, not a Phase-1 failure |
 | 1.4 | `?range=invalid` returns 400 | ✅ | 400 |
 | 1.5 | `GET /api/launcher/quota/5h` | ✅ | source=`ccline_cache`, percent=4, cached_at present |
 | 1.6 | Top-bar cost markup present (`#stat-cost`, `#stat-cost-val`, `#stat-cost-range`, `#stat-cost-popover`, `#cp-list`, `#cp-range`) | ✅ markup-✓ | 13 hits for `stat-cost` |
@@ -55,7 +61,7 @@ so the test hub sees the 4 live children + 1 prod hub (total instanceCount=6).
 | 2.6 | State auto-transitions on `refreshActivity` cycle | ✅ markup-✓ | `_statusByPid` updated each poll → next `renderKanban` re-bins; no DOM re-shuffle artefact found (clean re-render) |
 | 2.7 | Empty column placeholder `—` | ✅ markup-✓ | `.col-empty` class L82, rendered by render loop |
 | 2.8 | <880px collapses to single column | ✅ markup-✓ | CSS L84 `@media (max-width:880px) { .kanban { grid-template-columns: 1fr } }` |
-| 2.9 | "状态切换不抖" debounce | ⚠️ needs-manual-UI | The render path is full re-render every 3s; **no explicit debounce** found in source. May still feel fine if backend status is stable; flag for visual confirm under churn. |
+| 2.9 | "状态切换不抖" debounce | ⚠️ [需人工验证] | The render path is full re-render every 3s; **no explicit debounce** found in source. May still feel fine if backend status is stable; flag for visual confirm under churn. |
 
 ### 1.3 H5 — Tagging + filter + keyboard shortcuts (T8)
 
@@ -67,9 +73,9 @@ so the test hub sees the 4 live children + 1 prod hub (total instanceCount=6).
 | 3.4 | `?` key opens help dialog `#help-dlg` | ✅ markup-✓ | dialog template present; close button `#help-close` |
 | 3.5 | `j` / `n` cycle through waiting_ask | ✅ markup-✓ | 4 `addEventListener('keydown')` registrations; explicit `key === 'j'` and `key === 'n'` branches; `waiting_ask` referenced 6× |
 | 3.6 | `/` focuses tag filter | ✅ markup-✓ | `key === '/'` branch present |
-| 3.7 | Suppression: input/textarea focus, dialog open, overlay open | ⚠️ needs-manual-UI | source has guards; full edge case coverage (contenteditable, native confirm()) needs human confirm |
-| 3.8 | `+ tag` button on group hover, prompt() input, ≤24 chars | ⚠️ needs-manual-UI | `tag-add` class L93 with `opacity:0` (hover-revealed); prompt validation needs UI run |
-| 3.9 | Chip × delete with confirm | ⚠️ needs-manual-UI | `tag-chip` markup present; behavior needs human |
+| 3.7 | Suppression: input/textarea focus, dialog open, overlay open | ⚠️ [需人工验证] | source has guards; full edge case coverage (contenteditable, native confirm()) needs human confirm |
+| 3.8 | `+ tag` button on group hover, prompt() input, ≤24 chars | ⚠️ [需人工验证] | `tag-add` class L93 with `opacity:0` (hover-revealed); prompt validation needs UI run |
+| 3.9 | Chip × delete with confirm | ⚠️ [需人工验证] | `tag-chip` markup present; behavior needs human |
 | 3.10 | <680px filter input shrinks | ✅ markup-✓ | responsive CSS present (not pasted here for brevity) |
 
 ### 1.4 General regression (existing endpoints untouched)
@@ -83,7 +89,7 @@ so the test hub sees the 4 live children + 1 prod hub (total instanceCount=6).
 | 4.5 | `GET /api/launcher/browse-dir?path=…` | ✅ | returns `{current, parent, dirs:[{name, path, hasGit}]}` |
 | 4.6 | Pair flow `request → status → reject` | ✅ | got code 657579 → status approved=false expired=false → reject ok=true |
 | 4.7 | Prefs alias / ccuse-profile POST endpoints | ✅ markup-✓ | still wired in `dispatchLauncherRoute` (lines 3195 / 3208) |
-| 4.8 | `POST /api/launcher/prefs/compact-threshold` | ⚠️ see [F2] | accepts wrong shape silently |
+| 4.8 | `POST /api/launcher/prefs/compact-threshold` | ✅ (see [F2] follow-up) | accepts shape but malformed payload silently drops; backend-dev follow-up |
 | 4.9 | `POST /api/launcher/prefs/worktree-default` | ✅ | flipped true → false cleanly |
 | 4.10 | `POST /api/launcher/open-terminal` route still mounted | ✅ markup-✓ | line 3268 |
 | 4.11 | iframe overlay `#ccv-overlay` markup intact | ✅ markup-✓ | 5 hits |
@@ -109,7 +115,11 @@ curl -sX POST http://127.0.0.1:7200/api/launcher/pair-request                  #
 
 ## 2. Findings
 
-### F1 (MEDIUM, owner: backend-dev) — `usage/summary?range=month` cold-cache request >5s
+### F1 (follow-up, MEDIUM, owner: backend-dev) — `usage/summary?range=month` cold-cache request >5s
+
+> **Triage**: tracked as backend follow-up after T9, **not a Phase-1 failure**
+> (per team-lead 2026-05-22). Hot-cache path (80ms) is the normal user
+> experience; cold-cache is the extreme case at hub-restart.
 
 **Repro**:
 1. Restart the hub (cold ccusage cache for `month` range).
@@ -126,7 +136,11 @@ were warmed by prior dev sessions.
 all three ranges on boot), or stream a `{stale:true, fromCache:true, totalUSD:0}`
 sentinel first while the heavy compute runs in background.
 
-### F2 (LOW, owner: backend-dev) — `POST /prefs/compact-threshold` silently drops malformed input
+### F2 (follow-up, LOW, owner: backend-dev) — `POST /prefs/compact-threshold` silently drops malformed input
+
+> **Triage**: tracked as backend follow-up alongside F1, **not a Phase-1
+> failure**. T11 form construction must use the correct nested shape;
+> hardening the endpoint is a defense-in-depth improvement.
 
 **Repro**:
 ```bash
@@ -154,7 +168,7 @@ correct shape — otherwise the form will silently no-op.
 - `browse-dir` schema is `{current, parent, dirs:[{name, path, hasGit}]}` (not
   `entries`).
 
-### F4 (INFO) — Kanban "状态切换不抖" was a manual-UI item; no explicit debounce in code
+### F4 (INFO) — Kanban "状态切换不抖" — no explicit debounce in code, [需人工验证]
 
 `renderKanban` is invoked from `refresh()` (every 30s) and from `refreshActivity()`
 (every 3s on visible tab). Each call does a full DOM swap. There's no
@@ -204,14 +218,19 @@ lsof -nP -iTCP:7200 -sTCP:LISTEN | awk 'NR>1{print $2}' | xargs -r kill
 
 ## 5. Sign-off
 
-Phase 1 functionality is **acceptably ready for Phase 2 to land on top**:
-- All 8 user-visible checklist items pass at markup level; F1 (month cold-cache)
-  is the only one that may visibly affect users today and should be picked up
-  before Phase 2 cutover.
+**Phase 1 PASSED** (per team-lead triage 2026-05-22):
+- All 8 user-visible checklist items pass at markup/API level.
+- F1 (month cold-cache) + F2 (compact-threshold validation) are **post-Phase-1
+  backend follow-ups** — backend-dev will pick them up alongside T9. They do
+  not block Phase 2.
+- F3 (schema corrections) → fed back into `docs/test-baseline-endpoints.md`.
+- F4 (Kanban debounce) is [需人工验证] — ui-dev will visually confirm under
+  real workload churn.
+- 6 items remain [需人工验证] (Kanban migration smoothness, j/n keyboard
+  suppression edge cases, tag prompt/chip-delete dialogs, etc.) — to be
+  covered by human click-through pass.
 - No regression in existing routes / overlays / pair flow.
-- ui-dev's 165-line uncommitted cost-UI follow-up will need a re-pass once
+- ui-dev's 165-line uncommitted cost-UI follow-up will get a re-pass once
   committed.
 
-Owners pinged for findings:
-- F1 / F2 → backend-dev
-- F4 (sanity check needed) → ui-dev
+Routing handled by team-lead (no separate per-finding pings from tester).
