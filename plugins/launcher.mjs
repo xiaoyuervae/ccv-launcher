@@ -10,7 +10,7 @@
 // produced by runtime-broadcast.mjs. Spawns children with CCV_HUB cleared so
 // they do not become hubs themselves.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, realpathSync, statSync, unlinkSync, watch, openSync, readSync, closeSync, createReadStream } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, realpathSync, statSync, unlinkSync, watch, openSync, readSync, closeSync, createReadStream, copyFileSync } from 'node:fs';
 import { dirname, join, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn, execFileSync } from 'node:child_process';
@@ -1092,6 +1092,131 @@ function removeWorktree(originalCwd, worktreePath, { force = false } = {}) {
 
 function worktreeForPid(pid) {
   return _pidWorktrees.get(pid) || null;
+}
+
+// ---- CLAUDE.md scanner + editor (M4) ----
+// Scans the ancestor chain of a cwd for CLAUDE.md, plus ~/.claude/CLAUDE.md,
+// plus any `@<ref>.md` references inside those files (typically into
+// ~/.claude/rules/). Used by the per-card Memory tab.
+const MD_FILE_MAX_BYTES = 256 * 1024;
+const MD_PREVIEW_BYTES = 200;
+const MD_BACKUP_KEEP = 5;
+const HOME_CLAUDE_DIR = join(homedir(), '.claude');
+
+function isAllowedMdPath(absPath) {
+  // resolvePath instead of realpath so we work for files that don't exist
+  // yet (first-time save into a new CLAUDE.md). Caller is responsible for
+  // passing an absolute path.
+  const resolved = resolvePath(absPath);
+  if (!resolved.endsWith('.md')) return false;
+  // Allowed root 1: anywhere under ~/.claude (CLAUDE.md, rules/*.md, etc.)
+  if (isInsideDir(resolved, HOME_CLAUDE_DIR)) return true;
+  // Allowed roots 2 & 3: for any known instance cwd —
+  //   (a) a file named CLAUDE.md anywhere on the cwd's ancestor chain
+  //   (b) any .md file under cwd/.claude/ (skills, memory, etc.)
+  const base = basename(resolved);
+  const dir = dirname(resolved);
+  for (const inst of instances.values()) {
+    const cwd = inst && inst.cwd;
+    if (!cwd) continue;
+    if (base === 'CLAUDE.md' && isInsideDir(cwd, dir)) return true;
+    const dotClaude = join(cwd, '.claude');
+    if (isInsideDir(resolved, dotClaude)) return true;
+  }
+  return false;
+}
+
+function safeReadPreview(absPath) {
+  try {
+    // Read up to MD_PREVIEW_BYTES to avoid slurping multi-MB files for the
+    // scanner list view (full content goes through /api/launcher/file).
+    const fd = openSync(absPath, 'r');
+    try {
+      const buf = Buffer.alloc(MD_PREVIEW_BYTES);
+      const n = readSync(fd, buf, 0, MD_PREVIEW_BYTES, 0);
+      return buf.slice(0, n).toString('utf-8');
+    } finally { closeSync(fd); }
+  } catch { return ''; }
+}
+
+function pushMdFile(out, seen, absPath, scope) {
+  let real = absPath;
+  try { real = realpathSync(absPath); } catch { /* keep raw */ }
+  if (seen.has(real)) return;
+  seen.add(real);
+  try {
+    const st = statSync(real);
+    if (!st.isFile()) return;
+    out.push({
+      path: real,
+      scope,
+      size: st.size,
+      mtime: Math.floor(st.mtimeMs),
+      preview: safeReadPreview(real),
+    });
+  } catch { /* unreadable — skip silently */ }
+}
+
+function scanClaudeMd(cwd) {
+  const out = [];
+  const seen = new Set();
+  if (!cwd || typeof cwd !== 'string') return out;
+  // 1. Walk cwd → ancestors for CLAUDE.md. The match in cwd itself is
+  //    scope='project', further up is 'parent'. Stop at filesystem root.
+  let dir = cwd;
+  let lastDir = '';
+  let isFirst = true;
+  while (dir && dir !== lastDir) {
+    const p = join(dir, 'CLAUDE.md');
+    if (existsSync(p)) pushMdFile(out, seen, p, isFirst ? 'project' : 'parent');
+    isFirst = false;
+    lastDir = dir;
+    dir = dirname(dir);
+  }
+  // 2. Global ~/.claude/CLAUDE.md (always; scope distinct from rules).
+  const global = join(HOME_CLAUDE_DIR, 'CLAUDE.md');
+  if (existsSync(global)) pushMdFile(out, seen, global, 'global');
+  // 3. @-references inside every CLAUDE.md found so far. Matches `@~/...md`,
+  //    `@/abs/...md`, and `@relative/...md`. Anything ending in `.md`.
+  //    Resolves ~/ to homedir, relative to dirname(file).
+  for (const file of [...out]) {
+    let buf = '';
+    try { buf = readFileSync(file.path, 'utf-8'); } catch { continue; }
+    const refRe = /@(~?[/\w][^\s)`]*\.md)/g;
+    let m;
+    while ((m = refRe.exec(buf)) !== null) {
+      let ref = m[1];
+      if (ref.startsWith('~/')) ref = join(homedir(), ref.slice(2));
+      else if (!ref.startsWith('/')) ref = resolvePath(dirname(file.path), ref);
+      if (existsSync(ref)) pushMdFile(out, seen, ref, 'rule');
+    }
+  }
+  return out;
+}
+
+function backupMdBeforeWrite(absPath) {
+  // No-op when the file doesn't exist yet (first-time create). Else snapshot
+  // to <path>.bak.<ISO-ts> and keep the latest MD_BACKUP_KEEP siblings.
+  if (!existsSync(absPath)) return null;
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupPath = absPath + '.bak.' + ts;
+  copyFileSync(absPath, backupPath);
+  try {
+    const dir = dirname(absPath);
+    const base = basename(absPath);
+    const prefix = base + '.bak.';
+    const entries = readdirSync(dir)
+      .filter(e => e.startsWith(prefix))
+      .map(e => {
+        try { return { name: e, mtime: statSync(join(dir, e)).mtimeMs }; }
+        catch { return { name: e, mtime: 0 }; }
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const e of entries.slice(MD_BACKUP_KEEP)) {
+      try { unlinkSync(join(dir, e.name)); } catch { /* ignore */ }
+    }
+  } catch { /* dir read failure shouldn't fail the write */ }
+  return backupPath;
 }
 
 async function doSpawn(targetCwd, { force = false, ccuseProfile = '', useWorktree = false, branchName = '' } = {}) {
@@ -3352,6 +3477,35 @@ const HTML_PAGE = `<!doctype html>
   .git-actions { display:flex; gap:6px; flex-wrap:wrap; padding-top:4px; border-top:1px dotted var(--line); }
   .git-actions .btn[disabled] { opacity:.4; cursor:not-allowed; }
   .instance-head .wt-tag { font-size:10px; color:#8ddc94; background:rgba(63,185,80,.10); padding:1px 6px; border-radius:3px; font-family:ui-monospace,monospace; }
+  /* Memory tab */
+  .mem-group { margin-bottom:10px; }
+  .mem-group:last-child { margin-bottom:0; }
+  .mg-hd { font-size:10px; color:var(--mute); text-transform:uppercase; letter-spacing:.5px; margin-bottom:4px; }
+  .mem-row { padding:0; border-bottom:1px dotted var(--line); }
+  .mem-row:last-child { border-bottom:0; }
+  .mem-row .mr-hd { display:flex; gap:8px; align-items:baseline; padding:5px 4px; cursor:pointer; font-family:ui-monospace,monospace; font-size:10px; }
+  .mem-row .mr-hd:hover { background:rgba(88,166,255,.06); }
+  .mem-row .mr-path { color:#a5d6ff; font-weight:600; min-width:90px; }
+  .mem-row .mr-dir { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--mute); direction:rtl; text-align:left; }
+  .mem-row .mr-meta { color:var(--mute); flex-shrink:0; }
+  .mem-row .mr-body { padding:6px 4px; }
+  .mem-row .mr-body textarea { width:100%; height:380px; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px; line-height:1.5; resize:vertical; box-sizing:border-box; }
+  .mem-row .mr-body textarea:focus { outline:0; border-color:var(--accent); }
+  .mem-row .mr-actions { display:flex; gap:6px; margin-top:6px; }
+  .mem-row .mr-info { font-size:10px; color:var(--mute); padding-top:4px; }
+  /* global Memory drawer */
+  #mem-drawer { display:none; position:fixed; right:16px; top:54px; width:400px; max-width:90vw; max-height:70vh; overflow-y:auto; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px; z-index:30; box-shadow:0 6px 24px rgba(0,0,0,.4); }
+  #mem-drawer.open { display:block; }
+  #mem-drawer .md-hd { display:flex; justify-content:space-between; align-items:center; padding-bottom:6px; border-bottom:1px solid var(--line); margin-bottom:8px; }
+  #mem-drawer .md-title { font-size:12px; font-weight:600; }
+  #mem-drawer .md-close { background:transparent; color:var(--mute); border:0; font-size:18px; cursor:pointer; }
+  #mem-drawer .md-row { display:flex; gap:6px; padding:4px 0; border-bottom:1px dotted var(--line); font-family:ui-monospace,monospace; font-size:10px; }
+  #mem-drawer .md-row:last-child { border-bottom:0; }
+  #mem-drawer .md-scope { color:#a5d6ff; min-width:54px; font-weight:600; }
+  #mem-drawer .md-path { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--fg); }
+  #mem-drawer .md-pids { color:var(--mute); }
+  #btn-mem { background:transparent; color:var(--mute); border:1px solid var(--line); padding:5px 10px; border-radius:6px; font-size:12px; cursor:pointer; }
+  #btn-mem:hover { color:var(--accent); border-color:var(--accent); }
   .err-group .eg-samples { display:none; padding:4px 0 0 0; }
   .err-group.open .eg-samples { display:block; }
   .err-sample { font-family:ui-monospace,monospace; font-size:10px; color:var(--mute); padding:3px 0; white-space:pre-wrap; word-break:break-all; border-left:2px solid var(--line); padding-left:8px; margin:4px 0; }
@@ -3485,9 +3639,17 @@ const HTML_PAGE = `<!doctype html>
   <span class="grow"></span>
   <input type="text" id="tag-filter" placeholder="filter tags (/)" autocomplete="off" spellcheck="false">
   <button id="btn-wt" title="git worktrees (click to manage)" hidden>🌿 <span id="btn-wt-count">0</span></button>
+  <button id="btn-mem" title="CLAUDE.md across all running instances (aggregated)">📖 Memory</button>
   <button id="btn-help" title="Keyboard shortcuts (?)">?</button>
   <button id="btn-new">+ New</button>
 </header>
+<div id="mem-drawer">
+  <div class="md-hd">
+    <span class="md-title">Memory (aggregated)</span>
+    <button class="md-close" id="mem-drawer-close" title="close">×</button>
+  </div>
+  <div id="mem-drawer-body" style="font-size:11px;color:var(--mute)">loading…</div>
+</div>
 <div id="pair-zone" style="max-width:960px;margin:0 auto;padding:12px 24px 0"></div>
 <div class="content" id="list"><div class="empty">loading…</div></div>
 <footer>ccv-launcher</footer>
@@ -3655,7 +3817,7 @@ const HTML_PAGE = `<!doctype html>
               + (pub ? '<div class="url-row">Public: <a href="#" data-act="copy" data-text="'+pub+'">'+pub+'</a></div>' : '')
               + (pub ? '<div class="qr" data-qr="'+pub+'"></div>' : '')
               + '</details>'
-            : '<details><summary>Details &middot; URLs &middot; Summary &middot; Edits &middot; Errors' + (it.worktree ? ' &middot; Git' : '') + '</summary>'
+            : '<details><summary>Details &middot; URLs &middot; Summary &middot; Edits &middot; Errors &middot; Memory' + (it.worktree ? ' &middot; Git' : '') + '</summary>'
               + '<div class="card-tabs" data-tabs-for="' + it.pid + '">'
               +   '<div class="tab-strip" role="tablist">'
               +     '<button class="tab-btn active" data-tab-btn="urls"    data-pid="' + it.pid + '">URLs &middot; QR</button>'
@@ -3663,6 +3825,7 @@ const HTML_PAGE = `<!doctype html>
               +     '<button class="tab-btn"        data-tab-btn="edits"   data-pid="' + it.pid + '">Edits</button>'
               +     '<button class="tab-btn"        data-tab-btn="errors"  data-pid="' + it.pid + '">Errors</button>'
               +     '<button class="tab-btn"        data-tab-btn="threshold" data-pid="' + it.pid + '" data-cwd="' + escape(it.cwd || '') + '">Threshold</button>'
+              +     '<button class="tab-btn"        data-tab-btn="memory"  data-pid="' + it.pid + '">Memory</button>'
               +     (it.worktree ? '<button class="tab-btn" data-tab-btn="git" data-pid="' + it.pid + '">Git</button>' : '')
               +   '</div>'
               +   '<div class="tab-panel" data-tab-panel="urls" data-pid="' + it.pid + '">'
@@ -3675,6 +3838,7 @@ const HTML_PAGE = `<!doctype html>
               +   '<div class="tab-panel" data-tab-panel="edits"   data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>'
               +   '<div class="tab-panel" data-tab-panel="errors"  data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>'
               +   '<div class="tab-panel" data-tab-panel="threshold" data-pid="' + it.pid + '" data-cwd="' + escape(it.cwd || '') + '" hidden><div class="tab-empty">click to load…</div></div>'
+              +   '<div class="tab-panel" data-tab-panel="memory" data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>'
               +   (it.worktree ? '<div class="tab-panel" data-tab-panel="git" data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>' : '')
               + '</div>'
               + '</details>')
@@ -4100,6 +4264,65 @@ const HTML_PAGE = `<!doctype html>
     if (act === 'git-commit') gitCommitFlow(pid);
     else if (act === 'git-push') gitPushFlow(pid);
     else if (act === 'git-pr') gitOpenPrFlow(pid);
+  });
+
+  // ---- M4: Memory tab — open + edit + save CLAUDE.md / rules ----
+  async function memOpenRow(memRow) {
+    const body = memRow.querySelector('.mr-body');
+    if (!body) return;
+    if (!body.hidden) {
+      // toggle close
+      body.hidden = true; body.innerHTML = '';
+      return;
+    }
+    body.hidden = false;
+    body.innerHTML = '<div class="tab-loading">loading…</div>';
+    const path = memRow.dataset.memPath;
+    try {
+      const r = await api('/api/launcher/file?path=' + encodeURIComponent(path));
+      body.innerHTML = ''
+        + '<textarea spellcheck="false" data-mem-edit></textarea>'
+        + '<div class="mr-actions">'
+        +   '<button class="btn primary" data-act="mem-save">Save</button>'
+        +   '<button class="btn" data-act="mem-cancel">Cancel</button>'
+        +   '<span class="mr-info">' + (r.size || 0) + ' bytes · backup auto-kept (latest 5)</span>'
+        + '</div>';
+      body.querySelector('textarea').value = r.content || '';
+    } catch (e) {
+      body.innerHTML = '<div class="tab-error">load failed: ' + escape(e.message) + '</div>';
+    }
+  }
+  async function memSaveRow(memRow) {
+    const path = memRow.dataset.memPath;
+    const ta = memRow.querySelector('textarea[data-mem-edit]');
+    if (!ta) return;
+    try {
+      const r = await api('/api/launcher/file', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path, content: ta.value }),
+      });
+      alert('Saved · ' + (r.size || 0) + ' bytes' + (r.backup ? '\nbackup: ' + r.backup : ''));
+      // Refresh the Memory tab so size/mtime update
+      const container = memRow.closest('[data-tabs-for]');
+      if (container) {
+        const pid = Number(container.dataset.tabsFor);
+        const st = _tabState.get(pid);
+        if (st) st.cache.memory = null;
+        loadTabData(pid, 'memory');
+      }
+    } catch (e) { alert('Save failed: ' + e.message); }
+  }
+  listEl.addEventListener('click', (ev) => {
+    const t = ev.target.closest('[data-act]');
+    if (!t) return;
+    const act = t.dataset.act;
+    if (act !== 'mem-open' && act !== 'mem-save' && act !== 'mem-cancel') return;
+    ev.preventDefault();
+    const memRow = t.closest('.mem-row');
+    if (!memRow) return;
+    if (act === 'mem-open') memOpenRow(memRow);
+    else if (act === 'mem-save') memSaveRow(memRow);
+    else if (act === 'mem-cancel') { const b = memRow.querySelector('.mr-body'); if (b) { b.hidden = true; b.innerHTML = ''; } }
   });
 
   // ---- Terminal overlay ----
@@ -4579,12 +4802,13 @@ const HTML_PAGE = `<!doctype html>
     try { return new Date(ts).toLocaleTimeString([], { hour12: false }); } catch { return ''; }
   }
 
-  const TAB_LABEL = { urls: 'URLs · QR', summary: 'Summary', edits: 'Edits', errors: 'Errors', threshold: 'Threshold', git: 'Git' };
+  const TAB_LABEL = { urls: 'URLs · QR', summary: 'Summary', edits: 'Edits', errors: 'Errors', threshold: 'Threshold', memory: 'Memory', git: 'Git' };
   const TAB_ENDPOINT = {
     summary: pid => '/api/launcher/instances/' + pid + '/run-summary',
     edits:   pid => '/api/launcher/instances/' + pid + '/recent-edits',
     errors:  pid => '/api/launcher/instances/' + pid + '/errors',
     git:     pid => '/api/launcher/instances/' + pid + '/git-diff',
+    memory:  pid => '/api/launcher/instances/' + pid + '/claude-md',
     // 'threshold' has no fetch endpoint — it's a per-cwd form driven by
     // compactStatus from the activity payload and by POSTing to
     // /api/launcher/prefs/compact-threshold on Save.
@@ -4643,6 +4867,7 @@ const HTML_PAGE = `<!doctype html>
     else if (tab === 'edits') n = data.totalUniqueTargets != null ? data.totalUniqueTargets : ((data.files || []).length + (data.bash || []).length);
     else if (tab === 'errors') n = data.total != null ? data.total : (data.groups ? data.groups.length : 0);
     else if (tab === 'git') n = (data.files || []).length;
+    else if (tab === 'memory') n = (data.files || []).length;
     btn.innerHTML = escape(TAB_LABEL[tab]) + (n ? ' <span class="tab-count">' + n + '</span>' : '');
     if (tab === 'errors') btn.classList.toggle('has-error', n > 0);
   }
@@ -4652,6 +4877,7 @@ const HTML_PAGE = `<!doctype html>
     else if (tab === 'edits')  panel.innerHTML = renderRecentEditsHTML(data);
     else if (tab === 'errors') panel.innerHTML = renderErrorsHTML(data);
     else if (tab === 'git')    panel.innerHTML = renderGitHTML(pid, data);
+    else if (tab === 'memory') panel.innerHTML = renderMemoryHTML(pid, data);
   }
 
   const EVENT_ICON = {
@@ -4766,6 +4992,44 @@ const HTML_PAGE = `<!doctype html>
       +   '<button class="btn" data-act="git-pr" data-pid="' + pid + '">Open PR</button>'
       + '</div>';
     return head + fileRows + actions;
+  }
+
+  // Memory tab: groups CLAUDE.md scan results by scope, each row expandable
+  // into an inline editor. Loaded lazily from /api/launcher/instances/:pid/claude-md.
+  const SCOPE_LABEL = { project: '本项目', parent: '父目录链', global: '全局', rule: 'Rules' };
+  function renderMemoryHTML(pid, d) {
+    const files = (d && d.files) || [];
+    if (!files.length) return '<div class="tab-empty">no CLAUDE.md found on this cwd / global</div>';
+    const groups = { project: [], parent: [], global: [], rule: [] };
+    for (const f of files) (groups[f.scope] || (groups[f.scope] = [])).push(f);
+    let html = '';
+    for (const scope of ['project', 'parent', 'global', 'rule']) {
+      const arr = groups[scope] || [];
+      if (!arr.length) continue;
+      html += '<div class="mem-group">';
+      html += '<div class="mg-hd">' + escape(SCOPE_LABEL[scope] || scope) + ' (' + arr.length + ')</div>';
+      for (const f of arr) {
+        const sizeKB = (f.size / 1024).toFixed(1);
+        const ago = f.mtime ? fmtAge(f.mtime) + ' ago' : '';
+        html += ''
+          + '<div class="mem-row" data-mem-path="' + escape(f.path) + '">'
+          +   '<div class="mr-hd" data-act="mem-open">'
+          +     '<span class="mr-path" title="' + escape(f.path) + '">' + escape(f.path.replace(/^.*\//, '')) + '</span>'
+          +     '<span class="mr-dir" title="' + escape(f.path) + '">' + escape(dirnameJs(f.path)) + '</span>'
+          +     '<span class="mr-meta">' + sizeKB + ' KB · ' + escape(ago) + '</span>'
+          +   '</div>'
+          +   '<div class="mr-body" hidden></div>'
+          + '</div>';
+      }
+      html += '</div>';
+    }
+    return html;
+  }
+
+  // dirname() shim — no node:path in browser. Splits to last "/".
+  function dirnameJs(p) {
+    const i = p.lastIndexOf('/');
+    return i <= 0 ? '/' : p.slice(0, i);
   }
 
   function renderCompactAlert(el, status) {
@@ -4898,7 +5162,7 @@ const HTML_PAGE = `<!doctype html>
         container.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tabBtn === st.activeTab));
         container.querySelectorAll('.tab-panel').forEach(p => p.hidden = p.dataset.tabPanel !== st.activeTab);
       }
-      for (const t of ['summary', 'edits', 'errors', 'git']) {
+      for (const t of ['summary', 'edits', 'errors', 'git', 'memory']) {
         if (!st.cache[t]) continue;
         const panel = container.querySelector('[data-tab-panel="' + t + '"]');
         if (panel) renderTabPanel(pid, t, panel, st.cache[t]);
@@ -5412,6 +5676,45 @@ const HTML_PAGE = `<!doctype html>
   }
   visibilityPoll(refreshWorktreeCounter, 10000);
   refreshWorktreeCounter();
+
+  // ---- M4: global Memory drawer (aggregated CLAUDE.md across all instances) ----
+  const memDrawer = document.getElementById('mem-drawer');
+  const memDrawerBody = document.getElementById('mem-drawer-body');
+  const memBtn = document.getElementById('btn-mem');
+  document.getElementById('mem-drawer-close').addEventListener('click', () => memDrawer.classList.remove('open'));
+  if (memBtn) memBtn.addEventListener('click', async () => {
+    if (memDrawer.classList.contains('open')) { memDrawer.classList.remove('open'); return; }
+    memDrawer.classList.add('open');
+    memDrawerBody.textContent = 'loading…';
+    try {
+      const data = await api('/api/launcher/claude-md/all');
+      const files = data.files || [];
+      if (!files.length) { memDrawerBody.textContent = 'no CLAUDE.md across running instances'; return; }
+      const grouped = { project: [], parent: [], global: [], rule: [] };
+      for (const f of files) (grouped[f.scope] || (grouped[f.scope] = [])).push(f);
+      let html = '';
+      for (const scope of ['project', 'parent', 'global', 'rule']) {
+        for (const f of grouped[scope] || []) {
+          const pids = (f.pids || []).slice(0, 3).join(',') + ((f.pids || []).length > 3 ? '+' : '');
+          html += '<div class="md-row">'
+            + '<span class="md-scope">' + escape(scope) + '</span>'
+            + '<span class="md-path" title="' + escape(f.path) + '">' + escape(f.path) + '</span>'
+            + '<span class="md-pids">pids:' + escape(pids) + '</span>'
+            + '</div>';
+        }
+      }
+      memDrawerBody.innerHTML = html || '<div>(empty)</div>';
+    } catch (e) {
+      memDrawerBody.textContent = 'failed: ' + e.message;
+    }
+  });
+  // Close drawer on outside click. ignore clicks on the toggle itself.
+  document.addEventListener('click', (ev) => {
+    if (!memDrawer.classList.contains('open')) return;
+    if (memDrawer.contains(ev.target)) return;
+    if (memBtn && memBtn.contains(ev.target)) return;
+    memDrawer.classList.remove('open');
+  });
 
   // Single global keydown listener — bails out when typing or when a
   // modal/overlay owns the keyboard. Other ESC handlers (term-overlay /
@@ -6083,6 +6386,82 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
         }
       }
       sendJson(res, 200, { ok: true, removed, rejected, needsConfirm: rejected.length > 0 && !force });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // ---- M4: CLAUDE.md scanner + inline editor ----
+  // Per-pid scan walks the instance cwd's ancestor chain + ~/.claude/CLAUDE.md
+  // + any @-referenced .md files. Read/write endpoints share a single
+  // whitelist (isAllowedMdPath) that bounds writes to CLAUDE.md on the cwd
+  // ancestor chain, .md files under cwd/.claude/, or anywhere under ~/.claude.
+  const claudeMdM = url.match(/^\/api\/launcher\/instances\/(\d+)\/claude-md$/);
+  if (claudeMdM && method === 'GET') {
+    try {
+      const pid = parseInt(claudeMdM[1], 10);
+      const inst = instances.get(pid);
+      if (!inst) { sendJson(res, 404, { error: 'instance not found' }); return; }
+      sendJson(res, 200, { pid, cwd: inst.cwd, files: scanClaudeMd(inst.cwd) });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // Aggregated view across every running non-hub instance. UI top-bar uses
+  // this to render the global Memory drawer (de-duped by absolute path).
+  if (url === '/api/launcher/claude-md/all' && method === 'GET') {
+    try {
+      const merged = new Map(); // realpath → entry (+ list of pids it surfaced for)
+      for (const inst of instances.values()) {
+        if (!inst || !inst.cwd || inst.isHub) continue;
+        for (const f of scanClaudeMd(inst.cwd)) {
+          if (!merged.has(f.path)) merged.set(f.path, { ...f, pids: [] });
+          merged.get(f.path).pids.push(inst.pid);
+        }
+      }
+      sendJson(res, 200, { files: Array.from(merged.values()) });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  if (url.startsWith('/api/launcher/file') && method === 'GET') {
+    try {
+      const raw = parsedUrl.searchParams.get('path') || '';
+      if (!raw) { sendJson(res, 400, { error: 'path required' }); return; }
+      const abs = resolvePath(raw);
+      if (!isAllowedMdPath(abs)) { sendJson(res, 403, { error: 'path not in whitelist' }); return; }
+      if (!existsSync(abs)) { sendJson(res, 404, { error: 'file not found' }); return; }
+      const st = statSync(abs);
+      if (!st.isFile()) { sendJson(res, 400, { error: 'not a regular file' }); return; }
+      if (st.size > MD_FILE_MAX_BYTES) { sendJson(res, 413, { error: 'file too large (>' + MD_FILE_MAX_BYTES + ' bytes)' }); return; }
+      const content = readFileSync(abs, 'utf-8');
+      sendJson(res, 200, { path: abs, size: st.size, mtime: Math.floor(st.mtimeMs), content });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  if (url === '/api/launcher/file' && method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req, 512 * 1024) || '{}');
+      const raw = typeof body.path === 'string' ? body.path : '';
+      const content = typeof body.content === 'string' ? body.content : '';
+      if (!raw) { sendJson(res, 400, { error: 'path required' }); return; }
+      if (content.length > MD_FILE_MAX_BYTES) { sendJson(res, 413, { error: 'content too large (>' + MD_FILE_MAX_BYTES + ' bytes)' }); return; }
+      const abs = resolvePath(raw);
+      if (!isAllowedMdPath(abs)) { sendJson(res, 403, { error: 'path not in whitelist' }); return; }
+      const dir = dirname(abs);
+      if (!existsSync(dir)) { sendJson(res, 400, { error: 'parent directory does not exist' }); return; }
+      const backup = backupMdBeforeWrite(abs);
+      writeFileSync(abs, content, 'utf-8');
+      const st = statSync(abs);
+      sendJson(res, 200, { ok: true, path: abs, size: st.size, mtime: Math.floor(st.mtimeMs), backup });
     } catch (err) {
       sendJson(res, 500, { error: err.message });
     }
