@@ -18,7 +18,50 @@ T13 (M4 CLAUDE.md scanner), Phase-1 regression, F2 follow-up verification
 
 ---
 
-## 0. Critical finding (escalated separately to lead)
+## 0. Critical finding — RESOLVED ✅
+
+### S1 / HIGH — `/api/launcher/file` symlink escape (read + write) — **FIXED in `eb882f0`**
+
+**Original finding (from initial Phase 2 run, HEAD `99eeeac`)**: `isAllowedMdPath`
+used `resolvePath` (path.resolve, string-level), so a symlink inside `~/.claude/`
+with an `.md` extension passed the whitelist while the OS read/write followed
+the link to arbitrary user-accessible files.
+
+**Fix** (lead, commit `eb882f0`): new `safeRealpath(absPath)` helper resolves
+symlinks via `realpathSync` (with `dirname + basename` fallback for not-yet-
+existing leaves). `isAllowedMdPath` is now two-stage:
+1. lexical resolve + `.md` shape gate (early reject)
+2. realpath-resolved path re-checked against whitelist roots
+
+Closes both "leaf is symlink" AND "parent dir is symlink" variants.
+
+### Re-verification on HEAD `eb882f0`
+
+Restarted hub: killed pid 45567, fresh pid 51255 on new code.
+
+| # | Attack vector | Expected | Got | Status |
+|---|---|---|---|---|
+| A | GET via leaf symlink → /etc/passwd | 403 | `403 {"error":"path not in whitelist"}` | ✅ |
+| B | POST via leaf symlink → user-writable /tmp file | 403, target unchanged | 403, target still `SAFE-BEFORE-FIX` | ✅ |
+| C | POST with parent dir = symlink → /tmp dir | 403, no file created | 403, `/tmp/tester-parent-target/` empty | ✅ |
+
+### Non-regression checks (post-fix)
+
+| # | Item | Got | Status |
+|---|---|---|---|
+| D | Legit create `~/.claude/tester-fix-regression.md` | 200, `backup:null` | ✅ |
+| E | Legit update same path | 200, `backup:".bak.<ISO-ts>"` written | ✅ |
+| F | Legit GET on same path | 200 + content body | ✅ |
+| G | GET `/etc/passwd` directly | 403 | ✅ |
+| H | GET via `..` traversal | 403 | ✅ |
+| I | POST non-`.md` extension | 403 | ✅ |
+
+All fixtures, symlinks, .bak files cleaned up. **S1 is closed.** Phase 2
+unblocked.
+
+---
+
+## 0a. Original Phase 2 finding (preserved for history)
 
 ### S1 / HIGH — `/api/launcher/file` symlink escape (read + write)
 
@@ -162,7 +205,7 @@ Fixtures (`/tmp/demo`, `/tmp/demo-bare.git`) removed at end.
 | 3.7 | `/file` POST refuses out-of-whitelist root | ✅ | `/tmp/evil.md` → 403 |
 | 3.8 | `/file` GET refuses `/etc/passwd` | ✅ | 403 |
 | 3.9 | `/file` refuses `..` traversal | ✅ | `~/.claude/../../../../etc/passwd` → 403 (and same with `.md` suffix) |
-| 3.10 | **`/file` SYMLINK escape allows read+write of arbitrary user files** | ❌ **S1** | see §0 |
+| 3.10 | **`/file` SYMLINK escape allows read+write of arbitrary user files** | ✅ FIXED in `eb882f0` | see §0 — original repro 403'd after `safeRealpath` patch |
 | 3.11 | Top-bar `📖 Memory` aggregated drawer | ✅ markup-✓ | `id="btn-mem"` L489 + drawer template L495 |
 | 3.12 | Memory tab per-card grouped by scope | ✅ markup-✓ | `renderMemoryHTML` L1851 groups by `scope` |
 | 3.13 | Inline editor (380px textarea + Save alert) | ✅ markup-✓ | L1119-1156 wires fetch → textarea → POST → alert showing backup path |
@@ -211,33 +254,34 @@ curl -X POST .../api/launcher/instances/<pid>/open-pr   # NOT git-pr (UI uses ac
 curl    .../api/launcher/worktrees
 curl -X POST .../api/launcher/worktrees/cleanup         # body: {paths:[...], force?:bool}
 curl    .../api/launcher/claude-md/all
-curl    .../api/launcher/file?path=...                  # ⚠ symlink escape — see §0
-curl -X POST .../api/launcher/file                      # ⚠ symlink escape — see §0
+curl    .../api/launcher/file?path=...                  # ✅ S1 fixed in eb882f0
+curl -X POST .../api/launcher/file                      # ✅ S1 fixed in eb882f0
 ```
 
 ## 7. Sign-off
 
-**Phase 2 functionality is RIGHT THERE — but blocked on one HIGH security
-finding (§0)**:
+**Phase 2 PASSED — S1 fixed in eb882f0, re-verified by tester on HEAD eb882f0**:
 
-- ❌ **S1 / HIGH (BLOCKING)** — `/api/launcher/file` symlink escape (T13).
-  Must be fixed before any release. ~5-line patch in `isAllowedMdPath` +
-  `O_NOFOLLOW` on write.
+- ✅ **S1 / HIGH (RESOLVED)** — symlink escape on `/api/launcher/file` patched
+  by `safeRealpath` two-stage check (lead, commit `eb882f0`). 3 attack vectors
+  (leaf-symlink-to-root-file, leaf-symlink-to-user-file, parent-dir-symlink)
+  all now return 403. 6 non-regression checks (legit create/update/GET +
+  /etc/passwd / `..` traversal / non-.md) all behave as before. See §0.
 - ✅ T11 — all backend endpoints + markup correct. Tab interaction lazy-load
   + auto-refresh remains `[需人工验证]` (no browser).
 - ✅ T12 — full E2E walked: spawn worktree → edit → diff → commit (with
   shell-injection probe) → push → PR-validate → cleanup gating with force
   override. All passed.
 - ✅ T13 backend — scanner endpoints, backup rotation, 403 boundary on
-  /etc/passwd, traversal, non-.md, non-whitelisted root — all enforced.
-  **EXCEPT** the symlink escape in §0.
+  /etc/passwd, traversal, non-.md, non-whitelisted root, **and symlink
+  escape** — all enforced.
 - ✅ F2 (Phase 1 follow-up) — endpoint now rejects malformed input;
   error message could be clearer about expected shape.
 - ✅ F1 (Phase 1 follow-up) — closed by `0ca48a5` perf commit.
 - ✅ Phase 1 regression — sanity passed; spawn/kill exercised live during T12.
 
-**Recommendation**: hold Phase 2 release until S1 is patched. Once
-m2-dev ships the fix, I can re-verify the symlink scenario in ~2 minutes.
+**Recommendation**: Phase 2 cleared for release pending the lingering UI
+behavior items below (none are blocking; all are needs-visual-confirm).
 
 ### Lingering [需人工验证] items (lead to assign)
 - T11 tab click → lazy fetch → cache → switch-back smoothness
