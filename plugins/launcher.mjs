@@ -981,8 +981,130 @@ function waitForChildRuntime(pid, timeoutMs) {
   });
 }
 
-async function doSpawn(targetCwd, { force = false, ccuseProfile = '' } = {}) {
+// ---- worktree (M2) ----
+// pid → { path, branch, baseRef, originalCwd } for instances we spawned in a
+// dedicated git worktree. Kept in-memory (volatile across hub restarts); on
+// hub start we don't try to reconcile — `git worktree list` + `_pidWorktrees`
+// together give us the truth at /api/launcher/worktrees time.
+const _pidWorktrees = new Map();
+
+const WORKTREE_NAME_RE = /^[a-zA-Z0-9_-]{1,40}$/;
+const BRANCH_NAME_RE = /^[a-zA-Z0-9_./-]{1,80}$/;
+
+function isInsideDir(child, parent) {
+  // resolve both, then verify child === parent OR child starts with parent + sep.
+  // Guards against name-prefix attacks like /repo-evil vs /repo.
+  const c = resolvePath(child);
+  const p = resolvePath(parent);
+  if (c === p) return true;
+  return c.startsWith(p + '/');
+}
+
+function gitInCwd(cwd, args, opts = {}) {
+  return execFileSync('git', ['-C', cwd, ...args], {
+    encoding: 'utf-8',
+    timeout: opts.timeout || 8000,
+    maxBuffer: opts.maxBuffer || 4 * 1024 * 1024,
+    input: opts.input,
+    stdio: opts.input != null ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+function detectBaseRef(cwd) {
+  // Prefer the remote's default (origin/HEAD) so worktrees branch off the
+  // "canonical" base regardless of whatever the user has checked out. Fall
+  // back to HEAD when there's no origin (e.g. /tmp/demo with bare remote
+  // but no remote HEAD symref set).
+  try {
+    const out = execFileSync('git', ['-C', cwd, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], {
+      encoding: 'utf-8', timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (out) return out;
+  } catch { /* no origin/HEAD — fall through */ }
+  try {
+    const out = execFileSync('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+      encoding: 'utf-8', timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (out && out !== 'HEAD') return out;
+  } catch { /* not a git repo */ }
+  return 'HEAD';
+}
+
+function createWorktree(originalCwd, { branchName } = {}) {
+  if (!originalCwd || typeof originalCwd !== 'string') throw new Error('cwd required');
+  if (!existsSync(originalCwd) || !statSync(originalCwd).isDirectory()) {
+    throw new Error('cwd is not a directory');
+  }
+  try {
+    const out = execFileSync('git', ['-C', originalCwd, 'rev-parse', '--is-inside-work-tree'], {
+      encoding: 'utf-8', timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (out !== 'true') throw new Error('not a git work tree');
+  } catch {
+    throw new Error('cwd is not a git repository');
+  }
+
+  const baseName = (basename(originalCwd) || 'wt').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'wt';
+  const rnd = randomBytes(4).toString('hex');
+  const dirName = (baseName + '-' + rnd).slice(0, 40);
+  if (!WORKTREE_NAME_RE.test(dirName)) throw new Error('generated worktree name invalid');
+
+  const branch = branchName ? String(branchName) : ('ccv/' + dirName);
+  if (!BRANCH_NAME_RE.test(branch)) throw new Error('branch name contains invalid characters');
+
+  const worktreeRoot = join(originalCwd, '.claude', 'worktrees');
+  const worktreePath = join(worktreeRoot, dirName);
+  // Defense in depth: even though path is built from validated parts,
+  // re-resolve and verify it falls inside originalCwd.
+  if (!isInsideDir(worktreePath, originalCwd)) {
+    throw new Error('worktree path escapes cwd');
+  }
+  if (existsSync(worktreePath)) throw new Error('worktree path already exists');
+
+  mkdirSync(worktreeRoot, { recursive: true });
+
+  const baseRef = detectBaseRef(originalCwd);
+  try {
+    execFileSync('git', ['-C', originalCwd, 'worktree', 'add', '-b', branch, worktreePath, baseRef], {
+      encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    const stderr = (err.stderr || '').toString().trim();
+    throw new Error('git worktree add failed: ' + (stderr || err.message));
+  }
+  return { path: worktreePath, branch, baseRef, originalCwd };
+}
+
+function removeWorktree(originalCwd, worktreePath, { force = false } = {}) {
+  if (!isInsideDir(worktreePath, originalCwd)) {
+    throw new Error('worktree path not inside originalCwd');
+  }
+  const args = ['-C', originalCwd, 'worktree', 'remove'];
+  if (force) args.push('--force');
+  args.push(worktreePath);
+  try {
+    execFileSync('git', args, { encoding: 'utf-8', timeout: 8000, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (err) {
+    const stderr = (err.stderr || '').toString().trim();
+    throw new Error('git worktree remove failed: ' + (stderr || err.message));
+  }
+}
+
+function worktreeForPid(pid) {
+  return _pidWorktrees.get(pid) || null;
+}
+
+async function doSpawn(targetCwd, { force = false, ccuseProfile = '', useWorktree = false, branchName = '' } = {}) {
   if (!targetCwd || typeof targetCwd !== 'string') throw new Error('cwd required');
+  // useWorktree: create a dedicated git worktree under
+  // <targetCwd>/.claude/worktrees/<auto-name>/ on a new branch, then spawn the
+  // child rooted in the worktree path so its writes don't collide with other
+  // ccvs running on the same repo. The original cwd stays clean.
+  let wtInfo = null;
+  if (useWorktree) {
+    wtInfo = createWorktree(targetCwd, { branchName });
+    targetCwd = wtInfo.path;
+  }
   if (!existsSync(targetCwd) || !statSync(targetCwd).isDirectory()) {
     throw new Error('cwd is not an existing directory');
   }
@@ -1050,9 +1172,14 @@ async function doSpawn(targetCwd, { force = false, ccuseProfile = '' } = {}) {
     // by the *real* ccv process pid (set inside runtime-broadcast.mjs at
     // serverStarted), so it returns the right entry — we just need to remember
     // we may not be able to SIGTERM child.pid directly later.
+    if (wtInfo && entry && entry.pid) {
+      _pidWorktrees.set(entry.pid, wtInfo);
+    }
     return entry;
   } catch (err) {
     try { process.kill(child.pid, 'SIGTERM'); } catch { /* ignore */ }
+    // Spawn failed after worktree creation: leave the worktree on disk so the
+    // user can inspect what went wrong. Cleanup endpoint can reap it later.
     throw err;
   }
 }
@@ -3207,6 +3334,19 @@ const HTML_PAGE = `<!doctype html>
   .compact-alert[hidden] { display:none; }
   .compact-alert .ca-icon { flex-shrink:0; color:var(--bad); font-weight:600; }
   .compact-alert .ca-cmd { font-family:ui-monospace,monospace; font-weight:600; color:#ffaba3; padding:1px 6px; background:rgba(248,81,73,.18); border-radius:3px; }
+  /* Compact Threshold form */
+  .th-form { display:flex; flex-direction:column; gap:8px; padding:4px 2px; font-size:11px; }
+  .th-form .th-row { display:flex; align-items:center; gap:8px; }
+  .th-form .th-row.col { flex-direction:column; align-items:flex-start; gap:3px; }
+  .th-form input[type=number] { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:5px; padding:4px 7px; font-family:ui-monospace,monospace; font-size:11px; width:110px; }
+  .th-form input[type=number]:focus { outline:0; border-color:var(--accent); }
+  .th-form input[type=checkbox] { accent-color:var(--accent); }
+  .th-form label { color:var(--fg); font-size:11px; cursor:pointer; }
+  .th-form .th-help { color:var(--mute); font-size:10px; margin-left:6px; }
+  .th-form .th-meta { padding:6px 8px; background:var(--bg); border:1px solid var(--line); border-radius:5px; font-size:10px; color:var(--mute); display:flex; flex-direction:column; gap:3px; font-family:ui-monospace,monospace; }
+  .th-form .th-meta .th-warn { color:#f0a4a0; }
+  .th-form .th-err { color:var(--bad); font-size:10px; flex:1; }
+  .th-form .th-err[hidden] { display:none; }
 
   /* dialog */
   dialog { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:10px; padding:20px; max-width:500px; width:92%; }
@@ -3473,6 +3613,7 @@ const HTML_PAGE = `<!doctype html>
               +     '<button class="tab-btn"        data-tab-btn="summary" data-pid="' + it.pid + '">Summary</button>'
               +     '<button class="tab-btn"        data-tab-btn="edits"   data-pid="' + it.pid + '">Edits</button>'
               +     '<button class="tab-btn"        data-tab-btn="errors"  data-pid="' + it.pid + '">Errors</button>'
+              +     '<button class="tab-btn"        data-tab-btn="threshold" data-pid="' + it.pid + '" data-cwd="' + escape(it.cwd || '') + '">Threshold</button>'
               +   '</div>'
               +   '<div class="tab-panel" data-tab-panel="urls" data-pid="' + it.pid + '">'
               +     (lan ? '<div class="url-row">LAN: <a href="#" data-act="copy" data-text="'+lan+'">'+lan+'</a></div>' : '')
@@ -3483,6 +3624,7 @@ const HTML_PAGE = `<!doctype html>
               +   '<div class="tab-panel" data-tab-panel="summary" data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>'
               +   '<div class="tab-panel" data-tab-panel="edits"   data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>'
               +   '<div class="tab-panel" data-tab-panel="errors"  data-pid="' + it.pid + '" hidden><div class="tab-empty">click to load…</div></div>'
+              +   '<div class="tab-panel" data-tab-panel="threshold" data-pid="' + it.pid + '" data-cwd="' + escape(it.cwd || '') + '" hidden><div class="tab-empty">click to load…</div></div>'
               + '</div>'
               + '</details>')
       +   '<div class="instance-actions">' + actions + '</div>'
@@ -4229,6 +4371,7 @@ const HTML_PAGE = `<!doctype html>
       // T11: compactStatus card-level banner. Surface only when the threshold
       // has tripped but backend couldn't auto-inject /compact (ccv has no
       // inject channel), so the user knows to run /compact manually.
+      if (act.compactStatus) _compactStatusByPid.set(act.pid, act.compactStatus);
       const compactEl = document.querySelector('[data-compact-for="' + act.pid + '"]');
       if (compactEl) renderCompactAlert(compactEl, act.compactStatus);
       const drawer = document.querySelector('[data-act-drawer="' + act.pid + '"]');
@@ -4297,6 +4440,7 @@ const HTML_PAGE = `<!doctype html>
   // Per-pid tab state survives render() re-runs so the active tab + cached
   // payloads aren't lost when refreshActivity triggers a Kanban repaint.
   const _tabState = new Map();
+  const _compactStatusByPid = new Map();
   function getTabState(pid) {
     if (!_tabState.has(pid)) _tabState.set(pid, { activeTab: 'urls', cache: {}, fetching: {} });
     return _tabState.get(pid);
@@ -4307,11 +4451,14 @@ const HTML_PAGE = `<!doctype html>
     try { return new Date(ts).toLocaleTimeString([], { hour12: false }); } catch { return ''; }
   }
 
-  const TAB_LABEL = { urls: 'URLs · QR', summary: 'Summary', edits: 'Edits', errors: 'Errors' };
+  const TAB_LABEL = { urls: 'URLs · QR', summary: 'Summary', edits: 'Edits', errors: 'Errors', threshold: 'Threshold' };
   const TAB_ENDPOINT = {
     summary: pid => '/api/launcher/instances/' + pid + '/run-summary',
     edits:   pid => '/api/launcher/instances/' + pid + '/recent-edits',
     errors:  pid => '/api/launcher/instances/' + pid + '/errors',
+    // 'threshold' has no fetch endpoint — it's a per-cwd form driven by
+    // compactStatus from the activity payload and by POSTing to
+    // /api/launcher/prefs/compact-threshold on Save.
   };
 
   function setActiveTab(pid, tab) {
@@ -4321,7 +4468,13 @@ const HTML_PAGE = `<!doctype html>
     if (!container) return;
     container.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tabBtn === tab));
     container.querySelectorAll('.tab-panel').forEach(p => p.hidden = p.dataset.tabPanel !== tab);
-    // Lazy-load on first activation of a non-URLs tab; subsequent
+    // Threshold tab is a form rendered from cached activity data; render on
+    // each activation but don't auto-refresh (avoid overwriting user input).
+    if (tab === 'threshold') {
+      renderThresholdPanel(pid);
+      return;
+    }
+    // Lazy-load other non-URLs tabs on first activation; subsequent
     // activations show cached content immediately.
     if (tab !== 'urls') {
       const panel = container.querySelector('[data-tab-panel="' + tab + '"]');
@@ -4473,6 +4626,106 @@ const HTML_PAGE = `<!doctype html>
     el.innerHTML = '';
   }
 
+  // ---- T11 follow-up: Compact Threshold form (per-cwd config) ----
+  // Reads compactStatus from _compactStatusByPid (populated by refreshActivity)
+  // and POSTs to /api/launcher/prefs/compact-threshold on Save. Doesn't poll —
+  // user input would get clobbered. Form re-renders on each tab activation +
+  // after a successful save.
+  const DEFAULT_AUTO_COMPACT = 110000;
+  const DEFAULT_AUTO_CLEAR = 140000;
+  function renderThresholdPanel(pid) {
+    const panel = document.querySelector('[data-tab-panel="threshold"][data-pid="' + pid + '"]');
+    if (!panel) return;
+    const cwd = panel.dataset.cwd || '';
+    const cs = _compactStatusByPid.get(Number(pid)) || _compactStatusByPid.get(pid) || {};
+    panel.innerHTML = renderThresholdHTML(pid, cwd, cs);
+  }
+  function renderThresholdHTML(pid, cwd, cs) {
+    const enabled = !!cs.enabled;
+    const ac = cs.auto_compact_at || DEFAULT_AUTO_COMPACT;
+    const cle = cs.auto_clear_at || DEFAULT_AUTO_CLEAR;
+    const ago = cs.lastTriggeredAt ? fmtAge(cs.lastTriggeredAt) + ' ago' : 'never';
+    const cooldownRemainSec = cs.cooldownUntil && cs.cooldownUntil > Date.now()
+      ? Math.ceil((cs.cooldownUntil - Date.now()) / 1000) : 0;
+    const noInject = cs.lastResult === 'skipped' && cs.reason === 'no_inject_channel';
+    const meta = ''
+      + '<div class="th-meta">'
+      +   '<div>last trigger: ' + escape(ago) + (cs.lastResult ? ' · result: ' + escape(cs.lastResult) : '') + '</div>'
+      +   (cooldownRemainSec > 0 ? '<div>cooling down: ' + cooldownRemainSec + 's</div>' : '')
+      +   (noInject ? '<div class="th-warn">⚠ ccv 暂无 inject 通道；context 超阈值时仍需手动 /compact</div>' : '')
+      + '</div>';
+    return ''
+      + '<div class="th-form" data-pid="' + pid + '" data-cwd="' + escape(cwd) + '">'
+      +   '<label class="th-row">'
+      +     '<input type="checkbox" data-th-field="enabled"' + (enabled ? ' checked' : '') + '>'
+      +     '<span>enable auto-threshold monitoring</span>'
+      +   '</label>'
+      +   '<label class="th-row col">'
+      +     '<span>auto_compact_at <span class="th-help">(tokens — trigger /compact when context exceeds)</span></span>'
+      +     '<input type="number" data-th-field="auto_compact_at" min="1" step="1000" value="' + ac + '">'
+      +   '</label>'
+      +   '<label class="th-row col">'
+      +     '<span>auto_clear_at <span class="th-help">(tokens — trigger /clear when context exceeds; must be > auto_compact_at)</span></span>'
+      +     '<input type="number" data-th-field="auto_clear_at" min="1" step="1000" value="' + cle + '">'
+      +   '</label>'
+      +   meta
+      +   '<div class="th-row" style="justify-content:flex-end">'
+      +     '<span class="th-err" data-th-err hidden></span>'
+      +     '<button class="btn primary" data-th-save data-pid="' + pid + '">Save</button>'
+      +   '</div>'
+      + '</div>';
+  }
+  async function handleSaveThreshold(pid) {
+    const form = document.querySelector('.th-form[data-pid="' + pid + '"]');
+    if (!form) return;
+    const cwd = form.dataset.cwd || '';
+    const enabledEl = form.querySelector('[data-th-field="enabled"]');
+    const acEl  = form.querySelector('[data-th-field="auto_compact_at"]');
+    const cleEl = form.querySelector('[data-th-field="auto_clear_at"]');
+    const errEl = form.querySelector('[data-th-err]');
+    const showErr = (msg) => { if (errEl) { errEl.hidden = false; errEl.textContent = msg; } };
+    const hideErr = () => { if (errEl) { errEl.hidden = true; errEl.textContent = ''; } };
+    // Frontend completeness check — backend was observed silently accepting
+    // partial bodies in an earlier tester run; this guards against that and
+    // gives the user immediate feedback either way.
+    if (!cwd) { showErr('cwd missing on form'); return; }
+    const enabled = !!(enabledEl && enabledEl.checked);
+    const ac = acEl ? parseInt(acEl.value, 10) : NaN;
+    const cle = cleEl ? parseInt(cleEl.value, 10) : NaN;
+    if (!Number.isFinite(ac) || ac <= 0) { showErr('auto_compact_at must be a positive integer'); return; }
+    if (!Number.isFinite(cle) || cle <= 0) { showErr('auto_clear_at must be a positive integer'); return; }
+    if (cle <= ac) { showErr('auto_clear_at must be greater than auto_compact_at'); return; }
+    hideErr();
+    const saveBtn = form.querySelector('[data-th-save]');
+    const prevLabel = saveBtn ? saveBtn.textContent : 'Save';
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving…'; }
+    try {
+      const data = await api('/api/launcher/prefs/compact-threshold', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cwd, enabled, auto_compact_at: ac, auto_clear_at: cle }),
+      });
+      // Merge the response into the cached status so the form (and any later
+      // tab re-render) reflects the saved values immediately, without waiting
+      // for the next activity tick to push them.
+      const prev = _compactStatusByPid.get(Number(pid)) || {};
+      const merged = Object.assign({}, prev, data && data.threshold ? data.threshold : { enabled, auto_compact_at: ac, auto_clear_at: cle });
+      _compactStatusByPid.set(Number(pid), merged);
+      renderThresholdPanel(pid);
+      // The re-render swaps out the save button; re-query and show a brief
+      // success cue on the new instance.
+      const newBtn = document.querySelector('.th-form[data-pid="' + pid + '"] [data-th-save]');
+      if (newBtn) {
+        newBtn.disabled = true;
+        newBtn.textContent = 'Saved ✓';
+        setTimeout(() => { newBtn.disabled = false; newBtn.textContent = 'Save'; }, 1400);
+      }
+    } catch (e) {
+      showErr('save failed: ' + e.message);
+      if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = prevLabel; }
+    }
+  }
+
   // Re-apply persisted tab state after a full re-render (called from render()
   // after innerHTML write + details-open restoration).
   function rehydrateTabs() {
@@ -4490,17 +4743,27 @@ const HTML_PAGE = `<!doctype html>
         if (panel) renderTabPanel(pid, t, panel, st.cache[t]);
         updateTabBadges(pid, t, st.cache[t]);
       }
+      // Threshold panel: no cache, but if it's the active tab we need to
+      // re-render the form (the new DOM defaults to the empty placeholder).
+      if (st.activeTab === 'threshold') renderThresholdPanel(pid);
     });
   }
 
-  // Tab click + err-group expand delegation (separate from the action-data
-  // delegate so it doesn't slow that path with extra closest() walks).
+  // Tab click + err-group expand + Threshold Save delegation (separate from
+  // the action-data delegate so it doesn't slow that path with extra
+  // closest() walks).
   listEl.addEventListener('click', (ev) => {
     const tabBtn = ev.target.closest('[data-tab-btn]');
     if (tabBtn) {
       ev.preventDefault();
       const pid = Number(tabBtn.dataset.pid);
       setActiveTab(pid, tabBtn.dataset.tabBtn);
+      return;
+    }
+    const saveBtn = ev.target.closest('[data-th-save]');
+    if (saveBtn) {
+      ev.preventDefault();
+      handleSaveThreshold(saveBtn.dataset.pid);
       return;
     }
     const errHd = ev.target.closest('.err-group .eg-hd');
@@ -5198,11 +5461,15 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
         }));
     } catch (e) { log('getWorkspaces error:', e.message); }
     // Enrich each instance with launcher-side prefs (alias + ccuse profile) so
-    // the frontend can render them without an extra round-trip.
+    // the frontend can render them without an extra round-trip. Also surface
+    // the worktree info (path / branch / baseRef / originalCwd) when this pid
+    // was spawned via useWorktree=true so the UI can show the Git tab + branch
+    // chip without an extra round-trip.
     const enrichedRunning = running.map(i => ({
       ...i,
       alias: getAlias(i.cwd),
       ccuseProfile: getCcuseProfile(i.cwd),
+      worktree: worktreeForPid(i.pid),
     }));
     const enrichedIdle = idle.map(i => ({
       ...i,
@@ -5322,14 +5589,19 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
   if (url === '/api/launcher/spawn' && method === 'POST') {
     try {
       const raw = await readBody(req);
-      const { cwd, force, ccuseProfile } = JSON.parse(raw || '{}');
+      const { cwd, force, ccuseProfile, useWorktree, branchName } = JSON.parse(raw || '{}');
       // If client passes a profile, persist it as this cwd's preferred profile
       // so future spawns default to it without explicit selection.
       if (typeof ccuseProfile === 'string' && cwd) {
         setCcuseProfile(cwd, ccuseProfile);
       }
-      const entry = await serializeSpawn(() => doSpawn(cwd, { force: !!force, ccuseProfile: ccuseProfile || '' }));
-      sendJson(res, 200, { ok: true, instance: entry });
+      const entry = await serializeSpawn(() => doSpawn(cwd, {
+        force: !!force,
+        ccuseProfile: ccuseProfile || '',
+        useWorktree: !!useWorktree,
+        branchName: typeof branchName === 'string' ? branchName : '',
+      }));
+      sendJson(res, 200, { ok: true, instance: entry, worktree: entry && entry.pid ? worktreeForPid(entry.pid) : null });
     } catch (err) {
       log('spawn error:', err.message);
       sendJson(res, 400, { error: err.message });
