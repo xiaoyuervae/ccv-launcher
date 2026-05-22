@@ -2505,8 +2505,13 @@ const HTML_PAGE = `<!doctype html>
   .stat .stat-val { color:var(--fg); font-weight:600; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   .stat.is-stale .stat-val::after { content:' ↻'; color:var(--accent); font-size:9px; opacity:.7; }
   .stat.is-loading { opacity:.55; }
-  .stat-cost { cursor:pointer; position:relative; }
+  .stat-cost { position:relative; }
   .stat-cost:hover { border-color:var(--accent); }
+  .cost-multi { display:flex; align-items:baseline; gap:10px; }
+  .cost-slot { display:flex; align-items:baseline; gap:4px; cursor:default; transition:opacity .15s; }
+  .cost-slot:hover { opacity:.78; }
+  .cost-slot .cost-label { color:var(--mute); font-size:10px; text-transform:lowercase; }
+  .cost-slot .cost-val   { color:var(--fg); font-weight:600; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   .stat-cost .cost-popover { display:none; position:absolute; top:calc(100% + 6px); right:0; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; box-shadow:0 4px 16px rgba(0,0,0,.4); z-index:11; min-width:220px; }
   .stat-cost:hover .cost-popover { display:block; }
   .cost-popover .cp-hd { color:var(--mute); font-size:10px; text-transform:uppercase; letter-spacing:.5px; padding-bottom:4px; border-bottom:1px solid var(--line); margin-bottom:5px; }
@@ -2519,9 +2524,12 @@ const HTML_PAGE = `<!doctype html>
   .stat-quota .quota-fill { height:100%; background:var(--ok); transition:width .3s, background .3s; }
   .stat-quota .quota-fill.warn { background:var(--warn); }
   .stat-quota .quota-fill.bad  { background:var(--bad); }
-  .stat-quota .src-tag { font-size:9px; padding:1px 5px; border-radius:3px; font-weight:600; letter-spacing:.2px; }
+  .stat-quota .src-tag { font-size:11px; padding:1px 5px; border-radius:3px; font-weight:600; letter-spacing:.2px; }
   .stat-quota .src-tag.computed { color:var(--warn); background:rgba(210,153,34,.14); }
   .stat-quota.unavailable { opacity:.55; }
+  /* per-instance session cost mini-tag (T6 spec follow-up) */
+  .instance-head .tag.cost { color:var(--mute); background:rgba(125,133,144,.12); font-weight:500; }
+  .instance-head .tag.cost[hidden] { display:none; }
 
   /* per-card context bar (T6: H2) */
   .context-row { display:flex; align-items:center; gap:8px; margin:0 0 8px; font-size:10px; color:var(--mute); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
@@ -2581,13 +2589,15 @@ const HTML_PAGE = `<!doctype html>
   #help-dlg .kb-table td { padding:5px 0; vertical-align:top; }
   #help-dlg .kb-table td:first-child { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--accent); white-space:nowrap; padding-right:14px; min-width:90px; }
   #help-dlg .kb-row-hd td { color:var(--mute); font-size:10px; text-transform:uppercase; padding:10px 0 2px; border-bottom:1px solid var(--line); }
-  @media (max-width:680px) {
+  @media (max-width:640px) {
     #tag-filter { min-width:0; flex:1 1 auto; max-width:140px; font-size:10px; padding:4px 7px; }
     #btn-help { padding:4px 8px; }
   }
 
-  /* mobile narrow: shrink stats, hide labels, recenter popover */
-  @media (max-width:680px) {
+  /* mobile narrow: shrink stats, hide labels, recenter popover.
+     Cost block collapses to one slot + tap-cycle controlled by
+     body[data-active-range="..."]; default is 'today'. */
+  @media (max-width:640px) {
     .topbar-stats { gap:6px; font-size:10px; }
     .stat { padding:3px 7px; gap:4px; }
     .stat .stat-label { display:none; }
@@ -2595,6 +2605,13 @@ const HTML_PAGE = `<!doctype html>
     .stat-quota .quota-bar { width:36px; }
     .context-row .ctx-bar { width:80px; }
     .context-row .ctx-model { max-width:90px; }
+    /* show only the active cost slot; tap to cycle */
+    .cost-multi { cursor:pointer; gap:0; }
+    .cost-slot { display:none; }
+    body[data-active-range="today"] .cost-slot[data-range="today"],
+    body[data-active-range="week"]  .cost-slot[data-range="week"],
+    body[data-active-range="month"] .cost-slot[data-range="month"],
+    body:not([data-active-range]) .cost-slot[data-range="today"] { display:flex; }
   }
 
   /* sections */
@@ -2787,10 +2804,13 @@ const HTML_PAGE = `<!doctype html>
   <h1>ccv launcher</h1>
   <span class="meta" id="meta">loading…</span>
   <div class="topbar-stats" id="topbar-stats">
-    <div class="stat stat-cost is-loading" id="stat-cost" title="点击切换范围 today/week/month">
+    <div class="stat stat-cost is-loading" id="stat-cost" title="cost summary (hover a number for breakdown; tap to cycle on narrow screens)">
       <span class="stat-icon">$</span>
-      <span class="stat-label" id="stat-cost-range">today</span>
-      <span class="stat-val" id="stat-cost-val">—</span>
+      <div class="cost-multi" id="cost-multi">
+        <span class="cost-slot" data-range="today"><span class="cost-label">today</span><span class="cost-val">—</span></span>
+        <span class="cost-slot" data-range="week"><span class="cost-label">week</span><span class="cost-val">—</span></span>
+        <span class="cost-slot" data-range="month"><span class="cost-label">month</span><span class="cost-val">—</span></span>
+      </div>
       <div class="cost-popover" id="stat-cost-popover">
         <div class="cp-hd">By model · <span id="cp-range">today</span></div>
         <div id="cp-list"><div class="cp-empty">loading…</div></div>
@@ -2938,6 +2958,7 @@ const HTML_PAGE = `<!doctype html>
       +     '<span class="tag">up '+fmtAge(it.startedAt)+'</span>'
       +     (it.version ? '<span class="tag">'+escape(it.version)+'</span>' : '')
       +     (it.external ? '<span class="ext-tag" title="外部发现 — 此 ccv 在 launcher 插件加载前就已经启动，没自动注册到 runtime/，由 launcher 通过 lsof + /api/version-info 反向发现并接管">外部</span>' : '')
+      +     (it.isHub ? '' : '<span class="tag cost" data-cost-for="' + it.pid + '" hidden></span>')
       +   '</div>'
       +   '<div class="card-title" data-title-for="' + it.pid + '"></div>'
       +   '<div class="activity-row" data-act-row="' + it.pid + '">'
@@ -3676,6 +3697,21 @@ const HTML_PAGE = `<!doctype html>
       }
       const ctxRow = document.querySelector('[data-ctx-for="' + act.pid + '"]');
       if (ctxRow) renderContextRow(ctxRow, act.contextUsage);
+      // T6 follow-up: per-instance session cost mini-tag in instance-head
+      const costTag = document.querySelector('[data-cost-for="' + act.pid + '"]');
+      if (costTag) {
+        const costUSD = act.sessionUsage && act.sessionUsage.costUSD;
+        if (costUSD != null && costUSD > 0) {
+          costTag.hidden = false;
+          costTag.textContent = fmtUSD(Number(costUSD));
+          const req = act.sessionUsage.requestCount;
+          costTag.title = 'session cost' + (req ? ' · ' + req + ' req' : '');
+        } else {
+          costTag.hidden = true;
+          costTag.textContent = '';
+          costTag.removeAttribute('title');
+        }
+      }
       const drawer = document.querySelector('[data-act-drawer="' + act.pid + '"]');
       if (drawer) {
         drawer.dataset.payload = JSON.stringify(act);
@@ -3866,7 +3902,8 @@ const HTML_PAGE = `<!doctype html>
 
   // ---- T6: top bar stats (H1 cost + H3 5h quota) ----
   const COST_RANGES = ['today', 'week', 'month'];
-  let _costRangeIdx = 0;
+  const _byRange = { today: null, week: null, month: null };
+  let _activeRange = 'today';
   function fmtUSD(n) {
     if (n == null || isNaN(n)) return '—';
     if (n === 0) return '$0';
@@ -3888,33 +3925,62 @@ const HTML_PAGE = `<!doctype html>
     return String(n);
   }
 
-  async function refreshUsage() {
-    const range = COST_RANGES[_costRangeIdx];
-    const costEl = document.getElementById('stat-cost');
-    if (!costEl) return;
-    document.getElementById('stat-cost-range').textContent = range;
-    document.getElementById('cp-range').textContent = range;
-    try {
-      const data = await api('/api/launcher/usage/summary?range=' + range);
-      costEl.classList.remove('is-loading');
-      costEl.classList.toggle('is-stale', !!data.stale);
-      const total = Number(data.totalUSD || 0);
-      document.getElementById('stat-cost-val').textContent = fmtUSD(total);
-      const list = document.getElementById('cp-list');
-      const breakdown = data.byModelUSD || {};
-      const entries = Object.entries(breakdown).sort((a, b) => b[1] - a[1]);
-      if (!entries.length) {
-        list.innerHTML = '<div class="cp-empty">No usage in this range yet.</div>';
+  function paintCostBlock() {
+    const stat = document.getElementById('stat-cost');
+    if (!stat) return;
+    let anyData = false;
+    let anyStale = false;
+    for (const r of COST_RANGES) {
+      const slot = stat.querySelector('.cost-slot[data-range="' + r + '"] .cost-val');
+      if (!slot) continue;
+      const data = _byRange[r];
+      if (data) {
+        anyData = true;
+        slot.textContent = fmtUSD(Number(data.totalUSD || 0));
+        if (data.stale) anyStale = true;
       } else {
-        const rows = entries.map(([m, v]) =>
-          '<div class="cp-row"><span class="cp-model" title="' + escape(m) + '">' + escape(m) + '</span><span class="cp-val">' + fmtUSD(v) + '</span></div>'
-        ).join('');
-        const totalRow = '<div class="cp-row cp-total"><span class="cp-model">Total · ' + (data.requestCount || 0) + ' req</span><span class="cp-val">' + fmtUSD(total) + '</span></div>';
-        list.innerHTML = rows + totalRow;
+        slot.textContent = '—';
       }
-    } catch {
-      costEl.classList.add('is-loading');
     }
+    stat.classList.toggle('is-loading', !anyData);
+    stat.classList.toggle('is-stale', anyStale);
+  }
+
+  function showBreakdown(range) {
+    const data = _byRange[range];
+    const list = document.getElementById('cp-list');
+    document.getElementById('cp-range').textContent = range;
+    if (!list) return;
+    if (!data) {
+      list.innerHTML = '<div class="cp-empty">loading…</div>';
+      return;
+    }
+    const breakdown = data.byModelUSD || {};
+    const entries = Object.entries(breakdown).sort((a, b) => b[1] - a[1]);
+    if (!entries.length) {
+      list.innerHTML = '<div class="cp-empty">No usage in this range yet.</div>';
+      return;
+    }
+    const rows = entries.map(([m, v]) =>
+      '<div class="cp-row"><span class="cp-model" title="' + escape(m) + '">' + escape(m) + '</span><span class="cp-val">' + fmtUSD(v) + '</span></div>'
+    ).join('');
+    const total = Number(data.totalUSD || 0);
+    const totalRow = '<div class="cp-row cp-total"><span class="cp-model">Total · ' + (data.requestCount || 0) + ' req</span><span class="cp-val">' + fmtUSD(total) + '</span></div>';
+    list.innerHTML = rows + totalRow;
+  }
+
+  // Fetch all three ranges in parallel; backend caches each for 60s so polling
+  // every 10s is cheap. Failures on individual ranges leave that slot showing
+  // its previous value (or "—" on first miss).
+  async function refreshUsage() {
+    const results = await Promise.allSettled(
+      COST_RANGES.map(r => api('/api/launcher/usage/summary?range=' + r))
+    );
+    COST_RANGES.forEach((r, i) => {
+      if (results[i].status === 'fulfilled') _byRange[r] = results[i].value;
+    });
+    paintCostBlock();
+    showBreakdown(_activeRange);
   }
 
   async function refreshQuota() {
@@ -3931,17 +3997,18 @@ const HTML_PAGE = `<!doctype html>
 
       if (q.source === 'unavailable') {
         el.classList.add('unavailable');
-        valEl.textContent = '—';
+        valEl.textContent = '数据暂不可用';
         fillEl.style.width = '0%';
         fillEl.className = 'quota-fill';
         srcTag.hidden = true;
-        el.title = '5h quota unavailable: ' + (q.reason || 'install ccline or wait for usage data');
+        el.title = '5h quota 数据暂不可用\\n' + (q.reason || 'install ccline or wait for usage data');
         return;
       }
 
+      // Color thresholds (T6 spec): <50 green, 50-79 yellow, ≥80 red.
       const pct = Math.max(0, Math.min(100, Number(q.percent || 0)));
       fillEl.style.width = pct.toFixed(1) + '%';
-      fillEl.className = 'quota-fill' + (pct >= 95 ? ' bad' : pct >= 80 ? ' warn' : '');
+      fillEl.className = 'quota-fill' + (pct >= 80 ? ' bad' : pct >= 50 ? ' warn' : '');
 
       let valText;
       if (q.used != null && q.limit != null) {
@@ -3954,9 +4021,11 @@ const HTML_PAGE = `<!doctype html>
       if (q.source === 'jsonl_compute') {
         srcTag.hidden = false;
         srcTag.className = 'src-tag computed';
-        srcTag.textContent = '推算';
+        srcTag.textContent = '⚠';
+        srcTag.title = '推算（基于本地 jsonl，可能不精确）';
       } else {
         srcTag.hidden = true;
+        srcTag.removeAttribute('title');
       }
 
       const tip = ['source: ' + q.source];
@@ -3975,13 +4044,37 @@ const HTML_PAGE = `<!doctype html>
 
   function refreshTopStats() { refreshUsage(); refreshQuota(); }
 
-  // Cost block click cycles range today → week → month → today.
-  // Popover stays interactive: clicks inside it shouldn't trigger a cycle.
-  document.getElementById('stat-cost').addEventListener('click', (e) => {
-    if (e.target.closest('.cost-popover')) return;
-    _costRangeIdx = (_costRangeIdx + 1) % COST_RANGES.length;
-    refreshUsage();
-  });
+  // Hover any slot → preview that range's breakdown in the popover. On
+  // mouseleave, fall back to the active range (matters on narrow screens
+  // where only one slot is visible).
+  const costMultiEl = document.getElementById('cost-multi');
+  const statCostEl = document.getElementById('stat-cost');
+  if (costMultiEl) {
+    costMultiEl.addEventListener('mouseover', (e) => {
+      const slot = e.target.closest('.cost-slot');
+      if (!slot) return;
+      showBreakdown(slot.dataset.range);
+    });
+  }
+  if (statCostEl) {
+    statCostEl.addEventListener('mouseleave', () => showBreakdown(_activeRange));
+  }
+  // Narrow-screen tap-cycle: when only one slot is visible, tapping the
+  // multi-row advances _activeRange. body[data-active-range] drives the CSS.
+  const NARROW_MQ = window.matchMedia('(max-width: 640px)');
+  function setActiveRange(r) {
+    _activeRange = r;
+    document.body.dataset.activeRange = r;
+    showBreakdown(r);
+  }
+  setActiveRange('today');
+  if (costMultiEl) {
+    costMultiEl.addEventListener('click', () => {
+      if (!NARROW_MQ.matches) return; // wide screens: clicks are no-op
+      const idx = COST_RANGES.indexOf(_activeRange);
+      setActiveRange(COST_RANGES[(idx + 1) % COST_RANGES.length]);
+    });
+  }
 
   refreshTopStats();
   visibilityPoll(refreshTopStats, 10000);
