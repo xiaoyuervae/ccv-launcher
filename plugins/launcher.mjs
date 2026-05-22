@@ -4366,13 +4366,20 @@ const HTML_PAGE = `<!doctype html>
       const slot = stat.querySelector('.cost-slot[data-range="' + r + '"] .cost-val');
       if (!slot) continue;
       const data = _byRange[r];
-      if (data) {
-        anyData = true;
-        slot.textContent = fmtUSD(Number(data.totalUSD || 0));
-        if (data.stale) anyStale = true;
-      } else {
+      if (!data) {
         slot.textContent = '—';
+        continue;
       }
+      // pending=true → backend cold-miss; aggregation in flight. Show "…"
+      // instead of a misleading $0 — the next 10s poll picks up the real
+      // result once the background scan completes.
+      if (data.pending) {
+        slot.textContent = '…';
+        continue;
+      }
+      anyData = true;
+      slot.textContent = fmtUSD(Number(data.totalUSD || 0));
+      if (data.stale) anyStale = true;
     }
     stat.classList.toggle('is-loading', !anyData);
     stat.classList.toggle('is-stale', anyStale);
@@ -4385,6 +4392,10 @@ const HTML_PAGE = `<!doctype html>
     if (!list) return;
     if (!data) {
       list.innerHTML = '<div class="cp-empty">loading…</div>';
+      return;
+    }
+    if (data.pending) {
+      list.innerHTML = '<div class="cp-empty">scanning ' + escape(range) + ' (first load can take a few seconds)…</div>';
       return;
     }
     const breakdown = data.byModelUSD || {};
