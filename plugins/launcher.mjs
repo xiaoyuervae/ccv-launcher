@@ -2039,6 +2039,344 @@ function resolveNativeJsonl(instance) {
 
 // ---------- end usage / cost reducer ----------
 
+// ---------- 5h quota window (tiered) ----------
+// Tier 1: ccline cache (~/.claude/ccline/.api_usage_cache.json) — utilization
+//   only, refreshed every 5 min by the ccline statusline binary.
+// Tier 2: direct call to /api/oauth/usage — needs an oauth-2025-04-20-scoped
+//   access_token. ClaudeBar-style keychain integration is out of scope for
+//   v1; we attempt only when ~/.claude/.credentials.json exists with an
+//   access_token in cleartext. Otherwise we skip to tier 3.
+// Tier 3: jsonl_compute — local 5h block reducer (ccusage `blocks` algorithm,
+//   gap-detected, with auto-detected plan and P90 burn rate).
+// All tiers cached 30s in memory + 5min on disk (launcher-cache.json).
+const CCLINE_CACHE_FILE = join(homedir(), '.claude', 'ccline', '.api_usage_cache.json');
+const CLAUDE_CREDS_FILE = join(homedir(), '.claude', '.credentials.json');
+const QUOTA_5H_MEM_TTL_MS = 30_000;
+const QUOTA_5H_DISK_TTL_MS = 5 * 60_000;
+const PLAN_THRESHOLDS = [
+  { name: 'Pro', limit: 19000 },
+  { name: 'Max5', limit: 88000 },
+  { name: 'Max20', limit: 220000 },
+];
+
+let _quota5hMem = null;
+let _quota5hRefreshing = false;
+
+function readCclineCache() {
+  if (!existsSync(CCLINE_CACHE_FILE)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(CCLINE_CACHE_FILE, 'utf-8'));
+    const cachedAt = raw.cached_at ? Date.parse(raw.cached_at) : 0;
+    const ageMs = cachedAt ? Date.now() - cachedAt : Infinity;
+    return {
+      five_hour_utilization: typeof raw.five_hour_utilization === 'number' ? raw.five_hour_utilization : null,
+      seven_day_utilization: typeof raw.seven_day_utilization === 'number' ? raw.seven_day_utilization : null,
+      // Note: ccline cache's `resets_at` is the *seven-day* reset, not 5h —
+      // we surface it but tag it accordingly so UI doesn't render it as the
+      // 5h countdown. ClaudeBar itself doesn't trust this field for 5h.
+      seven_day_resets_at: raw.resets_at || null,
+      cached_at: raw.cached_at || null,
+      ageMs,
+      stale: ageMs > 5 * 60_000,
+    };
+  } catch (err) {
+    log('readCclineCache error:', err.message);
+    return null;
+  }
+}
+
+// Tier-2 token retrieval: best-effort cleartext credentials.json. macOS
+// keychain access via `security` would block on user approval and isn't
+// suitable for an unattended hub. Returns null when unavailable.
+function readClaudeOauthToken() {
+  if (!existsSync(CLAUDE_CREDS_FILE)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(CLAUDE_CREDS_FILE, 'utf-8'));
+    const t = raw && raw.claudeAiOauth && raw.claudeAiOauth.accessToken;
+    return typeof t === 'string' && t ? t : null;
+  } catch { return null; }
+}
+
+async function fetchOauthUsage() {
+  const token = readClaudeOauthToken();
+  if (!token) return null;
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 6000);
+    const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+        'User-Agent': 'ccv-launcher',
+      },
+      signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) {
+      log('fetchOauthUsage non-ok:', r.status);
+      return null;
+    }
+    return await r.json();
+  } catch (err) {
+    log('fetchOauthUsage error:', err.message);
+    return null;
+  }
+}
+
+// 5h block algorithm (ccusage-style):
+//   1. Sort assistant turns by timestamp.
+//   2. Block start = first turn floored to the hour. Block end = start + 5h.
+//   3. New block when the next turn is past the current block's end OR has
+//      a gap > 5h from the previous turn (idle break).
+//   4. Active block = block that contains "now".
+function blocksFromTurns(turns) {
+  const sorted = turns.slice().sort((a, b) => a.ts - b.ts);
+  const FIVE_H = 5 * 3600 * 1000;
+  const blocks = [];
+  let cur = null;
+  let prevTs = 0;
+  for (const t of sorted) {
+    if (!cur) {
+      const start = new Date(t.ts);
+      start.setMinutes(0, 0, 0);
+      cur = {
+        start: start.getTime(),
+        end: start.getTime() + FIVE_H,
+        firstTs: t.ts,
+        lastTs: t.ts,
+        tokens: 0,
+        turns: 0,
+        models: new Set(),
+      };
+      blocks.push(cur);
+    } else if (t.ts >= cur.end || t.ts - prevTs > FIVE_H) {
+      const start = new Date(t.ts);
+      start.setMinutes(0, 0, 0);
+      cur = {
+        start: start.getTime(),
+        end: start.getTime() + FIVE_H,
+        firstTs: t.ts,
+        lastTs: t.ts,
+        tokens: 0,
+        turns: 0,
+        models: new Set(),
+      };
+      blocks.push(cur);
+    }
+    cur.tokens += t.tokens;
+    cur.turns += 1;
+    cur.lastTs = t.ts;
+    if (t.model) cur.models.add(t.model);
+    prevTs = t.ts;
+  }
+  return blocks.map(b => ({ ...b, models: Array.from(b.models) }));
+}
+
+function detectPlan(blocks) {
+  let maxBlockTokens = 0;
+  for (const b of blocks) if (b.tokens > maxBlockTokens) maxBlockTokens = b.tokens;
+  for (const tier of PLAN_THRESHOLDS) {
+    if (maxBlockTokens <= tier.limit) return { plan_name: tier.name, limit: tier.limit, max_observed: maxBlockTokens };
+  }
+  // Above all known thresholds — bucket as Max20 (the highest plan).
+  return { plan_name: 'Max20', limit: PLAN_THRESHOLDS[PLAN_THRESHOLDS.length - 1].limit, max_observed: maxBlockTokens };
+}
+
+function p90(values) {
+  if (!values.length) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.floor(0.9 * sorted.length));
+  return sorted[idx];
+}
+
+async function gatherTurnsForBlocks(now) {
+  // 192h window — matches Maciek-roboblog's burn-rate horizon.
+  const horizon = now - 192 * 3600 * 1000;
+  const paths = listSessionJsonlPaths();
+  const turns = [];
+  for (const p of paths) {
+    let st; try { st = statSync(p); } catch { continue; }
+    if (st.mtimeMs < horizon) continue;
+    await readJsonlEntries(p, (e) => {
+      if (!e || e.type !== 'assistant') return;
+      const msg = e.message; const u = msg && msg.usage;
+      if (!u) return;
+      const ts = e.timestamp ? Date.parse(e.timestamp) : 0;
+      if (!ts || ts < horizon) return;
+      const tokens = (+u.input_tokens || 0)
+                   + (+u.output_tokens || 0)
+                   + (+u.cache_creation_input_tokens || 0)
+                   + (+u.cache_read_input_tokens || 0);
+      turns.push({ ts, tokens, model: msg.model || null });
+    });
+  }
+  return turns;
+}
+
+async function computeFiveHourBlock() {
+  const now = Date.now();
+  const turns = await gatherTurnsForBlocks(now);
+  const blocks = blocksFromTurns(turns);
+  const active = blocks.find(b => now >= b.start && now < b.end);
+  const plan = detectPlan(blocks);
+
+  // P90 burn rate (tokens/min) over completed blocks within the horizon.
+  const completed = blocks.filter(b => b.end <= now && b.turns >= 2);
+  const rates = completed.map(b => {
+    const durMin = Math.max(1, (b.lastTs - b.firstTs) / 60000);
+    return b.tokens / durMin;
+  });
+  const burnRate = p90(rates); // tokens/min
+
+  const used = active ? active.tokens : 0;
+  const remaining = Math.max(0, plan.limit - used);
+  const projection_minutes = burnRate > 0 ? Math.round(remaining / burnRate) : null;
+  const reset_at = active ? new Date(active.end).toISOString() : null;
+  const percent = plan.limit > 0 ? Math.min(100, (used / plan.limit) * 100) : 0;
+
+  return {
+    source: 'jsonl_compute',
+    used,
+    limit: plan.limit,
+    percent: Math.round(percent * 10) / 10,
+    reset_at,
+    plan_name: plan.plan_name,
+    plan_max_observed: plan.max_observed,
+    burn_rate: Math.round(burnRate * 100) / 100,
+    projection_minutes,
+    block_start: active ? new Date(active.start).toISOString() : null,
+    block_end: active ? new Date(active.end).toISOString() : null,
+    block_turns: active ? active.turns : 0,
+    block_models: active ? active.models : [],
+    computedAt: now,
+  };
+}
+
+function loadQuota5hFromDisk() {
+  try {
+    if (existsSync(USAGE_CACHE_FILE)) {
+      const raw = JSON.parse(readFileSync(USAGE_CACHE_FILE, 'utf-8'));
+      return raw && raw.quota5h ? raw.quota5h : null;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function saveQuota5hToDisk(result) {
+  try {
+    const dir = dirname(USAGE_CACHE_FILE);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    let cur = {};
+    if (existsSync(USAGE_CACHE_FILE)) {
+      try { cur = JSON.parse(readFileSync(USAGE_CACHE_FILE, 'utf-8')) || {}; } catch { cur = {}; }
+    }
+    cur.quota5h = result;
+    writeFileSync(USAGE_CACHE_FILE, JSON.stringify(cur, null, 2));
+  } catch (err) { log('saveQuota5hToDisk error:', err.message); }
+}
+
+async function buildQuota5h() {
+  // Tier 1: ccline cache (utilization only, no raw token counts).
+  const ccline = readCclineCache();
+  if (ccline && !ccline.stale && ccline.five_hour_utilization != null) {
+    return {
+      source: 'ccline_cache',
+      percent: ccline.five_hour_utilization,
+      used: null,
+      limit: null,
+      reset_at: null, // ccline only carries 7-day reset; 5h reset unknown
+      plan_name: null,
+      burn_rate: null,
+      projection_minutes: null,
+      cached_at: ccline.cached_at,
+      seven_day_utilization: ccline.seven_day_utilization,
+      seven_day_resets_at: ccline.seven_day_resets_at,
+      computedAt: Date.now(),
+    };
+  }
+
+  // Tier 2: direct OAuth API. Best-effort — skipped silently when no token
+  // is reachable on disk (most users keep it in keychain).
+  const oauth = await fetchOauthUsage();
+  if (oauth && oauth.five_hour && typeof oauth.five_hour.utilization === 'number') {
+    return {
+      source: 'api_oauth',
+      percent: oauth.five_hour.utilization,
+      used: null,
+      limit: null,
+      reset_at: oauth.five_hour.resets_at || null,
+      plan_name: null,
+      burn_rate: null,
+      projection_minutes: null,
+      seven_day_utilization: oauth.seven_day && oauth.seven_day.utilization,
+      seven_day_resets_at: oauth.seven_day && oauth.seven_day.resets_at,
+      extra_usage: oauth.extra_usage || null,
+      computedAt: Date.now(),
+    };
+  }
+
+  // Tier 3: local jsonl compute.
+  try {
+    return await computeFiveHourBlock();
+  } catch (err) {
+    log('computeFiveHourBlock error:', err.message);
+  }
+
+  // Tier 4: nothing worked.
+  return {
+    source: 'unavailable',
+    percent: null,
+    used: null,
+    limit: null,
+    reset_at: null,
+    plan_name: null,
+    burn_rate: null,
+    projection_minutes: null,
+    reason: 'no quota source reachable (ccline cache absent + no oauth token + jsonl compute failed)',
+    computedAt: Date.now(),
+  };
+}
+
+function refreshQuota5hInBackground() {
+  if (_quota5hRefreshing) return;
+  _quota5hRefreshing = true;
+  buildQuota5h()
+    .then((result) => {
+      _quota5hMem = { ...result, fromCache: false, stale: false };
+      saveQuota5hToDisk(_quota5hMem);
+    })
+    .catch((err) => log('quota5h refresh error:', err.message))
+    .finally(() => { _quota5hRefreshing = false; });
+}
+
+async function getCachedQuota5h() {
+  const now = Date.now();
+  if (_quota5hMem && now - _quota5hMem.computedAt < QUOTA_5H_MEM_TTL_MS) {
+    return { ..._quota5hMem, fromCache: true, stale: false };
+  }
+  // Memory miss — try disk for an instant response, then refresh.
+  if (!_quota5hMem) {
+    const disk = loadQuota5hFromDisk();
+    if (disk && now - disk.computedAt < QUOTA_5H_DISK_TTL_MS) {
+      _quota5hMem = disk;
+      refreshQuota5hInBackground();
+      return { ...disk, fromCache: true, stale: now - disk.computedAt > QUOTA_5H_MEM_TTL_MS };
+    }
+  } else {
+    // Memory present but past mem TTL — serve stale and refresh.
+    refreshQuota5hInBackground();
+    return { ..._quota5hMem, fromCache: true, stale: true };
+  }
+  // Cold miss: build synchronously.
+  const result = await buildQuota5h();
+  _quota5hMem = { ...result, fromCache: false, stale: false };
+  saveQuota5hToDisk(_quota5hMem);
+  return _quota5hMem;
+}
+
+// ---------- end 5h quota window ----------
+
 async function getInstanceActivity(instance) {
   const cached = _activityCache.get(instance.pid);
   const now = Date.now();
@@ -3780,6 +4118,19 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
         requestCount: u ? u.requestCount : 0,
         lastEntry: u ? u.lastEntry : null,
       });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // 5h quota window: tiered (ccline_cache → api_oauth → jsonl_compute →
+  // unavailable). 30s in-memory + 5min disk cache, stale-while-revalidate
+  // so a poll never blocks on a cold scan.
+  if (url === '/api/launcher/quota/5h' && method === 'GET') {
+    try {
+      const result = await getCachedQuota5h();
+      sendJson(res, 200, result);
     } catch (err) {
       sendJson(res, 500, { error: err.message });
     }
