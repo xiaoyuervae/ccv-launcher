@@ -1649,6 +1649,72 @@ function loadModels() {
   return _modelsCache;
 }
 
+// vendor/models.json lookup honoring [1m] modifier and family fallback. Used
+// by the context-% reducer (T4) and exposed verbatim on contextUsage payloads
+// so UI doesn't re-implement the lookup.
+function getModelInfo(modelId) {
+  const data = loadModels();
+  const models = data.models || {};
+  const fallbackLimit = (data.fallback && data.fallback.context_limit) || 200000;
+  if (!modelId || typeof modelId !== 'string') {
+    return { model_id: modelId || 'unknown', display_name: 'unknown', context_limit: fallbackLimit };
+  }
+  let baseId = modelId;
+  let appliedModifier = null;
+  for (const mod of (data.context_modifiers || [])) {
+    if (mod.pattern && modelId.includes(mod.pattern)) {
+      baseId = modelId.replace(mod.pattern, '');
+      appliedModifier = mod;
+      break;
+    }
+  }
+  let entry = models[baseId];
+  if (!entry) {
+    // Family fallback — same heuristics as priceForModel; keeps lookup
+    // resilient when a brand-new model id appears before vendor/models.json
+    // is refreshed.
+    if (baseId.includes('opus-4-7')) entry = models['claude-opus-4-7'];
+    else if (baseId.includes('opus-4-6')) entry = models['claude-opus-4-6'];
+    else if (baseId.includes('opus-4-5')) entry = models['claude-opus-4-5'];
+    else if (baseId.includes('opus-4-1')) entry = models['claude-opus-4-1'];
+    else if (baseId.includes('opus')) entry = models['claude-opus-4-7'];
+    else if (baseId.includes('sonnet-4-7')) entry = models['claude-sonnet-4-7'];
+    else if (baseId.includes('sonnet-4-6')) entry = models['claude-sonnet-4-6'];
+    else if (baseId.includes('sonnet-4-5')) entry = models['claude-sonnet-4-5'];
+    else if (baseId.includes('sonnet-4')) entry = models['claude-sonnet-4-20250514'];
+    else if (baseId.includes('haiku')) entry = models['claude-haiku-4-5'];
+  }
+  let context_limit = (entry && entry.context_limit) || fallbackLimit;
+  let display_name = (entry && entry.display_name) || baseId;
+  if (appliedModifier) {
+    if (appliedModifier.context_limit) context_limit = appliedModifier.context_limit;
+    if (appliedModifier.display_suffix) display_name += appliedModifier.display_suffix;
+  }
+  return { model_id: modelId, display_name, context_limit };
+}
+
+// Context-window utilization from a per-entry usage snapshot. "Used" = prompt
+// size (input + cache_creation + cache_read) only; output is the response, not
+// part of what consumes the context window. Mirrors ccusage's UsageStats and
+// ClaudeBar's UsageSnapshot semantics.
+function computeContextUsage(lastEntry) {
+  if (!lastEntry || !lastEntry.model) return null;
+  const used = (+lastEntry.input || 0)
+             + (+lastEntry.cache_creation || 0)
+             + (+lastEntry.cache_read || 0);
+  const info = getModelInfo(lastEntry.model);
+  const limit = info.context_limit || 200000;
+  const percent = limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
+  return {
+    used,
+    limit,
+    percent: Math.round(percent * 10) / 10,
+    model: lastEntry.model,
+    displayName: info.display_name,
+    ts: lastEntry.ts || null,
+  };
+}
+
 function priceForModel(modelId) {
   const pricing = loadPricing();
   if (modelId && pricing[modelId]) return pricing[modelId];
@@ -2018,6 +2084,7 @@ async function getInstanceActivity(instance) {
   // jsonl. Hubs don't run user sessions so we skip them. Failures are silent —
   // the launcher should still render even when usage data is unavailable.
   let sessionUsage = null;
+  let contextUsage = null;
   if (!instance.isHub) {
     try {
       const np = resolveNativeJsonl(instance);
@@ -2035,6 +2102,7 @@ async function getInstanceActivity(instance) {
             lastEntry: u.lastEntry,
             jsonlPath: np,
           };
+          contextUsage = computeContextUsage(u.lastEntry);
         }
       }
     } catch (err) { log('sessionUsage error:', err.message); }
@@ -2054,6 +2122,7 @@ async function getInstanceActivity(instance) {
     pendingAsks: pendingAsks.map(a => ({ id: a.id, questions: a.questions, createdAt: a.createdAt })),
     recentEvents: recent,
     sessionUsage,
+    contextUsage,
   };
   _activityCache.set(instance.pid, { at: now, payload });
   return payload;
