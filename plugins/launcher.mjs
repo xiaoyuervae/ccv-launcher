@@ -10,30 +10,14 @@
 // produced by runtime-broadcast.mjs. Spawns children with CCV_HUB cleared so
 // they do not become hubs themselves.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, realpathSync, statSync, unlinkSync, watch, openSync, readSync, closeSync, createReadStream, copyFileSync } from 'node:fs';
-import { dirname, join, basename, resolve as resolvePath } from 'node:path';
+import { existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { spawn, execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { pathToFileURL, fileURLToPath } from 'node:url';
-import { createInterface } from 'node:readline';
-import { PREFIX, log, jlog } from '../src/launcher/log.mjs';
-import {
-  loadPrefs, savePrefs,
-  normalizeAlias, getAlias, setAlias,
-  getCcuseProfile, setCcuseProfile, setDefaultCcuseProfile,
-  normalizeTag, getTags, setTags, addTag, removeTag, getAllTags,
-  DEFAULT_COMPACT_THRESHOLD, getCompactThreshold, setCompactThreshold,
-  getWorktreeDefault, setWorktreeDefault,
-  listCcuseProfiles,
-} from '../src/launcher/prefs.mjs';
-import {
-  pendingPairs, approvedSessions, PAIR_CODE_TTL_MS, SESSION_MAX_AGE,
-  loadSessions, saveSessions, generatePairCode, cleanExpiredPairs,
-  parseCookies, isLanIp, getClientIp, isAuthenticated, shortUA, subjectIdFor,
-} from '../src/launcher/auth.mjs';
-const require = createRequire(import.meta.url);
+import { pathToFileURL } from 'node:url';
+
+import { log, jlog } from '../src/launcher/log.mjs';
+import { loadSessions, isAuthenticated, getClientIp, subjectIdFor } from '../src/launcher/auth.mjs';
 
 // cc-viewer ships workspace-registry.js at the install root (≤1.6.266) or
 // under server/ (≥1.6.273 refactor); pty-session-manager.js used to live
@@ -79,14 +63,9 @@ async function ensurePtySessionManager() {
 
 const HUB_ENABLED = process.env.CCV_HUB === '1';
 import {
-  instances, _pidWorktrees,
   setSelfBinding,
   RUNTIME_DIR,
   rescanRuntime, backfillExternalCcvs, startWatcher,
-  worktreeForPid, removeWorktree, gitInCwd,
-  listLocalCcSessions, killClaudePid, spawnCcvInTerminal,
-  serializeSpawn, doSpawn,
-  scanClaudeMd, isAllowedMdPath,
 } from '../src/launcher/runtime.mjs';
 
 // Cap concurrent /ws/shell sessions per process. Each PTY holds a zsh + node
@@ -149,7 +128,10 @@ function installRequestMultiplexer(httpServer, ccvProtocol) {
       dispatchLauncherRoute(req, res, parsedUrl).catch((err) => {
         log('launcher dispatch error:', err && err.message);
         if (!res.headersSent) {
-          try { sendJson(res, 500, { error: 'launcher plugin error' }); } catch { /* ignore */ }
+          try {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end('{"error":"launcher plugin error"}');
+          } catch { /* socket may already be gone */ }
         }
       });
       return;
