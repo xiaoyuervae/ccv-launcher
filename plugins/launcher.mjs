@@ -18,6 +18,7 @@ import { randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
+import { PREFIX, log, jlog } from '../src/launcher/log.mjs';
 const require = createRequire(import.meta.url);
 
 // cc-viewer ships workspace-registry.js at the install root (≤1.6.266) or
@@ -62,7 +63,6 @@ async function ensurePtySessionManager() {
   }
 }
 
-const PREFIX = '[ccv-launcher]';
 const HUB_ENABLED = process.env.CCV_HUB === '1';
 const RUNTIME_DIR = join(homedir(), '.claude', 'cc-viewer', 'runtime');
 // Public URL template for child instances exposed via a reverse proxy.
@@ -423,18 +423,6 @@ function shortUA(ua) {
 const instances = new Map();
 let _selfPort = null;
 let _selfToken = null;
-
-function log(...args) { console.error(PREFIX, ...args); }
-
-// Structured JSON log: one record per line on stderr (captured by launchd's
-// stderr.log). Use for events that ops/monitoring should be able to parse,
-// e.g. ws-shell-spawn, ws-shell-cap-hit, healthz. `event` is required;
-// additional fields are merged in.
-function jlog(event, fields = {}) {
-  try {
-    console.error(JSON.stringify({ ts: new Date().toISOString(), event, ...fields }));
-  } catch { /* ignore stringify failures */ }
-}
 
 // Cap concurrent /ws/shell sessions per process. Each PTY holds a zsh + node
 // listeners; on a public hub we want a hard ceiling so a runaway client (or
