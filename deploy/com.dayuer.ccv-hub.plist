@@ -7,19 +7,19 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/node</string>
-        <string>/Users/dayuer/Projects/cc-viewer/cli.js</string>
+        <string>/Users/dayuer/.nvm/versions/node/v22.22.0/bin/node</string>
+        <string>/Users/dayuer/.nvm/versions/node/v22.22.0/lib/node_modules/cc-viewer/cli.js</string>
         <string>--d</string>
         <string>--no-open</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/dayuer/Projects/cc-viewer</string>
+    <string>/Users/dayuer/.nvm/versions/node/v22.22.0/lib/node_modules/cc-viewer</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/dayuer/.local/bin:/Users/dayuer/.nvm/versions/node/v22.22.0/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>/Users/dayuer</string>
         <key>CCV_HUB</key>
@@ -29,7 +29,7 @@
         <key>CCV_MAX_PORT</key>
         <string>7100</string>
         <key>CCV_PUBLIC_URL_TEMPLATE</key>
-        <string>https://ccv-{port}.xiaoyuervae.cn:9990/?token={token}</string>
+        <string>http://127.0.0.1:{port}/?token={token}</string>
         <key>CCV_CHILD_PORT_FLOOR</key>
         <string>7008</string>
         <key>CCV_CHILD_PORT_CEIL</key>
