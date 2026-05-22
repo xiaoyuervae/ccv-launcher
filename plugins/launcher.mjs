@@ -5114,10 +5114,31 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
     try {
       const raw = await readBody(req);
       const body = JSON.parse(raw || '{}');
-      if (!body.cwd) throw new Error('cwd required');
+      if (!body.cwd || typeof body.cwd !== 'string') {
+        throw new Error('cwd required');
+      }
+      // Strict shape: reject bodies missing any of the three schema fields
+      // so a typo like `{cwd, threshold: 75}` no longer silently coerces to
+      // disabled/zeroed and gets pruned. UI sends a full snapshot anyway.
+      const hasAc = Object.prototype.hasOwnProperty.call(body, 'auto_compact_at');
+      const hasCl = Object.prototype.hasOwnProperty.call(body, 'auto_clear_at');
+      const hasEn = Object.prototype.hasOwnProperty.call(body, 'enabled');
+      if (!hasAc || !hasCl || !hasEn) {
+        const missing = [
+          !hasAc && 'auto_compact_at',
+          !hasCl && 'auto_clear_at',
+          !hasEn && 'enabled',
+        ].filter(Boolean);
+        throw new Error('missing required field(s): ' + missing.join(', '));
+      }
+      const ac = Number(body.auto_compact_at);
+      const cl = Number(body.auto_clear_at);
+      if (!Number.isFinite(ac) || ac < 0) throw new Error('auto_compact_at must be a non-negative number');
+      if (!Number.isFinite(cl) || cl < 0) throw new Error('auto_clear_at must be a non-negative number');
+      if (typeof body.enabled !== 'boolean') throw new Error('enabled must be a boolean');
       setCompactThreshold(body.cwd, {
-        auto_compact_at: body.auto_compact_at,
-        auto_clear_at: body.auto_clear_at,
+        auto_compact_at: ac,
+        auto_clear_at: cl,
         enabled: body.enabled,
       });
       sendJson(res, 200, { ok: true, threshold: getCompactThreshold(body.cwd) });
