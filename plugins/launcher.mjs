@@ -2575,56 +2575,213 @@ function classifyEntry(e) {
   return null;
 }
 
-const _runSummaryCache = new Map(); // jsonlPath -> { mtime, size, computedAt, events, totals }
-const RUN_SUMMARY_MEM_TTL_MS = 5_000;
+const _jsonlScanCache = new Map(); // jsonlPath -> { mtime, size, computedAt, runSummary, edits, errors }
+const JSONL_SCAN_TTL_MS = 5_000;
 const RUN_SUMMARY_MAX_EVENTS = 500; // cap response size
+const ERROR_SAMPLES_PER_GROUP = 5;
 
-async function computeRunSummary(jsonlPath) {
+// Single streaming pass over a session jsonl producing three projections —
+// run summary, recent edits, error breakdown — so /run-summary, /recent-edits,
+// and /errors all share one scan. mtime+size key with 5s in-memory floor.
+async function scanJsonlAll(jsonlPath) {
   if (!jsonlPath || !existsSync(jsonlPath)) return null;
   let st; try { st = statSync(jsonlPath); } catch { return null; }
-  const cached = _runSummaryCache.get(jsonlPath);
+  const cached = _jsonlScanCache.get(jsonlPath);
   const now = Date.now();
   if (cached && cached.mtime === st.mtimeMs && cached.size === st.size
-      && now - cached.computedAt < RUN_SUMMARY_MEM_TTL_MS) {
+      && now - cached.computedAt < JSONL_SCAN_TTL_MS) {
     return cached;
   }
+
+  // Run summary state
   const events = [];
-  const totals = { prompts: 0, slash_commands: 0, tools: 0, errors: 0, compacts: 0, subagents: 0, hooks: 0 };
+  const summaryTotals = { prompts: 0, slash_commands: 0, tools: 0, errors: 0, compacts: 0, subagents: 0, hooks: 0 };
   let toolUseCount = 0;
+
+  // Recent edits state: per-target aggregation keyed by file path (Edit/Write/
+  // MultiEdit) or command-prefix (Bash). Tracks count, lastTs, lastEditTool,
+  // and a small lastDiffPreview string for the most recent occurrence.
+  const editMap = new Map(); // key -> { tool, path, count, lastTs, lastDiffPreview }
+
+  // Errors state: cluster tool_result.is_error entries by hash of
+  // (tool_name, first 80 chars of message). Resolving tool_name requires
+  // mapping tool_use_id → name, so we maintain a forward index from
+  // assistant tool_use blocks as we stream.
+  const toolUseIndex = new Map(); // tool_use_id -> tool_name
+  const errorGroups = new Map();  // groupKey -> { toolName, errorPattern, count, lastTs, samples }
+  let errorTotal = 0;
+
   await readJsonlEntriesIndexed(jsonlPath, (e, line) => {
-    // Side counter: every assistant tool_use call (not just Task). Helps the
-    // UI summary show "N tool calls" without us needing a second pass.
+    // --- side counter + tool_use index + edits ---
     if (e && e.type === 'assistant' && Array.isArray(e.message && e.message.content)) {
       for (const b of e.message.content) {
-        if (b && b.type === 'tool_use') toolUseCount++;
+        if (!b || b.type !== 'tool_use') continue;
+        toolUseCount++;
+        if (b.id) toolUseIndex.set(b.id, b.name || 'unknown');
+        recordEdit(b, e.timestamp || null);
       }
     }
+    // --- error grouping (user-side tool_result.is_error) ---
+    if (e && e.type === 'user' && Array.isArray(e.message && e.message.content)) {
+      for (const b of e.message.content) {
+        if (!b || b.type !== 'tool_result' || !b.is_error) continue;
+        recordError(b, e.timestamp || null);
+      }
+    }
+    // --- run summary classification ---
     const cls = classifyEntry(e);
     if (!cls) return;
     events.push({ ts: cls.ts, type: cls.type, label: cls.label, jsonlLine: line, ...(cls.toolUseId ? { toolUseId: cls.toolUseId } : {}) });
-    if (cls.type === 'prompt') totals.prompts++;
-    else if (cls.type === 'slash_command') totals.slash_commands++;
-    else if (cls.type === 'auto_compact') totals.compacts++;
-    else if (cls.type === 'tool_error') totals.errors++;
-    else if (cls.type === 'subagent') totals.subagents++;
-    else if (cls.type === 'hook_event') totals.hooks++;
+    if (cls.type === 'prompt') summaryTotals.prompts++;
+    else if (cls.type === 'slash_command') summaryTotals.slash_commands++;
+    else if (cls.type === 'auto_compact') summaryTotals.compacts++;
+    else if (cls.type === 'tool_error') summaryTotals.errors++;
+    else if (cls.type === 'subagent') summaryTotals.subagents++;
+    else if (cls.type === 'hook_event') summaryTotals.hooks++;
   });
-  totals.tools = toolUseCount;
-  // Trim to the most recent N events for the wire response; UI can ask for
-  // older ones via pagination if/when that becomes a need.
-  const trimmed = events.length > RUN_SUMMARY_MAX_EVENTS
+  summaryTotals.tools = toolUseCount;
+
+  function recordEdit(block, ts) {
+    const tool = block.name;
+    if (!tool) return;
+    let key, path, preview;
+    if (tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit') {
+      const p = block.input && block.input.file_path;
+      if (!p) return;
+      path = String(p);
+      key = `${tool}::${path}`;
+      if (tool === 'Edit') {
+        const oldS = block.input.old_string || '';
+        const newS = block.input.new_string || '';
+        preview = `${truncateLabel(oldS, 40)}  →  ${truncateLabel(newS, 40)}`;
+      } else if (tool === 'Write') {
+        const c = block.input.content || '';
+        preview = `(write ${typeof c === 'string' ? c.length : 0} chars) ${truncateLabel(c, 60)}`;
+      } else {
+        const edits = Array.isArray(block.input.edits) ? block.input.edits.length : 0;
+        preview = `(multi-edit, ${edits} hunks)`;
+      }
+    } else if (tool === 'Bash') {
+      const cmd = (block.input && block.input.command) || '';
+      if (!cmd) return;
+      // Group bash by command head (first word + first few args) so we don't
+      // explode the list with one-off commands. UI can group further by
+      // first token if it wants.
+      const head = truncateLabel(String(cmd), 60);
+      path = head;
+      key = `Bash::${head}`;
+      preview = truncateLabel(String(cmd), 80);
+    } else {
+      return;
+    }
+    const cur = editMap.get(key);
+    const tsMs = ts ? Date.parse(ts) : 0;
+    if (cur) {
+      cur.count++;
+      if (tsMs >= cur.lastTsMs) {
+        cur.lastTsMs = tsMs;
+        cur.lastTs = ts;
+        cur.lastDiffPreview = preview;
+      }
+    } else {
+      editMap.set(key, { tool, path, count: 1, lastTs: ts, lastTsMs: tsMs, lastDiffPreview: preview });
+    }
+  }
+
+  function recordError(block, ts) {
+    errorTotal++;
+    const toolName = (block.tool_use_id && toolUseIndex.get(block.tool_use_id)) || 'unknown';
+    const full = typeof block.content === 'string'
+      ? block.content
+      : Array.isArray(block.content)
+        ? block.content.filter(b => b && b.type === 'text').map(b => b.text).join(' ')
+        : '';
+    const pattern = truncateLabel(full || 'tool returned error', 80);
+    const groupKey = `${toolName}\n${pattern}`;
+    const cur = errorGroups.get(groupKey);
+    const sample = { ts, fullMessage: full };
+    if (cur) {
+      cur.count++;
+      if (!cur.lastTs || (ts && ts > cur.lastTs)) cur.lastTs = ts;
+      if (cur.samples.length < ERROR_SAMPLES_PER_GROUP) cur.samples.push(sample);
+    } else {
+      errorGroups.set(groupKey, {
+        toolName, errorPattern: pattern,
+        count: 1, lastTs: ts,
+        samples: [sample],
+      });
+    }
+  }
+
+  // Materialize projections
+  const summaryEvents = events.length > RUN_SUMMARY_MAX_EVENTS
     ? events.slice(-RUN_SUMMARY_MAX_EVENTS)
     : events;
+
+  // Edits: sort by lastTs desc; split files vs bash so UI can render two
+  // sections without re-grouping.
+  const editList = Array.from(editMap.values()).map(({ lastTsMs, ...rest }) => rest);
+  editList.sort((a, b) => (Date.parse(b.lastTs || 0) || 0) - (Date.parse(a.lastTs || 0) || 0));
+  const fileEdits = editList.filter(e => e.tool !== 'Bash');
+  const bashEdits = editList.filter(e => e.tool === 'Bash');
+
+  // Errors: groups sorted by count desc, then lastTs desc.
+  const errorGroupList = Array.from(errorGroups.values());
+  errorGroupList.sort((a, b) => b.count - a.count || ((Date.parse(b.lastTs || 0) || 0) - (Date.parse(a.lastTs || 0) || 0)));
+
   const result = {
     mtime: st.mtimeMs,
     size: st.size,
     computedAt: now,
-    events: trimmed,
-    totalEvents: events.length,
-    totals,
+    runSummary: {
+      events: summaryEvents,
+      totalEvents: events.length,
+      totals: summaryTotals,
+    },
+    edits: {
+      files: fileEdits,
+      bash: bashEdits,
+      totalUniqueTargets: editList.length,
+    },
+    errors: {
+      groups: errorGroupList,
+      total: errorTotal,
+    },
   };
-  _runSummaryCache.set(jsonlPath, result);
+  _jsonlScanCache.set(jsonlPath, result);
   return result;
+}
+
+async function computeRunSummary(jsonlPath) {
+  const r = await scanJsonlAll(jsonlPath);
+  if (!r) return null;
+  return {
+    mtime: r.mtime, size: r.size, computedAt: r.computedAt,
+    events: r.runSummary.events,
+    totalEvents: r.runSummary.totalEvents,
+    totals: r.runSummary.totals,
+  };
+}
+
+async function computeRecentEdits(jsonlPath) {
+  const r = await scanJsonlAll(jsonlPath);
+  if (!r) return null;
+  return {
+    mtime: r.mtime, size: r.size, computedAt: r.computedAt,
+    files: r.edits.files,
+    bash: r.edits.bash,
+    totalUniqueTargets: r.edits.totalUniqueTargets,
+  };
+}
+
+async function computeErrors(jsonlPath) {
+  const r = await scanJsonlAll(jsonlPath);
+  if (!r) return null;
+  return {
+    mtime: r.mtime, size: r.size, computedAt: r.computedAt,
+    groups: r.errors.groups,
+    total: r.errors.total,
+  };
 }
 
 // ---------- end compact threshold + run summary ----------
@@ -5043,6 +5200,62 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
         events: r ? r.events : [],
         totalEvents: r ? r.totalEvents : 0,
         totals: r ? r.totals : { prompts: 0, slash_commands: 0, tools: 0, errors: 0, compacts: 0, subagents: 0, hooks: 0 },
+        computedAt: r ? r.computedAt : Date.now(),
+      });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // Per-instance recent edits: Edit/Write/MultiEdit aggregated by file_path,
+  // Bash aggregated by command head. Shares the run-summary's single-pass
+  // scan cache (5s TTL, mtime+size keyed).
+  const recentEditsM = url.match(/^\/api\/launcher\/instances\/(\d+)\/recent-edits$/);
+  if (recentEditsM && method === 'GET') {
+    try {
+      const pid = parseInt(recentEditsM[1], 10);
+      const inst = instances.get(pid);
+      if (!inst) { sendJson(res, 404, { error: 'instance not found' }); return; }
+      const jp = resolveNativeJsonl(inst);
+      if (!jp) {
+        sendJson(res, 200, { pid, jsonlPath: null, files: [], bash: [], totalUniqueTargets: 0, computedAt: Date.now() });
+        return;
+      }
+      const r = await computeRecentEdits(jp);
+      sendJson(res, 200, {
+        pid,
+        jsonlPath: jp,
+        files: r ? r.files : [],
+        bash: r ? r.bash : [],
+        totalUniqueTargets: r ? r.totalUniqueTargets : 0,
+        computedAt: r ? r.computedAt : Date.now(),
+      });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // Per-instance error breakdown: tool_result.is_error entries clustered by
+  // (toolName, first-80-chars). Shares the single-pass scan cache.
+  const errorsM = url.match(/^\/api\/launcher\/instances\/(\d+)\/errors$/);
+  if (errorsM && method === 'GET') {
+    try {
+      const pid = parseInt(errorsM[1], 10);
+      const inst = instances.get(pid);
+      if (!inst) { sendJson(res, 404, { error: 'instance not found' }); return; }
+      const jp = resolveNativeJsonl(inst);
+      if (!jp) {
+        sendJson(res, 200, { pid, jsonlPath: null, groups: [], total: 0, computedAt: Date.now() });
+        return;
+      }
+      const r = await computeErrors(jp);
+      sendJson(res, 200, {
+        pid,
+        jsonlPath: jp,
+        groups: r ? r.groups : [],
+        total: r ? r.total : 0,
         computedAt: r ? r.computedAt : Date.now(),
       });
     } catch (err) {
