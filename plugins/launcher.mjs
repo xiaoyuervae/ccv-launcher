@@ -2553,6 +2553,39 @@ const HTML_PAGE = `<!doctype html>
     .kanban { grid-template-columns: 1fr; gap:10px; }
   }
 
+  /* tag chips + filter (T8: H5) */
+  .group-tags { display:inline-flex; align-items:center; gap:4px; flex-wrap:wrap; margin-left:4px; }
+  .tag-chip { font-size:10px; color:var(--accent); background:rgba(88,166,255,.10); padding:1px 7px; border-radius:10px; cursor:pointer; user-select:none; transition:background .15s, color .15s; }
+  .tag-chip::after { content:' ×'; opacity:.4; transition:opacity .15s; }
+  .tag-chip:hover { background:rgba(248,81,73,.15); color:var(--bad); }
+  .tag-chip:hover::after { opacity:1; }
+  .tag-add { font-size:10px; color:var(--mute); background:transparent; border:1px dashed var(--line); padding:0 6px; height:18px; line-height:16px; border-radius:10px; cursor:pointer; font-family:inherit; transition:color .15s, border-color .15s, opacity .15s; opacity:0; }
+  .group:hover .tag-add { opacity:1; }
+  .tag-add:hover { color:var(--accent); border-color:var(--accent); }
+  #tag-filter { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 9px; font-size:11px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; min-width:160px; transition:border-color .15s; }
+  #tag-filter:focus { outline:0; border-color:var(--accent); }
+  #tag-filter::placeholder { color:var(--mute); }
+  #btn-help { background:transparent; color:var(--mute); border:1px solid var(--line); padding:5px 10px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; }
+  #btn-help:hover { color:var(--accent); border-color:var(--accent); }
+  .group[data-filter-hidden] { display:none; }
+  /* j/n flash highlight */
+  @keyframes jumpFlash {
+    0%, 100% { background:transparent; }
+    20%, 60% { background:rgba(88,166,255,.18); }
+  }
+  .instance.flash { animation:jumpFlash 1.2s ease-out; }
+  /* help dialog */
+  #help-dlg { max-width:420px; }
+  #help-dlg h2 { margin:0 0 12px; font-size:14px; }
+  #help-dlg .kb-table { width:100%; border-collapse:collapse; font-size:12px; }
+  #help-dlg .kb-table td { padding:5px 0; vertical-align:top; }
+  #help-dlg .kb-table td:first-child { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--accent); white-space:nowrap; padding-right:14px; min-width:90px; }
+  #help-dlg .kb-row-hd td { color:var(--mute); font-size:10px; text-transform:uppercase; padding:10px 0 2px; border-bottom:1px solid var(--line); }
+  @media (max-width:680px) {
+    #tag-filter { min-width:0; flex:1 1 auto; max-width:140px; font-size:10px; padding:4px 7px; }
+    #btn-help { padding:4px 8px; }
+  }
+
   /* mobile narrow: shrink stats, hide labels, recenter popover */
   @media (max-width:680px) {
     .topbar-stats { gap:6px; font-size:10px; }
@@ -2772,6 +2805,8 @@ const HTML_PAGE = `<!doctype html>
     </div>
   </div>
   <span class="grow"></span>
+  <input type="text" id="tag-filter" placeholder="filter tags (/)" autocomplete="off" spellcheck="false">
+  <button id="btn-help" title="Keyboard shortcuts (?)">?</button>
   <button id="btn-new">+ New</button>
 </header>
 <div id="pair-zone" style="max-width:960px;margin:0 auto;padding:12px 24px 0"></div>
@@ -2828,6 +2863,22 @@ const HTML_PAGE = `<!doctype html>
   <div class="row">
     <button class="btn" id="btn-cancel">Cancel</button>
     <button class="btn primary" id="btn-launch">Launch</button>
+  </div>
+</dialog>
+
+<dialog id="help-dlg">
+  <h2>Keyboard shortcuts</h2>
+  <table class="kb-table">
+    <tr class="kb-row-hd"><td colspan="2">Navigation</td></tr>
+    <tr><td>j  /  n</td><td>jump to next <strong>waiting_ask</strong> instance</td></tr>
+    <tr><td>/</td><td>focus tag filter</td></tr>
+    <tr><td>?</td><td>show this help</td></tr>
+    <tr><td>Esc</td><td>close dialog / overlay</td></tr>
+    <tr class="kb-row-hd"><td colspan="2">Filter syntax</td></tr>
+    <tr><td>tok1 tok2</td><td>AND match — all tokens must match a tag (case-insensitive substring)</td></tr>
+  </table>
+  <div class="row" style="margin-top:14px">
+    <button class="btn" id="help-close">Close</button>
   </div>
 </dialog>
 
@@ -2919,9 +2970,22 @@ const HTML_PAGE = `<!doctype html>
       + '<button class="btn" data-act="openterm" data-cwd="'+path+'" data-name="'+projName+'">Shell</button>';
     const count = g.list.length;
     const countTag = count > 1 ? '<span class="group-count">× ' + count + '</span>' : '';
+    // Tag chips (T8): editable per-cwd labels, skipped for the hub group
+    // (cwd-less, can't be tagged meaningfully). Each chip click removes the
+    // tag; "+ tag" button (visible on group hover) prompts for a new one.
+    const tagsHtml = (() => {
+      if (g.hasHub) return '';
+      const cwd = g.cwd || '';
+      const cwdEsc = escape(cwd);
+      const tags = (_tagsByCwd[cwd] || []).slice().sort();
+      const chips = tags.map(t =>
+        '<span class="tag-chip" data-act="tag-rm" data-cwd="' + cwdEsc + '" data-tag="' + escape(t) + '" title="点击删除标签">' + escape(t) + '</span>'
+      ).join('');
+      return '<span class="group-tags">' + chips + '<button class="tag-add" data-act="tag-add" data-cwd="' + cwdEsc + '" title="add tag">+</button></span>';
+    })();
     const body = g.list.map(renderInstance).join('');
     return ''
-      + '<div class="group' + (g.hasHub ? ' is-hub' : '') + '">'
+      + '<div class="group' + (g.hasHub ? ' is-hub' : '') + '" data-group-cwd="' + escape(g.cwd || '') + '">'
       +   '<div class="group-head">'
       +     '<div class="group-id">'
       +       '<span class="group-name">' + showName + '</span>'
@@ -2929,6 +2993,7 @@ const HTML_PAGE = `<!doctype html>
       +       aliasBtn
       +       countTag
       +       (g.hasHub ? '<span class="hub-tag">HUB</span>' : '')
+      +       tagsHtml
       +     '</div>'
       +     '<div class="group-path" title="'+path+'">'+path+'</div>'
       +     (groupActions ? '<div class="group-actions">' + groupActions + '</div>' : '')
@@ -2968,6 +3033,13 @@ const HTML_PAGE = `<!doctype html>
   const _statusByPid = new Map();
   let _lastListData = { items: [], history: [], localCc: [] };
   let _lastColByCwd = new Map();
+  // T8: tag state — populated by loadPrefs() on initial load and after every
+  // tag mutation. Render reads these to paint chips; applyTagFilter() uses
+  // them to decide which groups to hide.
+  let _tagsByCwd = {};
+  let _allTags = [];
+  let _filterText = '';
+  let _jumpIdx = -1;
 
   function render(items, history, localCc) {
     _lastListData = { items, history: history || [], localCc: localCc || [] };
@@ -3112,6 +3184,8 @@ const HTML_PAGE = `<!doctype html>
         });
       });
     }
+    // Re-apply current tag filter against the new DOM (T8)
+    applyTagFilter();
   }
 
   // Render QR codes when <summary> is clicked (toggle event doesn't bubble, so use click on summary)
@@ -3193,6 +3267,33 @@ const HTML_PAGE = `<!doctype html>
         alert('接管失败: ' + e.message);
         t.disabled = false; t.textContent = prev;
       }
+    } else if (act === 'tag-add') {
+      const cwd = t.dataset.cwd || '';
+      if (!cwd) return;
+      const existing = (_tagsByCwd[cwd] || []).slice();
+      const hint = _allTags.length ? ' (常用: ' + _allTags.slice(0, 8).join(', ') + ')' : '';
+      const next = window.prompt('添加标签 (≤24 字符，可用 key:value 形式如 env:prod)' + hint, '');
+      if (next == null) return;
+      const trimmed = next.trim();
+      if (!trimmed) return;
+      if (existing.includes(trimmed)) return;
+      try {
+        const data = await api('/api/launcher/prefs/tags', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd, tags: existing.concat(trimmed) }) });
+        _tagsByCwd[cwd] = data.tags || [];
+        if (Array.isArray(data.allTags)) _allTags = data.allTags;
+        if (_lastListData.items.length) render(_lastListData.items, _lastListData.history, _lastListData.localCc);
+      } catch (e) { alert('添加标签失败: ' + e.message); }
+    } else if (act === 'tag-rm') {
+      const cwd = t.dataset.cwd || '';
+      const tag = t.dataset.tag || '';
+      if (!cwd || !tag) return;
+      const existing = (_tagsByCwd[cwd] || []).filter(x => x !== tag);
+      try {
+        const data = await api('/api/launcher/prefs/tags', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd, tags: existing }) });
+        _tagsByCwd[cwd] = data.tags || [];
+        if (Array.isArray(data.allTags)) _allTags = data.allTags;
+        if (_lastListData.items.length) render(_lastListData.items, _lastListData.history, _lastListData.localCc);
+      } catch (e) { alert('删除标签失败: ' + e.message); }
     }
   });
 
@@ -3884,6 +3985,101 @@ const HTML_PAGE = `<!doctype html>
 
   refreshTopStats();
   visibilityPoll(refreshTopStats, 10000);
+
+  // ---- T8: tags + filter + keyboard shortcuts ----
+  async function loadPrefs() {
+    try {
+      const data = await api('/api/launcher/prefs');
+      _tagsByCwd = (data && data.tags) || {};
+      _allTags = Array.isArray(data && data.allTags) ? data.allTags : [];
+      // Repaint groups so tag chips reflect the loaded state.
+      if (_lastListData.items.length) render(_lastListData.items, _lastListData.history, _lastListData.localCc);
+    } catch { /* graceful: tags stay empty */ }
+  }
+
+  function applyTagFilter() {
+    const tokens = _filterText.trim().toLowerCase().split(/\\s+/).filter(Boolean);
+    const groups = listEl.querySelectorAll('.group[data-group-cwd]');
+    groups.forEach(g => {
+      const cwd = g.dataset.groupCwd || '';
+      const tags = (_tagsByCwd[cwd] || []).map(t => t.toLowerCase());
+      const matches = tokens.length === 0 || tokens.every(tok => tags.some(t => t.includes(tok)));
+      if (matches) g.removeAttribute('data-filter-hidden');
+      else g.setAttribute('data-filter-hidden', '');
+    });
+    // Recount visible groups per Kanban column
+    document.querySelectorAll('.kanban-col').forEach(col => {
+      const body = col.querySelector('.kanban-body');
+      if (!body) return;
+      const visible = body.querySelectorAll('.group:not([data-filter-hidden])').length;
+      const countEl = col.querySelector('.col-count');
+      if (countEl) countEl.textContent = visible;
+    });
+  }
+
+  const tagFilterEl = document.getElementById('tag-filter');
+  if (tagFilterEl) {
+    tagFilterEl.addEventListener('input', () => {
+      _filterText = tagFilterEl.value || '';
+      applyTagFilter();
+    });
+  }
+
+  // j/n: scroll the next waiting_ask instance into view, briefly flash it.
+  // Cycles through all visible (filter-respecting) waiting cards.
+  function jumpToNextWaiting() {
+    const candidates = [...listEl.querySelectorAll('.instance[data-pid]')].filter(el => {
+      // skip filter-hidden groups (offsetParent === null when display:none)
+      if (el.offsetParent === null) return false;
+      const pid = Number(el.dataset.pid);
+      return _statusByPid.get(pid) === 'waiting_ask';
+    });
+    if (!candidates.length) return false;
+    _jumpIdx = (_jumpIdx + 1) % candidates.length;
+    const target = candidates[_jumpIdx];
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    target.classList.remove('flash');
+    // force reflow so the animation restarts on repeat presses
+    void target.offsetWidth;
+    target.classList.add('flash');
+    setTimeout(() => target.classList.remove('flash'), 1200);
+    return true;
+  }
+
+  const helpDlg = document.getElementById('help-dlg');
+  document.getElementById('btn-help').addEventListener('click', () => helpDlg.showModal());
+  document.getElementById('help-close').addEventListener('click', () => helpDlg.close());
+
+  // Single global keydown listener — bails out when typing or when a
+  // modal/overlay owns the keyboard. Other ESC handlers (term-overlay /
+  // ccv-overlay) stay independent so they keep working when this one no-ops.
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && helpDlg.open) {
+      helpDlg.close();
+      ev.preventDefault();
+      return;
+    }
+    const tag = (ev.target && ev.target.tagName || '').toLowerCase();
+    const isTyping = tag === 'input' || tag === 'textarea' || (ev.target && ev.target.isContentEditable);
+    if (isTyping) return;
+    if (dlg.open || helpDlg.open) return;
+    if (termOverlay.classList.contains('open') || ccvOverlay.classList.contains('open')) return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+
+    if (ev.key === 'j' || ev.key === 'n') {
+      ev.preventDefault();
+      jumpToNextWaiting();
+    } else if (ev.key === '/') {
+      ev.preventDefault();
+      if (tagFilterEl) { tagFilterEl.focus(); tagFilterEl.select(); }
+    } else if (ev.key === '?') {
+      ev.preventDefault();
+      helpDlg.showModal();
+    }
+  });
+
+  loadPrefs();
+  // tags only change via user mutation in this UI; no polling needed.
 
   // ---- Pair notification polling ----
   const pairZone = document.getElementById('pair-zone');
