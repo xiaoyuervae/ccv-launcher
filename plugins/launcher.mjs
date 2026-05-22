@@ -91,6 +91,17 @@ const SESSIONS_FILE = join(homedir(), '.claude', 'cc-viewer', 'sessions.json');
 const LAUNCHER_PREFS_FILE = join(homedir(), '.claude', 'cc-viewer', 'launcher-prefs.json');
 let _prefsCache = null;
 
+function emptyPrefs() {
+  return {
+    aliases: {},
+    ccuseProfiles: {},
+    defaultCcuseProfile: '',
+    tags: {},
+    compactThresholds: {},
+    worktreeDefault: false,
+  };
+}
+
 function loadPrefs() {
   if (_prefsCache) return _prefsCache;
   try {
@@ -100,12 +111,15 @@ function loadPrefs() {
         aliases: raw.aliases && typeof raw.aliases === 'object' ? raw.aliases : {},
         ccuseProfiles: raw.ccuseProfiles && typeof raw.ccuseProfiles === 'object' ? raw.ccuseProfiles : {},
         defaultCcuseProfile: typeof raw.defaultCcuseProfile === 'string' ? raw.defaultCcuseProfile : '',
+        tags: raw.tags && typeof raw.tags === 'object' ? raw.tags : {},
+        compactThresholds: raw.compactThresholds && typeof raw.compactThresholds === 'object' ? raw.compactThresholds : {},
+        worktreeDefault: typeof raw.worktreeDefault === 'boolean' ? raw.worktreeDefault : false,
       };
     } else {
-      _prefsCache = { aliases: {}, ccuseProfiles: {}, defaultCcuseProfile: '' };
+      _prefsCache = emptyPrefs();
     }
   } catch {
-    _prefsCache = { aliases: {}, ccuseProfiles: {}, defaultCcuseProfile: '' };
+    _prefsCache = emptyPrefs();
   }
   return _prefsCache;
 }
@@ -168,6 +182,119 @@ function setCcuseProfile(cwd, profile) {
 function setDefaultCcuseProfile(profile) {
   const prefs = loadPrefs();
   prefs.defaultCcuseProfile = typeof profile === 'string' ? profile : '';
+  savePrefs();
+}
+
+// ---- tags (H5) ----
+function normalizeTag(raw) {
+  if (typeof raw !== 'string') return '';
+  // Tags are short labels; strip control chars, trim, cap at 24 chars.
+  let out = '';
+  let prevSpace = false;
+  for (const ch of raw) {
+    const c = ch.charCodeAt(0);
+    const isCtrl = c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029 ||
+                   (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069);
+    if (isCtrl) {
+      if (!prevSpace) { out += ' '; prevSpace = true; }
+    } else {
+      out += ch;
+      prevSpace = false;
+    }
+  }
+  return out.trim().slice(0, 24);
+}
+
+function getTags(cwd) {
+  if (!cwd) return [];
+  const arr = loadPrefs().tags[cwd];
+  return Array.isArray(arr) ? arr.slice() : [];
+}
+
+function setTags(cwd, arr) {
+  if (!cwd) return false;
+  const prefs = loadPrefs();
+  const normalized = Array.isArray(arr)
+    ? Array.from(new Set(arr.map(normalizeTag).filter(Boolean)))
+    : [];
+  if (normalized.length) prefs.tags[cwd] = normalized;
+  else delete prefs.tags[cwd];
+  savePrefs();
+  return true;
+}
+
+function addTag(cwd, t) {
+  if (!cwd) return false;
+  const tag = normalizeTag(t);
+  if (!tag) return false;
+  const cur = getTags(cwd);
+  if (cur.includes(tag)) return true;
+  cur.push(tag);
+  setTags(cwd, cur);
+  return true;
+}
+
+function removeTag(cwd, t) {
+  if (!cwd) return false;
+  const tag = normalizeTag(t);
+  if (!tag) return false;
+  const cur = getTags(cwd).filter(x => x !== tag);
+  setTags(cwd, cur);
+  return true;
+}
+
+function getAllTags() {
+  const prefs = loadPrefs();
+  const seen = new Set();
+  for (const arr of Object.values(prefs.tags || {})) {
+    if (!Array.isArray(arr)) continue;
+    for (const t of arr) seen.add(t);
+  }
+  return Array.from(seen).sort();
+}
+
+// ---- compact thresholds (M1) ----
+const DEFAULT_COMPACT_THRESHOLD = { auto_compact_at: 0, auto_clear_at: 0, enabled: false };
+
+function getCompactThreshold(cwd) {
+  if (!cwd) return { ...DEFAULT_COMPACT_THRESHOLD };
+  const raw = loadPrefs().compactThresholds[cwd];
+  if (!raw || typeof raw !== 'object') return { ...DEFAULT_COMPACT_THRESHOLD };
+  return {
+    auto_compact_at: Number.isFinite(raw.auto_compact_at) ? raw.auto_compact_at : 0,
+    auto_clear_at: Number.isFinite(raw.auto_clear_at) ? raw.auto_clear_at : 0,
+    enabled: !!raw.enabled,
+  };
+}
+
+function setCompactThreshold(cwd, { auto_compact_at, auto_clear_at, enabled } = {}) {
+  if (!cwd) return false;
+  const prefs = loadPrefs();
+  const ac = Number(auto_compact_at);
+  const cl = Number(auto_clear_at);
+  const next = {
+    auto_compact_at: Number.isFinite(ac) && ac > 0 ? Math.floor(ac) : 0,
+    auto_clear_at: Number.isFinite(cl) && cl > 0 ? Math.floor(cl) : 0,
+    enabled: !!enabled,
+  };
+  // If everything is default, drop the entry to keep prefs file lean.
+  if (!next.enabled && !next.auto_compact_at && !next.auto_clear_at) {
+    delete prefs.compactThresholds[cwd];
+  } else {
+    prefs.compactThresholds[cwd] = next;
+  }
+  savePrefs();
+  return true;
+}
+
+// ---- worktree default (M2) ----
+function getWorktreeDefault() {
+  return !!loadPrefs().worktreeDefault;
+}
+
+function setWorktreeDefault(value) {
+  const prefs = loadPrefs();
+  prefs.worktreeDefault = !!value;
   savePrefs();
 }
 
@@ -3053,12 +3180,12 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
     return;
   }
 
-  // Launcher-side prefs (aliases + ccuse profiles + default profile)
+  // Launcher-side prefs (aliases + ccuse profiles + default profile + tags + thresholds + worktree)
   if (url === '/api/launcher/prefs' && method === 'GET') {
     try {
       const prefs = loadPrefs();
       const profiles = await listCcuseProfiles();
-      sendJson(res, 200, { ...prefs, availableProfiles: profiles });
+      sendJson(res, 200, { ...prefs, availableProfiles: profiles, allTags: getAllTags() });
     } catch (err) {
       sendJson(res, 500, { error: err.message });
     }
@@ -3089,6 +3216,49 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
         setCcuseProfile(body.cwd, body.profile || '');
       }
       sendJson(res, 200, { ok: true });
+    } catch (err) {
+      sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  if (url === '/api/launcher/prefs/tags' && method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      const body = JSON.parse(raw || '{}');
+      if (!body.cwd) throw new Error('cwd required');
+      if (!Array.isArray(body.tags)) throw new Error('tags must be an array');
+      setTags(body.cwd, body.tags);
+      sendJson(res, 200, { ok: true, tags: getTags(body.cwd), allTags: getAllTags() });
+    } catch (err) {
+      sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  if (url === '/api/launcher/prefs/compact-threshold' && method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      const body = JSON.parse(raw || '{}');
+      if (!body.cwd) throw new Error('cwd required');
+      setCompactThreshold(body.cwd, {
+        auto_compact_at: body.auto_compact_at,
+        auto_clear_at: body.auto_clear_at,
+        enabled: body.enabled,
+      });
+      sendJson(res, 200, { ok: true, threshold: getCompactThreshold(body.cwd) });
+    } catch (err) {
+      sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  if (url === '/api/launcher/prefs/worktree-default' && method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      const body = JSON.parse(raw || '{}');
+      setWorktreeDefault(!!body.value);
+      sendJson(res, 200, { ok: true, worktreeDefault: getWorktreeDefault() });
     } catch (err) {
       sendJson(res, 400, { error: err.message });
     }
