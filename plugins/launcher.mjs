@@ -1948,10 +1948,30 @@ async function getCachedUsage(params) {
     refreshUsageInBackground(key, params);
     return { ...hit, fromCache: true, stale: true };
   }
-  const result = await aggregateUsage(params);
-  mem[key] = result;
-  saveUsageCacheToDisk();
-  return { ...result, fromCache: false, stale: false };
+  // Cold miss. The synchronous fallback used to await aggregateUsage(),
+  // which on a heavy "month" range scans ~30 days of native jsonls and
+  // can take >5s — long enough that the UI's 10s polling-with-timeout
+  // would error out. Instead: kick the scan as a background refresh and
+  // return a pending placeholder with computedAt=0 so UI can render a
+  // "..." spinner. The next poll picks up the real result from cache.
+  // Claude Code's native session jsonls are named <sessionId>.jsonl
+  // (UUID), so filename-date pre-filtering doesn't apply here — mtime
+  // already filters at the file level and the per-line ts < startMs skip
+  // is already in place. Cold-scan cost is dominated by JSON.parse on
+  // in-range files; this placeholder shields the wire from that latency.
+  refreshUsageInBackground(key, params);
+  return {
+    totalUSD: 0,
+    byModel: {},
+    byModelUSD: {},
+    requestCount: 0,
+    range: params.range,
+    cwd: params.cwd || '',
+    computedAt: 0,
+    fromCache: false,
+    stale: true,
+    pending: true,
+  };
 }
 
 // ---- per-instance session reducer ----
