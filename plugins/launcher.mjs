@@ -2377,6 +2377,258 @@ async function getCachedQuota5h() {
 
 // ---------- end 5h quota window ----------
 
+// ---------- compact threshold + run summary (T9) ----------
+// 1) Auto-compact / auto-clear threshold: getInstanceActivity calls
+//    checkCompactThresholds(instance, contextUsage) after computing
+//    contextUsage. When prefs.compactThresholds[cwd] is enabled and the
+//    current prompt-size crosses auto_compact_at / auto_clear_at we try to
+//    inject the corresponding slash command. ccv currently has no
+//    stdin/inject channel (audited the full /api/* surface — no
+//    /api/inject-prompt, no /api/stream-chunk write side, no WebSocket
+//    that takes user input), so injectPromptToCcv is intentionally a noop
+//    that returns {ok:false, reason:'no_inject_channel'} + jlogs the skip.
+//    The compactStatus payload field lets ui-dev's T11 surface a "context
+//    > threshold; please run /compact manually" hint on the affected card.
+// 2) Run Summary: streams the native session jsonl with a 1-based line
+//    counter and extracts notable events (prompts, slash commands,
+//    tool errors, hook events, sub-agent spawns, auto-compact markers).
+//    Cached per jsonlPath keyed on (mtime, size) — re-read is free when
+//    the file hasn't grown — with a 5s in-memory floor.
+const COMPACT_COOLDOWN_MS = 5 * 60 * 1000;
+const _thresholdCooldown = new Map(); // pid -> lastTriggerAt
+const _compactStatusByPid = new Map(); // pid -> compactStatus payload
+
+async function injectPromptToCcv(instance, prompt) {
+  // Future: probe ccv for a stdin or WebSocket inject channel and use it
+  // when available. As of cc-viewer at /Users/dayuer/.nvm/.../cc-viewer/
+  // server/server.js, no such route exists — ccv is a passive jsonl
+  // observer. Returning a structured "skipped" result lets callers jlog
+  // the attempt and lets UI surface a manual-action hint without the
+  // launcher silently doing nothing.
+  return { ok: false, reason: 'no_inject_channel' };
+}
+
+function checkCompactThresholds(instance, contextUsage) {
+  const pid = instance && instance.pid;
+  if (!pid || !instance || !instance.cwd) return null;
+  const threshold = getCompactThreshold(instance.cwd);
+  const status = {
+    enabled: !!threshold.enabled,
+    auto_compact_at: threshold.auto_compact_at || 0,
+    auto_clear_at: threshold.auto_clear_at || 0,
+    lastTriggeredAt: null,
+    lastResult: null,
+    reason: null,
+    cooldownUntil: null,
+  };
+  const prev = _compactStatusByPid.get(pid);
+  if (prev) {
+    status.lastTriggeredAt = prev.lastTriggeredAt;
+    status.lastResult = prev.lastResult;
+    status.reason = prev.reason;
+  }
+  if (!status.enabled) { _compactStatusByPid.set(pid, status); return status; }
+  if (!contextUsage || typeof contextUsage.used !== 'number') {
+    _compactStatusByPid.set(pid, status);
+    return status;
+  }
+  const now = Date.now();
+  const last = _thresholdCooldown.get(pid) || 0;
+  if (now - last < COMPACT_COOLDOWN_MS) {
+    status.cooldownUntil = last + COMPACT_COOLDOWN_MS;
+    _compactStatusByPid.set(pid, status);
+    return status;
+  }
+  // Clear takes priority over compact when both are configured and tripped.
+  let action = null;
+  if (status.auto_clear_at > 0 && contextUsage.used >= status.auto_clear_at) {
+    action = { prompt: '/clear', kind: 'clear' };
+  } else if (status.auto_compact_at > 0 && contextUsage.used >= status.auto_compact_at) {
+    action = { prompt: '/compact', kind: 'compact' };
+  }
+  if (!action) { _compactStatusByPid.set(pid, status); return status; }
+  // Fire-and-forget — we don't want a slow inject to block activity polls.
+  // The noop returns synchronously today; keeping the promise shape future-
+  // proofs the call site when a real inject channel lands.
+  Promise.resolve(injectPromptToCcv(instance, action.prompt))
+    .then((res) => {
+      const ok = !!(res && res.ok);
+      const newStatus = {
+        ..._compactStatusByPid.get(pid) || status,
+        lastTriggeredAt: now,
+        lastResult: ok ? 'ok' : 'skipped',
+        reason: ok ? null : (res && res.reason) || 'unknown',
+        cooldownUntil: now + COMPACT_COOLDOWN_MS,
+      };
+      _compactStatusByPid.set(pid, newStatus);
+      jlog(ok ? 'auto_compact_triggered' : 'auto_compact_skipped', {
+        pid, cwd: instance.cwd, action: action.kind, used: contextUsage.used,
+        threshold: action.kind === 'clear' ? status.auto_clear_at : status.auto_compact_at,
+        reason: ok ? undefined : newStatus.reason,
+      });
+    })
+    .catch((err) => {
+      const newStatus = {
+        ..._compactStatusByPid.get(pid) || status,
+        lastTriggeredAt: now,
+        lastResult: 'failed',
+        reason: err && err.message || String(err),
+        cooldownUntil: now + COMPACT_COOLDOWN_MS,
+      };
+      _compactStatusByPid.set(pid, newStatus);
+      jlog('auto_compact_failed', {
+        pid, cwd: instance.cwd, action: action.kind, reason: newStatus.reason,
+      });
+    });
+  _thresholdCooldown.set(pid, now);
+  status.lastTriggeredAt = now;
+  status.lastResult = 'pending';
+  status.cooldownUntil = now + COMPACT_COOLDOWN_MS;
+  _compactStatusByPid.set(pid, status);
+  return status;
+}
+
+// Stream jsonl with a 1-based line counter. The callback receives (entry, line).
+async function readJsonlEntriesIndexed(path, onEntry) {
+  let i = 0;
+  const stream = createReadStream(path, { encoding: 'utf-8' });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+  for await (const raw of rl) {
+    i++;
+    if (!raw) continue;
+    let obj; try { obj = JSON.parse(raw); } catch { continue; }
+    onEntry(obj, i);
+  }
+}
+
+function truncateLabel(s, n = 80) {
+  if (typeof s !== 'string') return '';
+  const oneLine = s.replace(/\s+/g, ' ').trim();
+  return oneLine.length > n ? oneLine.slice(0, n - 1) + '…' : oneLine;
+}
+
+// Classify a single jsonl entry. Returns null when the entry isn't notable.
+// Event types (5 from spec + 3 useful additions found in this repo's jsonl):
+//   prompt           — type=user with string content (real user input)
+//   slash_command    — prompt whose content starts with '/' (e.g. /compact, /clear)
+//   auto_compact     — user content containing the canonical resume marker
+//                      "This session is being continued from a previous conversation"
+//   tool_error       — type=user, content array with any tool_result.is_error===true
+//   subagent         — type=assistant, content array contains tool_use name===Task
+//   hook_event       — type=attachment with attachment.type==='hook_success'
+//   state_change     — *not implemented*: would require full state-machine replay
+//                      across the jsonl; punted to follow-up. Not in v1.
+function classifyEntry(e) {
+  if (!e || typeof e !== 'object') return null;
+  const ts = e.timestamp || null;
+  if (e.type === 'user') {
+    const msg = e.message; const c = msg && msg.content;
+    if (typeof c === 'string') {
+      if (c.includes('This session is being continued from a previous conversation')) {
+        return { type: 'auto_compact', label: 'session continued (auto-compact)', ts };
+      }
+      const trimmed = c.trim();
+      if (trimmed.startsWith('/')) {
+        const cmd = trimmed.split(/\s+/)[0];
+        return { type: 'slash_command', label: cmd, ts };
+      }
+      return { type: 'prompt', label: truncateLabel(c, 80), ts };
+    }
+    if (Array.isArray(c)) {
+      const err = c.find(b => b && b.type === 'tool_result' && b.is_error);
+      if (err) {
+        // Tool name isn't on the user-side tool_result block, but the
+        // tool_use_id is — UI can resolve the original tool name if needed.
+        const snippet = typeof err.content === 'string'
+          ? err.content
+          : Array.isArray(err.content)
+            ? err.content.filter(b => b && b.type === 'text').map(b => b.text).join(' ')
+            : '';
+        return { type: 'tool_error', label: truncateLabel(snippet || 'tool returned error', 80), ts, toolUseId: err.tool_use_id || null };
+      }
+    }
+    return null;
+  }
+  if (e.type === 'assistant') {
+    const msg = e.message; const blocks = msg && msg.content;
+    if (!Array.isArray(blocks)) return null;
+    for (const b of blocks) {
+      if (b && b.type === 'tool_use' && b.name === 'Task') {
+        const subType = (b.input && (b.input.subagent_type || b.input.description)) || 'Task';
+        return { type: 'subagent', label: truncateLabel(String(subType), 80), ts };
+      }
+    }
+    return null;
+  }
+  if (e.type === 'attachment') {
+    const a = e.attachment;
+    if (a && a.type === 'hook_success') {
+      // Real Claude Code attachments use camelCase: hookName (e.g.
+      // "SessionStart:startup") and hookEvent (e.g. "SessionStart"). Prefer
+      // hookName since it's specific; fall back through the snake_case
+      // variants in case the schema evolves.
+      const name = a.hookName || a.hook_event_name || a.hookEvent || a.hook_name || a.name || 'hook';
+      return { type: 'hook_event', label: truncateLabel(String(name), 80), ts };
+    }
+    return null;
+  }
+  return null;
+}
+
+const _runSummaryCache = new Map(); // jsonlPath -> { mtime, size, computedAt, events, totals }
+const RUN_SUMMARY_MEM_TTL_MS = 5_000;
+const RUN_SUMMARY_MAX_EVENTS = 500; // cap response size
+
+async function computeRunSummary(jsonlPath) {
+  if (!jsonlPath || !existsSync(jsonlPath)) return null;
+  let st; try { st = statSync(jsonlPath); } catch { return null; }
+  const cached = _runSummaryCache.get(jsonlPath);
+  const now = Date.now();
+  if (cached && cached.mtime === st.mtimeMs && cached.size === st.size
+      && now - cached.computedAt < RUN_SUMMARY_MEM_TTL_MS) {
+    return cached;
+  }
+  const events = [];
+  const totals = { prompts: 0, slash_commands: 0, tools: 0, errors: 0, compacts: 0, subagents: 0, hooks: 0 };
+  let toolUseCount = 0;
+  await readJsonlEntriesIndexed(jsonlPath, (e, line) => {
+    // Side counter: every assistant tool_use call (not just Task). Helps the
+    // UI summary show "N tool calls" without us needing a second pass.
+    if (e && e.type === 'assistant' && Array.isArray(e.message && e.message.content)) {
+      for (const b of e.message.content) {
+        if (b && b.type === 'tool_use') toolUseCount++;
+      }
+    }
+    const cls = classifyEntry(e);
+    if (!cls) return;
+    events.push({ ts: cls.ts, type: cls.type, label: cls.label, jsonlLine: line, ...(cls.toolUseId ? { toolUseId: cls.toolUseId } : {}) });
+    if (cls.type === 'prompt') totals.prompts++;
+    else if (cls.type === 'slash_command') totals.slash_commands++;
+    else if (cls.type === 'auto_compact') totals.compacts++;
+    else if (cls.type === 'tool_error') totals.errors++;
+    else if (cls.type === 'subagent') totals.subagents++;
+    else if (cls.type === 'hook_event') totals.hooks++;
+  });
+  totals.tools = toolUseCount;
+  // Trim to the most recent N events for the wire response; UI can ask for
+  // older ones via pagination if/when that becomes a need.
+  const trimmed = events.length > RUN_SUMMARY_MAX_EVENTS
+    ? events.slice(-RUN_SUMMARY_MAX_EVENTS)
+    : events;
+  const result = {
+    mtime: st.mtimeMs,
+    size: st.size,
+    computedAt: now,
+    events: trimmed,
+    totalEvents: events.length,
+    totals,
+  };
+  _runSummaryCache.set(jsonlPath, result);
+  return result;
+}
+
+// ---------- end compact threshold + run summary ----------
+
 async function getInstanceActivity(instance) {
   const cached = _activityCache.get(instance.pid);
   const now = Date.now();
@@ -2423,6 +2675,7 @@ async function getInstanceActivity(instance) {
   // the launcher should still render even when usage data is unavailable.
   let sessionUsage = null;
   let contextUsage = null;
+  let compactStatus = null;
   if (!instance.isHub) {
     try {
       const np = resolveNativeJsonl(instance);
@@ -2441,6 +2694,7 @@ async function getInstanceActivity(instance) {
             jsonlPath: np,
           };
           contextUsage = computeContextUsage(u.lastEntry);
+          compactStatus = checkCompactThresholds(instance, contextUsage);
         }
       }
     } catch (err) { log('sessionUsage error:', err.message); }
@@ -2461,6 +2715,7 @@ async function getInstanceActivity(instance) {
     recentEvents: recent,
     sessionUsage,
     contextUsage,
+    compactStatus,
   };
   _activityCache.set(instance.pid, { at: now, payload });
   return payload;
@@ -4760,6 +5015,36 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
     try {
       const result = await getCachedQuota5h();
       sendJson(res, 200, result);
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // Per-instance run summary: timeline of notable events extracted from the
+  // native session jsonl (prompts, slash commands, tool errors, sub-agent
+  // spawns, hook events, auto-compact markers). 5s per-file cache keyed on
+  // mtime+size — re-read is free when the jsonl hasn't grown.
+  const runSummaryM = url.match(/^\/api\/launcher\/instances\/(\d+)\/run-summary$/);
+  if (runSummaryM && method === 'GET') {
+    try {
+      const pid = parseInt(runSummaryM[1], 10);
+      const inst = instances.get(pid);
+      if (!inst) { sendJson(res, 404, { error: 'instance not found' }); return; }
+      const jp = resolveNativeJsonl(inst);
+      if (!jp) {
+        sendJson(res, 200, { pid, jsonlPath: null, events: [], totalEvents: 0, totals: { prompts: 0, slash_commands: 0, tools: 0, errors: 0, compacts: 0, subagents: 0, hooks: 0 }, computedAt: Date.now() });
+        return;
+      }
+      const r = await computeRunSummary(jp);
+      sendJson(res, 200, {
+        pid,
+        jsonlPath: jp,
+        events: r ? r.events : [],
+        totalEvents: r ? r.totalEvents : 0,
+        totals: r ? r.totals : { prompts: 0, slash_commands: 0, tools: 0, errors: 0, compacts: 0, subagents: 0, hooks: 0 },
+        computedAt: r ? r.computedAt : Date.now(),
+      });
     } catch (err) {
       sendJson(res, 500, { error: err.message });
     }
