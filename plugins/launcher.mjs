@@ -10,19 +10,21 @@
 // produced by runtime-broadcast.mjs. Spawns children with CCV_HUB cleared so
 // they do not become hubs themselves.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, realpathSync, statSync, unlinkSync, watch } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, realpathSync, statSync, unlinkSync, watch, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, join, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 const require = createRequire(import.meta.url);
 
-// cc-viewer ships workspace-registry.js at the install root and
-// pty-session-manager.js under lib/. Resolve relative to the running
-// cli.js (process.argv[1]) so the plugin works for npm-global, Homebrew,
-// or a local fork without baking in a path. Override via CCV_LIB_DIR.
+// cc-viewer ships workspace-registry.js at the install root (≤1.6.266) or
+// under server/ (≥1.6.273 refactor); pty-session-manager.js used to live
+// under lib/ but is missing from current published versions. Resolve
+// workspace-registry by probing both locations; load pty-session-manager
+// lazily inside installShellWebSocket so a missing file just disables
+// /ws/shell instead of breaking plugin load. Override roots via CCV_LIB_DIR.
 const CCV_LIB_DIR = process.env.CCV_LIB_DIR
   || dirname(realpathSync(process.argv[1]));
 // Scoped require so bare names like 'node-pty' / 'ws' resolve from
@@ -30,12 +32,34 @@ const CCV_LIB_DIR = process.env.CCV_LIB_DIR
 const ccvRequire = createRequire(
   pathToFileURL(join(CCV_LIB_DIR, 'package.json')).href
 );
+function resolveCcvFile(...candidates) {
+  for (const rel of candidates) {
+    const abs = join(CCV_LIB_DIR, rel);
+    if (existsSync(abs)) return abs;
+  }
+  return null;
+}
+const _workspaceRegistryPath = resolveCcvFile('workspace-registry.js', 'server/workspace-registry.js');
+if (!_workspaceRegistryPath) {
+  throw new Error(`[ccv-launcher] workspace-registry.js not found under ${CCV_LIB_DIR} (tried root and server/). Set CCV_LIB_DIR to the cc-viewer install root.`);
+}
 const { getWorkspaces, removeWorkspace } = await import(
-  pathToFileURL(join(CCV_LIB_DIR, 'workspace-registry.js')).href
+  pathToFileURL(_workspaceRegistryPath).href
 );
-const { PtySessionManager } = await import(
-  pathToFileURL(join(CCV_LIB_DIR, 'lib/pty-session-manager.js')).href
-);
+// PtySessionManager loaded lazily — see installShellWebSocket.
+let PtySessionManager = null;
+async function ensurePtySessionManager() {
+  if (PtySessionManager) return PtySessionManager;
+  const p = resolveCcvFile('lib/pty-session-manager.js', 'server/lib/pty-session-manager.js', 'pty-session-manager.js');
+  if (!p) return null;
+  try {
+    const mod = await import(pathToFileURL(p).href);
+    PtySessionManager = mod.PtySessionManager;
+    return PtySessionManager;
+  } catch {
+    return null;
+  }
+}
 
 const PREFIX = '[ccv-launcher]';
 const HUB_ENABLED = process.env.CCV_HUB === '1';
@@ -61,6 +85,137 @@ const approvedSessions = new Map();
 const PAIR_CODE_TTL_MS = 5 * 60 * 1000; // 5 min
 const SESSION_MAX_AGE = 30 * 24 * 3600;  // 30 days in seconds
 const SESSIONS_FILE = join(homedir(), '.claude', 'cc-viewer', 'sessions.json');
+// launcher-side prefs (aliases + ccuse profile per cwd). Lives next to the
+// runtime/ dir so symlinks survive ccv reinstalls. Indexed by cwd because pid
+// is volatile and projectName is normalized (loses Chinese characters).
+const LAUNCHER_PREFS_FILE = join(homedir(), '.claude', 'cc-viewer', 'launcher-prefs.json');
+let _prefsCache = null;
+
+function loadPrefs() {
+  if (_prefsCache) return _prefsCache;
+  try {
+    if (existsSync(LAUNCHER_PREFS_FILE)) {
+      const raw = JSON.parse(readFileSync(LAUNCHER_PREFS_FILE, 'utf-8'));
+      _prefsCache = {
+        aliases: raw.aliases && typeof raw.aliases === 'object' ? raw.aliases : {},
+        ccuseProfiles: raw.ccuseProfiles && typeof raw.ccuseProfiles === 'object' ? raw.ccuseProfiles : {},
+        defaultCcuseProfile: typeof raw.defaultCcuseProfile === 'string' ? raw.defaultCcuseProfile : '',
+      };
+    } else {
+      _prefsCache = { aliases: {}, ccuseProfiles: {}, defaultCcuseProfile: '' };
+    }
+  } catch {
+    _prefsCache = { aliases: {}, ccuseProfiles: {}, defaultCcuseProfile: '' };
+  }
+  return _prefsCache;
+}
+
+function savePrefs() {
+  try {
+    const dir = dirname(LAUNCHER_PREFS_FILE);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(LAUNCHER_PREFS_FILE, JSON.stringify(_prefsCache || {}, null, 2));
+  } catch (err) { log('savePrefs error:', err.message); }
+}
+
+function normalizeAlias(raw) {
+  if (typeof raw !== 'string') return '';
+  // Match ccv's own normalization rule (seqResourceLoaders.js): strip control
+  // chars + bidi marks, collapse to space, trim, cap at 32 chars.
+  let out = '';
+  let prevSpace = false;
+  for (const ch of raw) {
+    const c = ch.charCodeAt(0);
+    const isCtrl = c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029 ||
+                   (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069);
+    if (isCtrl) {
+      if (!prevSpace) { out += ' '; prevSpace = true; }
+    } else {
+      out += ch;
+      prevSpace = false;
+    }
+  }
+  return out.trim().slice(0, 32);
+}
+
+function getAlias(cwd) {
+  if (!cwd) return '';
+  return loadPrefs().aliases[cwd] || '';
+}
+
+function setAlias(cwd, raw) {
+  if (!cwd) return false;
+  const prefs = loadPrefs();
+  const normalized = normalizeAlias(raw);
+  if (normalized) prefs.aliases[cwd] = normalized;
+  else delete prefs.aliases[cwd];
+  savePrefs();
+  return true;
+}
+
+function getCcuseProfile(cwd) {
+  const prefs = loadPrefs();
+  return prefs.ccuseProfiles[cwd] || prefs.defaultCcuseProfile || '';
+}
+
+function setCcuseProfile(cwd, profile) {
+  const prefs = loadPrefs();
+  if (profile) prefs.ccuseProfiles[cwd] = profile;
+  else delete prefs.ccuseProfiles[cwd];
+  savePrefs();
+}
+
+function setDefaultCcuseProfile(profile) {
+  const prefs = loadPrefs();
+  prefs.defaultCcuseProfile = typeof profile === 'string' ? profile : '';
+  savePrefs();
+}
+
+// ---------- ccuse profile discovery ----------
+// `ccuse` is a zsh function from the user's .zshrc that switches the active
+// ANTHROPIC_* env vars (model, base_url, token) to point at different backends
+// (official, idealab, deepseek, etc.). launchd-spawned hub doesn't source
+// .zshrc, so we discover the profile list by running zsh interactively and
+// parsing the function's "用法:" / "Usage:" line.
+let _ccuseProfilesCache = null;
+let _ccuseProfilesAt = 0;
+const CCUSE_TTL_MS = 60_000;
+
+async function listCcuseProfiles() {
+  const now = Date.now();
+  if (_ccuseProfilesCache && now - _ccuseProfilesAt < CCUSE_TTL_MS) {
+    return _ccuseProfilesCache;
+  }
+  try {
+    // zsh -i -c 'ccuse' (no arg) prints usage with profile list
+    const { spawn: spawnAsync } = await import('node:child_process');
+    const out = await new Promise((resolve, reject) => {
+      const p = spawnAsync('/bin/zsh', ['-i', '-c', 'ccuse 2>&1; true'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 5000,
+      });
+      let stdout = ''; let stderr = '';
+      p.stdout.on('data', d => stdout += d.toString('utf-8'));
+      p.stderr.on('data', d => stderr += d.toString('utf-8'));
+      p.on('close', () => resolve(stdout + stderr));
+      p.on('error', reject);
+    });
+    // Look for the usage line: 用法: ccuse {a|b|c|...}  or  Usage: ccuse {a|b|c}
+    const m = out.match(/ccuse\s*\{([^}]+)\}/);
+    if (m) {
+      const list = m[1].split('|').map(s => s.trim()).filter(Boolean);
+      _ccuseProfilesCache = list;
+      _ccuseProfilesAt = now;
+      return list;
+    }
+    _ccuseProfilesCache = [];
+    _ccuseProfilesAt = now;
+    return [];
+  } catch (err) {
+    log('listCcuseProfiles error:', err.message);
+    return _ccuseProfilesCache || [];
+  }
+}
 
 function loadSessions() {
   try {
@@ -236,16 +391,400 @@ function rescanRuntime() {
       const entry = loadRuntimeFile(file);
       if (!entry) continue;
       seen.add(entry.pid);
+      // Self-registered runtime files always win — overwrites any prior backfill stub.
+      const prev = instances.get(entry.pid);
+      if (prev?.external) _externalPids.delete(entry.pid);
       instances.set(entry.pid, entry);
     }
-    // drop any in-memory instance whose runtime file vanished
+    // drop any in-memory instance whose runtime file vanished — but keep external
+    // backfill entries (they're tracked by their own liveness check).
     for (const pid of [...instances.keys()]) {
-      if (!seen.has(pid)) instances.delete(pid);
+      if (seen.has(pid)) continue;
+      if (_externalPids.has(pid)) continue;
+      instances.delete(pid);
     }
   } catch (err) {
     log('rescanRuntime error:', err.message);
   }
 }
+
+// External ccv backfill — discovers ccv processes that started before the
+// runtime-broadcast plugin was installed and never wrote runtime/<pid>.json.
+// Loopback (127.0.0.1) is exempt from token validation in ccv (server.js:410),
+// so we can pull /api/version-info, /api/local-url, /api/project-name from
+// the unregistered ccv to reconstruct a synthetic instance entry.
+const _externalPids = new Set();
+let _backfillInflight = null;
+let _backfillLastAt = 0;
+const BACKFILL_TTL_MS = 15_000;
+const PROBE_TIMEOUT_MS = 600;
+
+async function probeCcv(port) {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+    const r = await fetch(`http://127.0.0.1:${port}/api/version-info`, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!r.ok) return null;
+    const v = await r.json();
+    // Require ccv-shaped semver to avoid false positives from other local
+    // services exposing /api/version-info (seen: AliEntSafe at port 64555
+    // returned {version:"1.0", result:501, ...}). ccv versions are 3-tuple.
+    if (!v || typeof v.version !== 'string' || !/^\d+\.\d+\.\d+/.test(v.version)) return null;
+    // Pull URL (with token) + project name in parallel
+    const [urlR, nameR] = await Promise.all([
+      fetch(`http://127.0.0.1:${port}/api/local-url`).then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch(`http://127.0.0.1:${port}/api/project-name`).then(r => r.ok ? r.json() : null).catch(() => null),
+    ]);
+    // Both endpoints exist on ccv ≥1.6; if local-url is missing the token, this
+    // is probably not a ccv we can talk to.
+    if (!urlR || typeof urlR.url !== 'string' || !urlR.url.includes('token=')) return null;
+    let token = '';
+    let host = '127.0.0.1';
+    let ip = '127.0.0.1';
+    try {
+      const u = new URL(urlR.url);
+      token = u.searchParams.get('token') || '';
+      host = u.hostname;
+      ip = u.hostname;
+    } catch {}
+    return {
+      version: v.version,
+      token,
+      host,
+      ip,
+      projectName: nameR?.projectName || '',
+    };
+  } catch { return null; }
+}
+
+function listListeningNodePids() {
+  // `lsof -nP -iTCP -sTCP:LISTEN -c node -F pcn` returns records like
+  //   p<pid>\nc<command>\nn*:<port>\n
+  // -F is parseable; we only need pid + port pairs.
+  try {
+    const out = execFileSync('/usr/sbin/lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-c', 'node', '-F', 'pn'], {
+      encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8' },
+    });
+    const result = []; // {pid, port}
+    let curPid = null;
+    for (const line of out.split('\n')) {
+      if (!line) continue;
+      const tag = line[0]; const val = line.slice(1);
+      if (tag === 'p') curPid = parseInt(val, 10) || null;
+      else if (tag === 'n' && curPid) {
+        // n*:7008 or n[::1]:7008 or n127.0.0.1:7008
+        const m = val.match(/:(\d+)$/);
+        if (m) result.push({ pid: curPid, port: parseInt(m[1], 10) });
+      }
+    }
+    return result;
+  } catch { return []; }
+}
+
+function readPidCwd(pid) {
+  try {
+    // macOS lsof OR's selectors by default; -a forces AND so we get only cwd
+    // entries for the requested pid (otherwise we get every process's cwd).
+    // Force UTF-8 locale so non-ASCII path bytes aren't backslash-escaped
+    // (launchd doesn't inherit LANG/LC_ALL — without this, lsof falls back to
+    // POSIX/C locale and emits literal "\xNN" sequences for Chinese chars).
+    const out = execFileSync('/usr/sbin/lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-F', 'n'], {
+      encoding: 'utf-8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8' },
+    });
+    for (const line of out.split('\n')) {
+      if (line.startsWith('n')) return line.slice(1);
+    }
+  } catch {}
+  return '';
+}
+
+function readPidStartedMs(pid) {
+  try {
+    const out = execFileSync('/bin/ps', ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf-8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const t = Date.parse(out.trim());
+    return Number.isFinite(t) ? t : 0;
+  } catch { return 0; }
+}
+
+async function backfillExternalCcvs(force = false) {
+  const now = Date.now();
+  if (!force && now - _backfillLastAt < BACKFILL_TTL_MS) return;
+  if (_backfillInflight) return _backfillInflight;
+  _backfillInflight = (async () => {
+    try {
+      const listeners = listListeningNodePids();
+      // Skip pids already registered via runtime file
+      const candidates = listeners.filter(({ pid }) => {
+        const inst = instances.get(pid);
+        return !inst || inst.external;
+      });
+      const seenExternal = new Set();
+      // Probe in parallel, modest fan-out
+      await Promise.all(candidates.map(async ({ pid, port }) => {
+        const probe = await probeCcv(port);
+        if (!probe) return;
+        seenExternal.add(pid);
+        const existing = instances.get(pid);
+        // Don't overwrite a registered instance (shouldn't happen given the filter above, defensive)
+        if (existing && !existing.external) return;
+        const cwd = existing?.cwd || readPidCwd(pid);
+        const startedMs = existing?.startedAtMs || readPidStartedMs(pid);
+        const proto = 'http';
+        const localUrl = `${proto}://127.0.0.1:${port}`;
+        const lanUrl = probe.token ? `${proto}://${probe.ip}:${port}?token=${probe.token}` : '';
+        const synthEntry = {
+          pid,
+          port,
+          host: probe.host,
+          ip: probe.ip,
+          protocol: proto,
+          token: probe.token,
+        };
+        const publicUrl = buildPublicUrl(synthEntry);
+        instances.set(pid, {
+          pid,
+          port,
+          host: probe.host,
+          ip: probe.ip,
+          protocol: proto,
+          token: probe.token,
+          cwd,
+          projectName: probe.projectName,
+          displayName: cwd ? basename(cwd) : (probe.projectName || ''),
+          startedAt: startedMs ? new Date(startedMs).toISOString() : null,
+          startedAtMs: startedMs,
+          version: probe.version,
+          isHub: false,
+          external: true,
+          localUrl,
+          lanUrl,
+          publicUrl,
+          status: 'running',
+        });
+        _externalPids.add(pid);
+      }));
+      // Drop external entries no longer listening
+      for (const pid of [..._externalPids]) {
+        if (!seenExternal.has(pid)) {
+          _externalPids.delete(pid);
+          const inst = instances.get(pid);
+          if (inst?.external) instances.delete(pid);
+        }
+      }
+      _backfillLastAt = Date.now();
+    } catch (err) {
+      log('backfillExternalCcvs error:', err.message);
+    } finally {
+      _backfillInflight = null;
+    }
+  })();
+  return _backfillInflight;
+}
+
+
+// ---- Local CC sessions (claude CLI processes not running under ccv) ----
+// Scans `ps` for `claude --session-id <uuid> --resume <jsonl>` lines that are
+// NOT being intercepted by ccv (no ANTHROPIC_BASE_URL=127.0.0.1 in --settings).
+// These represent interactive claude sessions the user started directly in a
+// terminal — invisible to the launcher today. Listing them lets the user
+// "take over" by killing the bare claude and relaunching under ccv with
+// --resume, so future activity gets recorded.
+
+const _localCcCache = { at: 0, list: [] };
+const LOCAL_CC_CACHE_TTL_MS = 5000;
+const _firstEntryCwdCache = new Map(); // jsonlPath -> { mtime, cwd }
+
+// Decode a Claude Code project-dir name like "-Users-dayuer-Foo-Bar" back into
+// "/Users/dayuer/Foo/Bar". Lossy for non-alphanumeric chars (CJK etc are
+// flattened to "-"), so we only fall back to this when reading the jsonl's
+// first entry fails — the jsonl carries the real cwd verbatim.
+function decodeProjectDirName(name) {
+  if (!name || typeof name !== 'string') return '';
+  // Leading "-" denotes the absolute path's leading "/", so just replace.
+  return name.replace(/-/g, '/');
+}
+
+function readJsonlCwd(jsonlPath) {
+  try {
+    const st = statSync(jsonlPath);
+    const cached = _firstEntryCwdCache.get(jsonlPath);
+    if (cached && cached.mtime === st.mtimeMs) return cached.cwd;
+    const fd = openSync(jsonlPath, 'r');
+    const len = Math.min(st.size, 256 * 1024);
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, 0);
+    closeSync(fd);
+    let cwd = '';
+    // Scan early entries — the first jsonl line is often a "last-prompt"
+    // metadata record without cwd; the field appears on user/attachment
+    // entries a few lines in. Take the first cwd we see.
+    const lines = buf.toString('utf-8').split('\n');
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const obj = JSON.parse(line);
+        if (typeof obj?.cwd === 'string' && obj.cwd) { cwd = obj.cwd; break; }
+      } catch { /* truncated tail line — keep scanning */ }
+    }
+    _firstEntryCwdCache.set(jsonlPath, { mtime: st.mtimeMs, cwd });
+    return cwd;
+  } catch { return ''; }
+}
+
+// Read just the timestamp of the *last* jsonl entry — used as "last activity"
+// signal for the local CC session. Tail a small window (4KB usually fits one
+// entry's metadata) and parse the final newline-terminated JSON.
+function readJsonlLastTimestamp(jsonlPath) {
+  try {
+    const st = statSync(jsonlPath);
+    if (st.size === 0) return null;
+    const fd = openSync(jsonlPath, 'r');
+    const len = Math.min(st.size, 16 * 1024);
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, st.size - len);
+    closeSync(fd);
+    const text = buf.toString('utf-8');
+    const lines = text.split('\n').filter(l => l.trim());
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const obj = JSON.parse(lines[i]);
+        const ts = obj?.timestamp || obj?.ts || obj?.time;
+        if (ts) return new Date(ts).toISOString();
+      } catch { /* try previous line */ }
+    }
+    return new Date(st.mtimeMs).toISOString();
+  } catch { return null; }
+}
+
+function readPidLstart(pid) {
+  try {
+    const out = execFileSync('/bin/ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf-8', timeout: 1500 }).trim();
+    if (!out) return null;
+    const ms = Date.parse(out);
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  } catch { return null; }
+}
+
+function listLocalCcSessions(force = false) {
+  const now = Date.now();
+  if (!force && now - _localCcCache.at < LOCAL_CC_CACHE_TTL_MS) return _localCcCache.list;
+  let psOut = '';
+  try {
+    psOut = execFileSync('/bin/ps', ['-axww', '-o', 'pid=,command='], {
+      encoding: 'utf-8',
+      timeout: 3000,
+      maxBuffer: 4 * 1024 * 1024,
+      env: { ...process.env, LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8' },
+    });
+  } catch (err) {
+    log('listLocalCcSessions ps error:', err.message);
+    return _localCcCache.list;
+  }
+  const out = [];
+  const seen = new Set();
+  for (const rawLine of psOut.split('\n')) {
+    const line = rawLine.trimEnd();
+    if (!line) continue;
+    // bg-pty-host / bg-spare are claude's own supervisor/worker processes,
+    // not user-facing sessions — skip even when their command line contains
+    // a passed-through --session-id after the "--" separator.
+    if (/--bg-pty-host\b|--bg-spare\b/.test(line)) continue;
+    if (/\bdaemon\s+run\b/.test(line)) continue;
+    const m = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const pid = parseInt(m[1], 10);
+    const cmd = m[2];
+    if (!/\bclaude\b/.test(cmd) && !/\/share\/claude\//.test(cmd)) continue;
+    const sidM = cmd.match(/--session-id\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+    const resM = cmd.match(/--resume\s+(\S+)/);
+    if (!sidM || !resM) continue;
+    const sessionId = sidM[1];
+    const jsonlPath = resM[1];
+    // Skip ones already running under a ccv interceptor — the auth proxy
+    // listens on 127.0.0.1:<port>, so its presence in --settings means
+    // ccv is already capturing this session.
+    const intercepted = /ANTHROPIC_BASE_URL[^"]*"\s*:\s*"http:\/\/127\.0\.0\.1/.test(cmd);
+    if (intercepted) continue;
+    // De-dupe: same session-id can appear under bg-pty-host parent + child;
+    // bg-pty-host already filtered, but two foreground claudes with same id
+    // (e.g. fork-session retries) would collapse here.
+    if (seen.has(sessionId)) continue;
+    seen.add(sessionId);
+    let cwd = readJsonlCwd(jsonlPath);
+    if (!cwd) {
+      // jsonl unreadable — fall back to lossy decode from project dir name
+      const projDir = basename(dirname(jsonlPath));
+      cwd = decodeProjectDirName(projDir);
+    }
+    out.push({
+      pid,
+      sessionId,
+      jsonlPath,
+      cwd,
+      startedAt: readPidLstart(pid),
+      lastEntryAt: readJsonlLastTimestamp(jsonlPath),
+    });
+  }
+  // Newest activity first
+  out.sort((a, b) => {
+    const ta = a.lastEntryAt ? Date.parse(a.lastEntryAt) : 0;
+    const tb = b.lastEntryAt ? Date.parse(b.lastEntryAt) : 0;
+    return tb - ta;
+  });
+  _localCcCache.at = now;
+  _localCcCache.list = out;
+  return out;
+}
+
+// Spawn `ccv ...` in a new macOS Terminal.app window at cwd. Used by takeover
+// so the user gets a visible interactive ccv terminal where claude resumes.
+// `extraArgs` are appended after `ccv`, before --d (kept last so user can see
+// permission-skip behavior is intentional).
+function spawnCcvInTerminal(cwd, extraArgs = []) {
+  if (!cwd || !existsSync(cwd)) throw new Error('cwd does not exist');
+  // Hard reject anything that would let the args break out of single quotes.
+  const safeArgs = extraArgs.map(a => {
+    if (typeof a !== 'string') throw new Error('extraArgs must be strings');
+    if (/[\\'"`$]|[\x00-\x1f]/.test(a)) throw new Error('extraArgs contain unsafe chars: ' + a);
+    return a;
+  });
+  // Profile resolution mirrors doSpawn — honor per-cwd ccuse profile so the
+  // resumed claude uses the same backend the user picked for this project.
+  const profile = getCcuseProfile(cwd);
+  const safeProfile = profile ? profile.replace(/[^a-zA-Z0-9_\-.]/g, '') : '';
+  const ccvArgs = [...safeArgs, '--d'].join(' ');
+  // Build the shell command. Single-quote the cwd; safeArgs already validated.
+  const quotedCwd = "'" + cwd.replace(/'/g, "'\\''") + "'";
+  const profilePart = safeProfile ? `ccuse ${safeProfile} && ` : '';
+  const shellCmd = `cd ${quotedCwd} && ${profilePart}ccv ${ccvArgs}`;
+  // AppleScript needs double-quotes escaped
+  const appleEscaped = shellCmd.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const script = `tell application "Terminal" to do script "${appleEscaped}"\nactivate application "Terminal"`;
+  execFileSync('/usr/bin/osascript', ['-e', script], { timeout: 4000 });
+}
+
+// SIGTERM, then SIGKILL after a short grace period if still alive. Used by
+// takeover to evict the bare claude process before relaunching under ccv.
+async function killClaudePid(pid) {
+  if (!Number.isFinite(pid) || pid <= 1) throw new Error('invalid pid');
+  try { process.kill(pid, 'SIGTERM'); } catch (err) {
+    if (err.code === 'ESRCH') return; // already gone
+    throw err;
+  }
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 100));
+    try { process.kill(pid, 0); } catch (err) {
+      if (err.code === 'ESRCH') return;
+    }
+  }
+  try { process.kill(pid, 'SIGKILL'); } catch { /* gone or no perm */ }
+}
+
 
 function startWatcher() {
   try {
@@ -314,7 +853,7 @@ function waitForChildRuntime(pid, timeoutMs) {
   });
 }
 
-async function doSpawn(targetCwd, { force = false } = {}) {
+async function doSpawn(targetCwd, { force = false, ccuseProfile = '' } = {}) {
   if (!targetCwd || typeof targetCwd !== 'string') throw new Error('cwd required');
   if (!existsSync(targetCwd) || !statSync(targetCwd).isDirectory()) {
     throw new Error('cwd is not an existing directory');
@@ -342,18 +881,47 @@ async function doSpawn(targetCwd, { force = false } = {}) {
     CCV_MAX_PORT: String(HUB_PORT_CEIL),
   };
   // Inherit CCV_PUBLIC_URL_TEMPLATE so children produce matching public URLs.
-  const child = spawn(process.execPath, [cliPath, '--d', '--no-open'], {
-    cwd: targetCwd,
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env,
-  });
+
+  // ccuse integration: launchd-spawned hub doesn't source .zshrc, so the user's
+  // `ccuse` zsh function (which exports ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL to
+  // pick a backend) isn't accessible via plain `spawn`. When a profile is
+  // requested for this cwd (or as the launcher default), wrap the child launch
+  // in `zsh -i -c 'ccuse <profile> && exec node cli.js ...'` so .zshrc gets
+  // sourced first. Falls through to direct spawn when no profile is set.
+  const profile = ccuseProfile || getCcuseProfile(targetCwd);
+  let child;
+  if (profile) {
+    // Properly quote the profile name for zsh
+    const safeProfile = profile.replace(/[^a-zA-Z0-9_\-.]/g, '');
+    if (safeProfile !== profile) {
+      throw new Error(`ccuse profile "${profile}" contains invalid characters`);
+    }
+    const shellCmd = `ccuse ${safeProfile} && exec ${JSON.stringify(process.execPath)} ${JSON.stringify(cliPath)} --d --no-open`;
+    child = spawn('/bin/zsh', ['-i', '-c', shellCmd], {
+      cwd: targetCwd,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env,
+    });
+  } else {
+    child = spawn(process.execPath, [cliPath, '--d', '--no-open'], {
+      cwd: targetCwd,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env,
+    });
+  }
   child.stdout?.on('data', () => {}); // drain
   child.stderr?.on('data', () => {}); // drain
   child.unref();
 
   try {
     const entry = await waitForChildRuntime(child.pid, SPAWN_TIMEOUT_MS);
+    // If we wrapped via zsh, child.pid is the zsh shell, not the actual ccv
+    // node process. waitForChildRuntime polls runtime/<pid>.json which is keyed
+    // by the *real* ccv process pid (set inside runtime-broadcast.mjs at
+    // serverStarted), so it returns the right entry — we just need to remember
+    // we may not be able to SIGTERM child.pid directly later.
     return entry;
   } catch (err) {
     try { process.kill(child.pid, 'SIGTERM'); } catch { /* ignore */ }
@@ -435,6 +1003,541 @@ const PAIR_PAGE = `<!doctype html>
 </body>
 </html>`;
 
+// ---------- activity probe ----------
+// Each ccv writes its session log under LOG_DIR/<projectName>/<projectName>_<ts>.jsonl
+// where every line is one Anthropic API request (with response or partial response).
+// We tail the most recent log file for a given instance and derive a high-level
+// "what is it doing" from the last few entries.
+const LOG_DIR = join(homedir(), '.claude', 'cc-viewer');
+const ACTIVITY_TAIL_BYTES = 2 * 1024 * 1024;
+const ACTIVITY_TAIL_MAX_BYTES = 16 * 1024 * 1024;
+const ACTIVITY_CACHE_TTL_MS = 1500;
+const _activityCache = new Map(); // pid -> { at, signature, payload }
+
+// Match ccv's projectName normalization (interceptor.js:314): replace anything
+// outside [a-zA-Z0-9_\-\.] with '_'. We need this because runtime-broadcast.mjs
+// records the raw basename(cwd) (e.g. "fbi报表") while ccv writes logs under the
+// normalized name ("fbi__"); finding the active log file requires matching the
+// dir on disk, not the raw basename.
+function ccvProjectName(cwd) {
+  if (!cwd || typeof cwd !== 'string') return '';
+  return basename(cwd).replace(/[^a-zA-Z0-9_\-\.]/g, '_');
+}
+
+function findActiveLogFile(projectName, afterMs) {
+  if (!projectName) return null;
+  const dir = join(LOG_DIR, projectName);
+  if (!existsSync(dir)) return null;  let candidates;
+  try {
+    candidates = readdirSync(dir)
+      .filter(f => /^.+_\d{8}_\d{6}\.jsonl$/.test(f))
+      .map(f => {
+        const fp = join(dir, f);
+        try {
+          const st = statSync(fp);
+          return { path: fp, mtime: st.mtimeMs, size: st.size };
+        } catch { return null; }
+      })
+      .filter(Boolean);
+  } catch { return null; }
+  if (!candidates.length) return null;
+  // Most likely the most recently modified file is the one this pid writes to.
+  // afterMs (instance startedAt) is a tie-breaker but not a hard filter — log
+  // file timestamps are in filename only, mtime tracks last write.
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  return candidates[0];
+}
+
+// Parse "<projectName>_YYYYMMDD_HHMMSS.jsonl" → ms since epoch (local time).
+// ccv writes filenames with the timestamp of the first request that lands in
+// that file, so this is a stable proxy for "when this session started".
+function parseJsonlFilenameTime(filePath) {
+  const m = basename(filePath).match(/_(\d{8})_(\d{6})\.jsonl$/);
+  if (!m) return 0;
+  const d = m[1], t = m[2];
+  const iso = `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}T${t.slice(0,2)}:${t.slice(2,4)}:${t.slice(4,6)}`;
+  // Date.parse without timezone treats as local — which matches ccv's filename.
+  const ms = new Date(iso).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+// Pick the jsonl that represents an instance's "primary" session.
+//
+// Key insight: filename time = the moment ccv intercepted that session's first
+// request. So a ccv's *own* session has a filename time near (>=) startedAt.
+// A jsonl with filename time before startedAt means that ccv resumed an older
+// session.
+//
+// Algorithm (greedy, latest peer first so each can claim its exact match):
+//   1. Sort peers by startedAt DESC.
+//   2. For each peer, among jsonls not yet taken by another peer:
+//      a. Prefer the smallest fnameMs that is >= startedAt - SLACK_MS
+//         (= the file ccv created at or shortly after launch).
+//      b. If none qualify, fall back to the largest fnameMs < startedAt
+//         (= most recent old session this ccv could have resumed).
+//      c. If neither, fall back to mtime-newest among remaining candidates.
+//   3. Mark picked, move on.
+//
+// This unifies solo and multi-peer cases — solo just runs the loop once.
+const PEER_PICKER_SLACK_MS = 60_000;
+function pickInstanceLogs(projectName, instances) {
+  if (!projectName || !instances.length) return new Map();
+  const dir = join(LOG_DIR, projectName);
+  if (!existsSync(dir)) return new Map();
+  let candidates;
+  try {
+    candidates = readdirSync(dir)
+      .filter(f => /^.+_\d{8}_\d{6}\.jsonl$/.test(f))
+      .map(f => {
+        const fp = join(dir, f);
+        try {
+          const st = statSync(fp);
+          return { path: fp, mtime: st.mtimeMs, size: st.size, fnameMs: parseJsonlFilenameTime(fp) };
+        } catch { return null; }
+      })
+      .filter(Boolean);
+  } catch { return new Map(); }
+  if (!candidates.length) return new Map();
+
+  const sortedPeers = [...instances].sort((a, b) => {
+    const ta = a.startedAt ? new Date(a.startedAt).getTime() : 0;
+    const tb = b.startedAt ? new Date(b.startedAt).getTime() : 0;
+    return tb - ta; // newest first
+  });
+
+  const taken = new Set();
+  const result = new Map(); // pid -> candidate
+
+  for (const peer of sortedPeers) {
+    const startedAt = peer.startedAt ? new Date(peer.startedAt).getTime() : 0;
+    const remaining = candidates.filter(c => !taken.has(c.path));
+    if (!remaining.length) break;
+
+    let pick = null;
+    if (startedAt > 0) {
+      const after = remaining.filter(c => c.fnameMs >= startedAt - PEER_PICKER_SLACK_MS);
+      if (after.length) {
+        after.sort((a, b) => a.fnameMs - b.fnameMs);
+        pick = after[0];
+      } else {
+        const before = remaining.filter(c => c.fnameMs < startedAt - PEER_PICKER_SLACK_MS);
+        if (before.length) {
+          before.sort((a, b) => b.fnameMs - a.fnameMs);
+          pick = before[0];
+        }
+      }
+    }
+    if (!pick) {
+      const sorted = [...remaining].sort((a, b) => b.mtime - a.mtime);
+      pick = sorted[0];
+    }
+    if (pick) {
+      taken.add(pick.path);
+      result.set(peer.pid, pick);
+    }
+  }
+
+  return result;
+}
+
+function findActiveLogFileForInstance(projectName, instance, peers) {
+  const peerList = (peers && peers.length) ? peers : [instance];
+  const map = pickInstanceLogs(projectName, peerList);
+  return map.get(instance.pid) || null;
+}
+
+function tailJsonlEntries(filePath, maxBytes = ACTIVITY_TAIL_BYTES) {
+  let st;
+  try { st = statSync(filePath); } catch { return { entries: [], size: 0, mtime: 0 }; }
+  if (st.size === 0) return { entries: [], size: 0, mtime: st.mtimeMs };
+  // Adaptive grow: ccv jsonl entries inflate with conversation history (each
+  // request includes the full messages array), so a single record can be 500KB+
+  // late in a session. If the first window yields zero parseable entries, try
+  // doubling up to ACTIVITY_TAIL_MAX_BYTES before giving up.
+  let window = Math.min(maxBytes, st.size);
+  const cap = Math.min(ACTIVITY_TAIL_MAX_BYTES, st.size);
+  for (;;) {
+    const start = st.size - window;
+    let fd;
+    try {
+      fd = openSync(filePath, 'r');
+      const buf = Buffer.alloc(window);
+      readSync(fd, buf, 0, window, start);
+      closeSync(fd);
+      let text = buf.toString('utf-8');
+      if (start > 0) {
+        const nl = text.indexOf('\n');
+        if (nl > -1) text = text.slice(nl + 1);
+      }
+      const entries = [];
+      for (const line of text.split('\n')) {
+        if (!line) continue;
+        try { entries.push(JSON.parse(line)); } catch { /* truncated tail */ }
+      }
+      if (entries.length || window >= cap) {
+        return { entries, size: st.size, mtime: st.mtimeMs };
+      }
+      // Nothing parseable in this window — usually means we landed mid-record.
+      // Double the window and retry.
+      window = Math.min(window * 2, cap);
+    } catch (err) {
+      try { if (fd != null) closeSync(fd); } catch {}
+      return { entries: [], size: st.size, mtime: st.mtimeMs };
+    }
+  }
+}
+
+function truncate(s, n = 80) {
+  if (s == null) return '';
+  const str = String(s).replace(/\s+/g, ' ').trim();
+  return str.length > n ? str.slice(0, n - 1) + '…' : str;
+}
+
+function lastUserPrompt(entry) {
+  // body.messages is [{role, content: string | [{type, text, ...}]}, ...]
+  // Walk back to find the last meaningful user-typed text — skipping
+  // system-reminders, tool_result envelopes, slash-cmd wrappers, and the
+  // compact-resume preamble (same framing rules as firstUserPrompt).
+  const msgs = entry?.body?.messages;
+  if (!Array.isArray(msgs)) return '';
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m?.role !== 'user') continue;
+    const c = m.content;
+    if (typeof c === 'string') {
+      const cleaned = stripUserPromptFraming(c);
+      if (cleaned) return cleaned;
+      continue;
+    }
+    if (!Array.isArray(c)) continue;
+    // Iterate blocks in REVERSE so the most recent text in this user message
+    // wins (e.g. user appended an interrupt/clarification after a tool_use).
+    for (let j = c.length - 1; j >= 0; j--) {
+      const block = c[j];
+      if (block?.type !== 'text' || typeof block.text !== 'string') continue;
+      const cleaned = stripUserPromptFraming(block.text);
+      if (cleaned) return cleaned;
+    }
+  }
+  return '';
+}
+
+// Walk back through tail entries until we find a non-empty user prompt — the
+// latest single entry may only have tool_result blocks (during agentic tool
+// loops), in which case we want the prompt that kicked off this work.
+function lastUserPromptAcrossEntries(entries) {
+  if (!Array.isArray(entries)) return '';
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const text = lastUserPrompt(entries[i]);
+    if (text) return text;
+  }
+  return '';
+}
+
+function firstUserPrompt(entry) {
+  // First non-system-reminder user message — used as the "what was this
+  // conversation originally about" title on the card.
+  const msgs = entry?.body?.messages;
+  if (!Array.isArray(msgs)) return '';
+  for (const m of msgs) {
+    if (m?.role !== 'user') continue;
+    const c = m.content;
+    if (typeof c === 'string') {
+      const cleaned = stripUserPromptFraming(c);
+      if (cleaned) return cleaned;
+      continue;
+    }
+    if (!Array.isArray(c)) continue;
+    // A user msg can have many text blocks: [system-reminder, system-reminder,
+    // ..., REAL PROMPT, ...]. Check every text block in order — first one that
+    // survives framing strip + skill-metadata filter wins.
+    for (const block of c) {
+      if (block?.type !== 'text' || typeof block.text !== 'string') continue;
+      const cleaned = stripUserPromptFraming(block.text);
+      if (cleaned) return cleaned;
+    }
+  }
+  return '';
+}
+
+// Strip CC's framing wrappers around the actual user prompt:
+//   <system-reminder>...</system-reminder>           — system-injected context, not user input
+//   <command-name>...</command-name>                  — slash command marker
+//   <command-message>...</command-message>            — slash command body
+//   <command-args>...</command-args>                  — slash command args
+//   <local-command-caveat>...</local-command-caveat>  — "DO NOT respond to these messages..." wrapper
+//   <local-command-stdout>...</local-command-stdout>  — slash command stdout echo
+//   <session>...</session>                            — CC's session-restore wrapper around the original prompt
+//   "This session is being continued..."              — compact-resume preamble (auto-generated summary)
+// Returns '' if nothing meaningful is left.
+function stripUserPromptFraming(text) {
+  if (!text) return '';
+  let t = String(text);
+  // Drop full-message system-reminder blocks
+  if (/^<system-reminder>/.test(t)) return '';
+  // Unwrap <session>...</session> — keep inner content (the original prompt)
+  const sessionMatch = t.match(/^<session>\s*([\s\S]*?)\s*<\/session>\s*$/);
+  if (sessionMatch) t = sessionMatch[1];
+  // Drop command framing entirely (these are slash commands, not freeform prompts)
+  if (/^<command-(name|message|args)>/.test(t)) return '';
+  // Drop local-command wrappers — caveat is pure boilerplate, stdout is slash-cmd echo
+  if (/^<local-command-(caveat|stdout)>/.test(t)) return '';
+  // Drop the compact-resume preamble. CC inserts this auto-generated summary as a
+  // user-role text block when /compact runs; the real first prompt of the resumed
+  // session is in a later block.
+  if (/^This session is being continued from a previous conversation/.test(t)) return '';
+  // Drop CC skill-activation markers — these are injected as user-role text when
+  // a skill loads (e.g. "Base directory for this skill: /path/to/skill ...").
+  // Not a real user prompt.
+  if (/^Base directory for this skill\b/i.test(t)) return '';
+  // Drop bare tool_use_result envelopes that CC reformats as user text
+  if (/^<tool_use_result\b/.test(t) || /^<\/?tool_use\b/.test(t)) return '';
+  return t.trim();
+}
+
+// File-level cache of first user prompt — one read per session log file. Cleared
+// when file mtime changes (rare for the first line of an append-only jsonl).
+const _firstPromptCache = new Map(); // filePath -> { mtime, size, text }
+const FIRST_LINE_MAX_BYTES = 4 * 1024 * 1024; // first jsonl line can be 100s of KB (system-reminders + skills)
+
+function readFirstUserPrompt(filePath) {
+  let st;
+  try { st = statSync(filePath); } catch { return ''; }
+  if (st.size === 0) return '';
+  const cached = _firstPromptCache.get(filePath);
+  if (cached && cached.mtime === st.mtimeMs) return cached.text;
+  let fd;
+  try {
+    fd = openSync(filePath, 'r');
+    const len = Math.min(st.size, FIRST_LINE_MAX_BYTES);
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, 0);
+    closeSync(fd);
+    const nl = buf.indexOf(0x0a);
+    const lineBuf = nl >= 0 ? buf.slice(0, nl) : buf;
+    let text = '';
+    try {
+      const obj = JSON.parse(lineBuf.toString('utf-8'));
+      text = firstUserPrompt(obj);
+    } catch { /* truncated first line — skip */ }
+    _firstPromptCache.set(filePath, { mtime: st.mtimeMs, size: st.size, text });
+    return text;
+  } catch {
+    try { if (fd != null) closeSync(fd); } catch {}
+    return '';
+  }
+}
+
+// Find the latest tool_use block in the response of the latest entry, and
+// pair it with the latest tool_result across entries to decide if a tool is
+// still running on the agent's side.
+function inspectToolFlow(entries) {
+  if (!entries.length) return { lastToolUse: null, hasMatchingResult: false };
+  let lastToolUse = null;
+  // Search entries in reverse
+  for (let i = entries.length - 1; i >= 0 && !lastToolUse; i--) {
+    const e = entries[i];
+    const content = e?.response?.content;
+    if (!Array.isArray(content)) continue;
+    for (let j = content.length - 1; j >= 0; j--) {
+      const b = content[j];
+      if (b?.type === 'tool_use') {
+        lastToolUse = { id: b.id, name: b.name, input: b.input, ts: e.timestamp };
+        break;
+      }
+    }
+  }
+  if (!lastToolUse) return { lastToolUse: null, hasMatchingResult: false };
+  // tool_result lives in the *next* request's body.messages[*].content[*]
+  let hasMatchingResult = false;
+  for (const e of entries) {
+    if (!e?.timestamp || e.timestamp <= lastToolUse.ts) continue;
+    const msgs = e?.body?.messages;
+    if (!Array.isArray(msgs)) continue;
+    for (const m of msgs) {
+      if (!Array.isArray(m?.content)) continue;
+      for (const block of m.content) {
+        if (block?.type === 'tool_result' && block.tool_use_id === lastToolUse.id) {
+          hasMatchingResult = true;
+          break;
+        }
+      }
+      if (hasMatchingResult) break;
+    }
+    if (hasMatchingResult) break;
+  }
+  return { lastToolUse, hasMatchingResult };
+}
+
+function summarizeToolInput(name, input) {
+  if (!input || typeof input !== 'object') return name || 'tool';
+  if (name === 'Bash') return `Bash: ${truncate(input.command, 60)}`;
+  if (name === 'Edit' || name === 'Write') return `${name}: ${truncate(input.file_path, 60)}`;
+  if (name === 'Read') return `Read: ${truncate(input.file_path, 60)}`;
+  if (name === 'Grep') return `Grep: ${truncate(input.pattern, 60)}`;
+  if (name === 'Glob') return `Glob: ${truncate(input.pattern, 60)}`;
+  if (name === 'WebFetch') return `WebFetch: ${truncate(input.url, 60)}`;
+  if (name === 'WebSearch') return `WebSearch: ${truncate(input.query, 60)}`;
+  if (name === 'TodoWrite') return `TodoWrite (${(input.todos || []).length} items)`;
+  if (name === 'Task' || name === 'Agent') return `Task: ${truncate(input.description || input.prompt, 60)}`;
+  // generic
+  const firstStr = Object.values(input).find(v => typeof v === 'string');
+  return firstStr ? `${name}: ${truncate(firstStr, 60)}` : name;
+}
+
+function summarizeEntry(e) {
+  // Used in drawer "recent events" list
+  const ts = e?.timestamp || '';
+  const userPrompt = lastUserPrompt(e);
+  const respContent = e?.response?.content;
+  let assistantText = '';
+  let toolUse = null;
+  if (Array.isArray(respContent)) {
+    for (const b of respContent) {
+      if (b?.type === 'text' && !assistantText) assistantText = b.text || '';
+      if (b?.type === 'tool_use' && !toolUse) toolUse = b;
+    }
+  }
+  return {
+    ts,
+    inProgress: !!e?.inProgress,
+    durationMs: e?.duration || 0,
+    userPrompt: truncate(userPrompt, 120),
+    assistantText: truncate(assistantText, 120),
+    toolUse: toolUse ? summarizeToolInput(toolUse.name, toolUse.input) : '',
+  };
+}
+
+function ageString(ms) {
+  if (ms < 0) return 'just now';
+  if (ms < 5_000) return 'just now';
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s ago`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m ago`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h ago`;
+  return `${Math.round(ms / 86_400_000)}d ago`;
+}
+
+async function fetchPendingAsks(instance) {
+  // Query the instance's own /api/pending-asks (in-memory state lives there).
+  if (!instance?.port || !instance?.token) return [];
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 800);
+    const resp = await fetch(`http://127.0.0.1:${instance.port}/api/pending-asks?token=${instance.token}`, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const asks = Array.isArray(data?.pendingAsks) ? data.pendingAsks : [];
+    // ccv writes pending asks to a shared on-disk store (~/.claude/cc-viewer/ask-store.json),
+    // so every running ccv echoes the same disk entries via /api/pending-asks. The owning
+    // ccv (the one whose ask-bridge hook captured the AskUserQuestion) marks it source='memory'.
+    // Filtering to source='memory' avoids showing the same waiting-for-answer badge on every
+    // sibling ccv at the same cwd. Falls back to including untagged entries for older ccv
+    // versions that don't set source.
+    return asks.filter(a => !a.source || a.source === 'memory');
+  } catch { return []; }
+}
+
+function deriveStatus({ entries, pendingAsks, fileMtime }) {
+  const now = Date.now();
+  if (pendingAsks.length > 0) {
+    const first = pendingAsks[0];
+    const qHeader = first?.questions?.[0]?.header || first?.questions?.[0]?.question || 'question';
+    return {
+      status: 'waiting_ask',
+      label: `⏳ awaiting answer: ${truncate(qHeader, 40)}${pendingAsks.length > 1 ? ` (+${pendingAsks.length - 1})` : ''}`,
+    };
+  }
+  if (!entries.length) {
+    return { status: 'no_session', label: '⚫ no session yet' };
+  }
+  const latest = entries[entries.length - 1];
+  const latestMs = latest?.timestamp ? new Date(latest.timestamp).getTime() : fileMtime;
+  const age = now - latestMs;
+  // in-flight Claude API call
+  if (latest?.inProgress && age < 5 * 60_000) {
+    // streaming; if we already see a tool_use in partial response, surface it
+    const partialContent = latest?.response?.content;
+    if (Array.isArray(partialContent)) {
+      const toolUse = partialContent.find(b => b?.type === 'tool_use');
+      if (toolUse) return { status: 'tool_running', label: `🛠 ${summarizeToolInput(toolUse.name, toolUse.input)}` };
+    }
+    return { status: 'thinking', label: '🔵 thinking…' };
+  }
+  // Tool launched but no result yet → agent (Claude Code) is running it
+  const { lastToolUse, hasMatchingResult } = inspectToolFlow(entries);
+  if (lastToolUse && !hasMatchingResult) {
+    const toolAge = now - new Date(lastToolUse.ts).getTime();
+    if (toolAge < 10 * 60_000) {
+      return { status: 'tool_running', label: `🛠 ${summarizeToolInput(lastToolUse.name, lastToolUse.input)}` };
+    }
+  }
+  if (age > 30 * 60_000) {
+    return { status: 'idle', label: `🟢 idle ${ageString(age)}` };
+  }
+  return { status: 'idle', label: `🟢 idle ${ageString(age)}` };
+}
+
+async function getInstanceActivity(instance) {
+  const cached = _activityCache.get(instance.pid);
+  const now = Date.now();
+  if (cached && now - cached.at < ACTIVITY_CACHE_TTL_MS) return cached.payload;
+
+  const startedAtMs = instance.startedAt ? new Date(instance.startedAt).getTime() : 0;
+  // Prefer ccv's normalized project name derived from cwd (matches what ccv
+  // actually writes to disk); fall back to whatever the instance reported.
+  const normalizedName = ccvProjectName(instance.cwd) || instance.projectName;
+  // Find peers (other running ccvs) at the same cwd so we can pick distinct
+  // jsonls when multiple ccvs share a project dir — otherwise both end up
+  // showing the title of whichever jsonl was modified most recently.
+  const peers = [...instances.values()].filter(i =>
+    !i.isHub && (ccvProjectName(i.cwd) || i.projectName) === normalizedName
+  );
+  const logFile = findActiveLogFileForInstance(normalizedName, instance, peers);
+  let entries = [];
+  let fileMtime = 0;
+  let logFileName = null;
+  let title = '';
+  if (logFile) {
+    const tailed = tailJsonlEntries(logFile.path);
+    entries = tailed.entries;
+    fileMtime = tailed.mtime;
+    logFileName = basename(logFile.path);
+    title = readFirstUserPrompt(logFile.path);
+  }
+  // Pending asks lives in-memory inside the ccv process. Skip for hub itself
+  // (avoids reentrant fetch into our own server) — hubs don't run user sessions.
+  const pendingAsks = instance.isHub ? [] : await fetchPendingAsks(instance);
+
+  const status = deriveStatus({ entries, pendingAsks, fileMtime });
+  // Preview shown next to the status badge — answers "what is this session
+  // currently about". Walk back across entries because the latest entry may
+  // be a tool_result-only turn during an agentic loop. Even when the badge
+  // shows a special state (awaiting / thinking / tool_running), the preview
+  // still helps the user remember what the session was about.
+  const userText = lastUserPromptAcrossEntries(entries);
+  const preview = userText ? `user: ${truncate(userText, 120)}` : '';
+  const recent = entries.slice(-5).map(summarizeEntry).reverse();
+
+  const payload = {
+    pid: instance.pid,
+    status: status.status,
+    statusLabel: status.label,
+    preview,
+    title,
+    alias: getAlias(instance.cwd),
+    ccuseProfile: getCcuseProfile(instance.cwd),
+    lastEventAt: entries.length ? entries[entries.length - 1].timestamp : null,
+    fileMtime,
+    logFile: logFileName,
+    pendingAsks: pendingAsks.map(a => ({ id: a.id, questions: a.questions, createdAt: a.createdAt })),
+    recentEvents: recent,
+  };
+  _activityCache.set(instance.pid, { at: now, payload });
+  return payload;
+}
+// ---------- end activity probe ----------
+
 const HTML_PAGE = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -478,13 +1581,77 @@ const HTML_PAGE = `<!doctype html>
   .card.running { border-left-color:var(--ok); }
   .card.hub     { border-left-color:var(--accent); }
   .card.idle    { border-left-color:transparent; }
+
+  /* groups (running side) — same-cwd instances share a header */
+  .group { background:var(--card); border:1px solid var(--line); border-radius:10px; margin-bottom:10px; overflow:hidden; }
+  .group.is-hub { border-color:rgba(88,166,255,.25); }
+  .group-head { display:grid; grid-template-columns: minmax(0,1fr) auto; grid-template-areas:"id actions" "path actions"; gap:2px 12px; padding:10px 14px; background:var(--card-hover); border-bottom:1px solid var(--line); }
+  .group-id { grid-area:id; display:flex; align-items:center; gap:8px; flex-wrap:wrap; min-width:0; }
+  .group-id .group-name { font-weight:600; font-size:14px; }
+  .group-id .name-sub { font-size:11px; color:var(--mute); font-weight:400; }
+  .group-id .name-sub::before { content:'· '; opacity:.5; }
+  .group-id .hub-tag { font-size:10px; color:var(--accent); background:rgba(88,166,255,.12); padding:1px 6px; border-radius:3px; font-weight:600; }
+  .group-id .alias-edit { background:transparent; border:0; color:var(--mute); cursor:pointer; font-size:12px; padding:0 2px; line-height:1; opacity:0; transition:opacity .15s; }
+  .group:hover .alias-edit { opacity:.7; }
+  .group:hover .alias-edit:hover { opacity:1; color:var(--accent); }
+  .group-count { font-size:10px; color:var(--mute); background:var(--tag-bg); padding:1px 8px; border-radius:10px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .group-path { grid-area:path; color:var(--mute); font-size:11px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .group-actions { grid-area:actions; display:flex; gap:6px; align-self:center; flex-shrink:0; }
+  .group-body { padding:0; }
+  .instance { padding:9px 14px; border-top:1px solid var(--line); border-left:2px solid transparent; transition:background .15s; position:relative; }
+  .group-body > .instance:first-child { border-top:0; }
+  .instance:hover { background:var(--card-hover); }
+  .instance.running { border-left-color:var(--ok); }
+  .instance.hub { border-left-color:var(--accent); }
+  .instance-head { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:5px; }
+  .instance-head .tag.port { color:var(--ok); background:rgba(63,185,80,.12); font-weight:600; }
+  .instance-head .ext-tag { font-size:10px; color:var(--warn); background:rgba(210,153,34,.12); padding:1px 6px; border-radius:3px; font-weight:600; }
+  .instance-actions { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:6px; }
   .card-head { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
   .card-head .name { font-weight:600; font-size:13px; }
   .card-head .hub-tag { font-size:10px; color:var(--accent); background:rgba(88,166,255,.12); padding:1px 6px; border-radius:3px; font-weight:600; }
+  .card-head .ext-tag { font-size:10px; color:var(--warn); background:rgba(210,153,34,.12); padding:1px 6px; border-radius:3px; font-weight:600; }
+  .card-head .name-sub { font-size:11px; color:var(--mute); font-weight:400; margin-left:2px; }
+  .card-head .name-sub::before { content:'· '; opacity:.5; }
+  .card-head .alias-edit { background:transparent; border:0; color:var(--mute); cursor:pointer; font-size:12px; padding:0 4px; line-height:1; opacity:0; transition:opacity .15s; }
+  .card:hover .alias-edit { opacity:1; }
+  .card-head .alias-edit:hover { color:var(--accent); }
   .tag { display:inline-block; font-size:11px; color:var(--mute); background:var(--tag-bg); padding:1px 7px; border-radius:3px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   .card-path { color:var(--mute); font-size:11px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:6px; }
+  .card-title { color:var(--fg); font-size:12px; line-height:1.4; margin:2px 0 6px; padding-left:8px; border-left:2px solid var(--accent); opacity:.85; max-height:34px; overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+  .card-title:empty { display:none; }
   .card-meta { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
   .card-actions { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+
+  /* activity status */
+  .activity-row { display:flex; align-items:center; gap:8px; margin:4px 0 8px; font-size:11px; min-height:18px; }
+  .badge { display:inline-flex; align-items:center; gap:4px; font-size:10px; font-weight:600; padding:2px 8px; border-radius:10px; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .badge.thinking     { color:#58a6ff; background:rgba(88,166,255,.12); }
+  .badge.tool_running { color:#d29922; background:rgba(210,153,34,.15); }
+  .badge.waiting_ask  { color:#f85149; background:rgba(248,81,73,.15); animation:pulseAsk 1.5s ease-in-out infinite; }
+  .badge.idle         { color:#3fb950; background:rgba(63,185,80,.10); }
+  .badge.no_session   { color:var(--mute); background:var(--tag-bg); }
+  .badge.error        { color:#f85149; background:rgba(248,81,73,.10); }
+  @keyframes pulseAsk { 0%,100%{opacity:1} 50%{opacity:.55} }
+  .preview { color:var(--mute); font-size:11px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .activity-toggle { background:transparent; border:0; color:var(--mute); cursor:pointer; font-size:11px; padding:0 4px; user-select:none; }
+  .activity-toggle:hover { color:var(--accent); }
+  .activity-drawer { display:none; margin:6px 0 8px; padding:8px 10px; background:#0d1117; border:1px solid var(--line); border-radius:6px; font-size:11px; }
+  .activity-drawer.open { display:block; }
+  .drawer-section { margin-bottom:8px; }
+  .drawer-section:last-child { margin-bottom:0; }
+  .drawer-h { font-size:10px; color:var(--mute); text-transform:uppercase; letter-spacing:.5px; margin-bottom:4px; }
+  .event-row { padding:4px 0; border-bottom:1px dotted var(--line); display:flex; gap:8px; align-items:flex-start; }
+  .event-row:last-child { border-bottom:0; }
+  .event-ts { color:var(--mute); font-size:10px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; flex-shrink:0; min-width:54px; }
+  .event-body { flex:1; min-width:0; }
+  .event-line { color:var(--fg); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .event-line.user { color:#a5d6ff; }
+  .event-line.tool { color:#d29922; }
+  .event-line.assistant { color:var(--fg); opacity:.85; }
+  .event-line.flag { color:#58a6ff; font-style:italic; }
+  .ask-row { padding:4px 6px; background:rgba(248,81,73,.08); border-radius:4px; margin-bottom:3px; color:#f0a4a0; }
+  .ask-row:last-child { margin-bottom:0; }
 
   /* buttons */
   .btn { display:inline-flex; align-items:center; gap:4px; background:transparent; color:var(--fg); border:1px solid var(--line); padding:4px 10px; border-radius:5px; cursor:pointer; font-size:11px; font-family:inherit; transition:all .15s; white-space:nowrap; }
@@ -532,6 +1699,46 @@ const HTML_PAGE = `<!doctype html>
   #term-bar button:hover { border-color:var(--bad); color:var(--bad); }
   #term-container { flex:1; overflow:hidden; }
 
+  /* ccv inline overlay — embeds the ccv UI in an iframe so user can open/close
+     a session without leaving the launcher tab */
+  #ccv-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:100; }
+  #ccv-overlay.open { display:flex; flex-direction:column; }
+  #ccv-bar { display:flex; align-items:center; gap:8px; padding:6px 14px; background:var(--card); border-bottom:1px solid var(--line); }
+  #ccv-bar .type-tag { font-size:10px; font-weight:600; padding:2px 7px; border-radius:3px; }
+  #ccv-bar .type-tag.ccv-tag { color:var(--ok); background:rgba(63,185,80,.14); }
+  #ccv-bar .name { font-weight:600; font-size:12px; }
+  #ccv-bar .port { font-size:11px; color:var(--mute); font-family:ui-monospace,monospace; }
+  #ccv-bar .path { color:var(--mute); font-size:11px; font-family:ui-monospace,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #ccv-bar .grow { flex:1; min-width:0; }
+  #ccv-bar button { background:transparent; color:var(--mute); border:1px solid var(--line); padding:3px 10px; border-radius:4px; cursor:pointer; font-size:11px; font-family:inherit; }
+  #ccv-bar button:hover { border-color:var(--accent); color:var(--accent); }
+  #ccv-bar #ccv-close:hover { border-color:var(--bad); color:var(--bad); }
+  #ccv-frame { flex:1; width:100%; border:0; background:#0d1117; }
+  /* iframe state overlay — covers the frame area while loading or on failure.
+     We can't peek inside cross-origin ccv to know when SPA finished rendering,
+     so we treat iframe.onload as "good enough" + watchdog as failure signal. */
+  #ccv-frame-status { display:none; position:absolute; left:0; right:0; bottom:0; top:42px; background:#0d1117; align-items:center; justify-content:center; flex-direction:column; gap:14px; color:var(--mute); font-size:13px; pointer-events:none; }
+  #ccv-frame-status.show { display:flex; pointer-events:auto; }
+  #ccv-frame-status .spinner { width:32px; height:32px; border:3px solid var(--line); border-top-color:var(--accent); border-radius:50%; animation:ccvSpin 0.9s linear infinite; }
+  @keyframes ccvSpin { to { transform:rotate(360deg); } }
+  #ccv-frame-status .err-title { color:var(--bad); font-weight:600; font-size:14px; }
+  #ccv-frame-status .err-detail { font-size:11px; max-width:480px; text-align:center; line-height:1.5; }
+  #ccv-frame-status .err-actions { display:flex; gap:8px; }
+  #ccv-frame-status .err-actions button { background:transparent; color:var(--mute); border:1px solid var(--line); padding:5px 12px; border-radius:4px; cursor:pointer; font-size:11px; font-family:inherit; }
+  #ccv-frame-status .err-actions button:hover { border-color:var(--accent); color:var(--accent); }
+
+  /* local CC sessions section */
+  .section-hd .dot.amber { background:var(--warn); }
+  .local-cc-card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 14px; margin-bottom:8px; border-left:2px solid var(--warn); display:grid; grid-template-columns: minmax(0,1fr) auto; grid-template-areas:"id actions" "path actions" "meta actions"; gap:3px 12px; }
+  .local-cc-card:hover { background:var(--card-hover); }
+  .local-cc-id { grid-area:id; display:flex; align-items:center; gap:8px; flex-wrap:wrap; min-width:0; }
+  .local-cc-id .name { font-weight:600; font-size:13px; }
+  .local-cc-id .session-tag { font-size:10px; color:var(--mute); background:var(--tag-bg); padding:1px 7px; border-radius:3px; font-family:ui-monospace,monospace; }
+  .local-cc-id .bare-tag { font-size:10px; color:var(--warn); background:rgba(210,153,34,.12); padding:1px 6px; border-radius:3px; font-weight:600; }
+  .local-cc-path { grid-area:path; color:var(--mute); font-size:11px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .local-cc-meta { grid-area:meta; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .local-cc-actions { grid-area:actions; display:flex; gap:6px; align-self:center; flex-shrink:0; }
+
   /* pair notification banner */
   .pair-banner { background:rgba(210,153,34,.1); border:1px solid var(--warn); border-radius:8px; padding:10px 14px; margin-bottom:12px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .pair-banner .pair-info { flex:1; min-width:200px; }
@@ -567,11 +1774,42 @@ const HTML_PAGE = `<!doctype html>
   <div id="term-container"></div>
 </div>
 
+<div id="ccv-overlay">
+  <div id="ccv-bar">
+    <span class="type-tag ccv-tag">CCV</span>
+    <span class="name" id="ccv-name"></span>
+    <span class="port" id="ccv-port"></span>
+    <span class="grow"><span class="path" id="ccv-path"></span></span>
+    <button id="ccv-newtab" title="在新标签页打开">↗</button>
+    <button id="ccv-reload" title="刷新">⟳</button>
+    <button id="ccv-close" title="关闭 (Esc)">Close</button>
+  </div>
+  <iframe id="ccv-frame" src="about:blank" allow="clipboard-read; clipboard-write; fullscreen"></iframe>
+  <div id="ccv-frame-status">
+    <div data-state="loading" style="display:flex; flex-direction:column; align-items:center; gap:14px;">
+      <div class="spinner"></div>
+      <div>Loading ccv…</div>
+    </div>
+    <div data-state="error" style="display:none; flex-direction:column; align-items:center; gap:10px;">
+      <div class="err-title">⚠ Failed to load ccv</div>
+      <div class="err-detail" id="ccv-frame-err-detail">The ccv at this port did not respond. It may have just restarted or be in the middle of starting up.</div>
+      <div class="err-actions">
+        <button id="ccv-frame-retry">Retry</button>
+        <button id="ccv-frame-newtab">Open in new tab</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <dialog id="dlg">
   <h2>Launch new instance</h2>
   <div style="color:var(--mute);font-size:11px;margin-bottom:4px">Directory:</div>
   <input id="cwd" placeholder="/path/to/project">
   <div class="tree" id="tree"></div>
+  <div style="color:var(--mute);font-size:11px;margin:8px 0 4px">ccuse profile (claude 后端):</div>
+  <select id="ccuse-select" style="width:100%;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px;font-size:12px">
+    <option value="">— 不切 (用 launcher 默认) —</option>
+  </select>
   <div class="err" id="err" hidden></div>
   <div class="row">
     <button class="btn" id="btn-cancel">Cancel</button>
@@ -612,52 +1850,145 @@ const HTML_PAGE = `<!doctype html>
     return Math.floor(ms/1000) + 's';
   }
 
-  function render(items, history) {
-    const total = items.length + (history || []).length;
-    metaEl.textContent = items.length + ' running' + (history && history.length ? ' · ' + history.length + ' recent' : '');
+  function renderInstance(it) {
+    const cls = it.isHub ? 'instance hub' : 'instance running';
+    const name = escape(it.displayName || it.projectName || '?');
+    const path = escape(it.cwd || '');
+    const pub = escape(it.publicUrl || '');
+    const lan = escape(it.lanUrl || '');
+    const openHref = pub || lan || '#';
+    let actions = ''
+      + '<button class="btn primary" data-act="open" data-href="'+escape(openHref)+'" data-port="'+(it.port||'')+'" data-name="'+name+'" data-path="'+path+'">Open</button>'
+      + '<button class="btn" data-act="open-newtab" data-href="'+escape(openHref)+'" data-port="'+(it.port||'')+'" title="在新标签页打开">↗</button>'
+      + '<button class="btn" data-act="copy" data-text="'+(pub||lan)+'">Copy</button>';
+    if (!it.isHub) {
+      actions += '<button class="btn" data-act="console" data-port="'+(it.port||'')+'" data-token="'+(it.token||'')+'" data-name="'+name+'" data-path="'+path+'" data-pub="'+(it.publicUrl||'')+'" data-lan="'+(it.lanUrl||'')+'">Console</button>';
+      actions += '<button class="btn danger" data-act="stop" data-pid="'+it.pid+'" data-name="'+name+'">Stop</button>';
+    }
+    return ''
+      + '<div class="'+cls+'" data-pid="'+it.pid+'">'
+      +   '<div class="instance-head">'
+      +     '<span class="tag port">:'+(it.port||'?')+'</span>'
+      +     '<span class="tag">pid '+it.pid+'</span>'
+      +     '<span class="tag">up '+fmtAge(it.startedAt)+'</span>'
+      +     (it.version ? '<span class="tag">'+escape(it.version)+'</span>' : '')
+      +     (it.external ? '<span class="ext-tag" title="外部发现 — 此 ccv 在 launcher 插件加载前就已经启动，没自动注册到 runtime/，由 launcher 通过 lsof + /api/version-info 反向发现并接管">外部</span>' : '')
+      +   '</div>'
+      +   '<div class="card-title" data-title-for="' + it.pid + '"></div>'
+      +   '<div class="activity-row" data-act-row="' + it.pid + '">'
+      +     '<span class="badge no_session">⚫ probing…</span>'
+      +     '<span class="preview"></span>'
+      +     (it.isHub ? '' : '<button class="activity-toggle" data-act="actdrawer" data-pid="' + it.pid + '" title="show recent activity">▾</button>')
+      +   '</div>'
+      +   (it.isHub ? '' : '<div class="activity-drawer" data-act-drawer="' + it.pid + '"></div>')
+      +   '<details><summary>URLs &middot; QR</summary>'
+      +     (lan ? '<div class="url-row">LAN: <a href="#" data-act="copy" data-text="'+lan+'">'+lan+'</a></div>':'')
+      +     (pub ? '<div class="url-row">Public: <a href="#" data-act="copy" data-text="'+pub+'">'+pub+'</a></div>':'')
+      +     (pub ? '<div class="qr" data-qr="'+pub+'"></div>':'')
+      +   '</details>'
+      +   '<div class="instance-actions">' + actions + '</div>'
+      + '</div>';
+  }
+
+  function renderGroup(g) {
+    const first = g.list[0];
+    const path = escape(g.cwd || '');
+    const projName = escape(first.displayName || first.projectName || '?');
+    const aliasRaw = first.alias || '';
+    const aliasEsc = aliasRaw ? escape(aliasRaw) : '';
+    const showName = aliasEsc || projName;
+    const subName = aliasEsc ? '<span class="name-sub" title="real project name">' + projName + '</span>' : '';
+    const aliasBtn = g.hasHub ? '' : '<button class="alias-edit" data-act="alias" data-cwd="'+escape(g.cwd||'')+'" data-current="'+aliasEsc+'" title="编辑别名 (Launcher 自己的别名,跟 ccv 内置别名不同步)">✎</button>';
+    const groupActions = g.hasHub ? '' :
+        '<button class="btn" data-act="newhere" data-cwd="'+path+'" data-name="'+projName+'" title="Spawn another ccv at the same directory">+ New</button>'
+      + '<button class="btn" data-act="openterm" data-cwd="'+path+'" data-name="'+projName+'">Shell</button>';
+    const count = g.list.length;
+    const countTag = count > 1 ? '<span class="group-count">× ' + count + '</span>' : '';
+    const body = g.list.map(renderInstance).join('');
+    return ''
+      + '<div class="group' + (g.hasHub ? ' is-hub' : '') + '">'
+      +   '<div class="group-head">'
+      +     '<div class="group-id">'
+      +       '<span class="group-name">' + showName + '</span>'
+      +       subName
+      +       aliasBtn
+      +       countTag
+      +       (g.hasHub ? '<span class="hub-tag">HUB</span>' : '')
+      +     '</div>'
+      +     '<div class="group-path" title="'+path+'">'+path+'</div>'
+      +     (groupActions ? '<div class="group-actions">' + groupActions + '</div>' : '')
+      +   '</div>'
+      +   '<div class="group-body">' + body + '</div>'
+      + '</div>';
+  }
+
+  function render(items, history, localCc) {
+    const total = items.length + (history || []).length + ((localCc || []).length);
+    metaEl.textContent = items.length + ' running'
+      + (localCc && localCc.length ? ' · ' + localCc.length + ' local' : '')
+      + (history && history.length ? ' · ' + history.length + ' recent' : '');
     if (!total) {
       listEl.innerHTML = '<div class="empty">No instances yet. Click "+ New" to launch one.</div>';
       return;
     }
-    items.sort((a,b) => (b.isHub?1:0) - (a.isHub?1:0) || (a.port||0) - (b.port||0));
-    let html = '<div class="section-hd"><span class="dot green"></span>Running (' + items.length + ')</div>';
-    html += items.map(it => {
-      const cls = it.isHub ? 'card hub' : 'card running';
-      const name = escape(it.projectName || '?');
-      const path = escape(it.cwd || '');
-      const pub = escape(it.publicUrl || '');
-      const lan = escape(it.lanUrl || '');
-      const openHref = pub || lan || '#';
-      let actions = ''
-        + '<button class="btn primary" data-act="open" data-href="'+escape(openHref)+'" data-port="'+(it.port||'')+'">Open</button>'
-        + '<button class="btn" data-act="copy" data-text="'+(pub||lan)+'">Copy URL</button>';
-      if (!it.isHub) {
-        actions += '<button class="btn" data-act="newhere" data-cwd="'+path+'" data-name="'+name+'" title="Spawn another ccv at the same directory">+ New</button>';
-        actions += '<button class="btn" data-act="openterm" data-cwd="'+path+'" data-name="'+name+'">Shell</button>';
-        actions += '<button class="btn" data-act="console" data-port="'+(it.port||'')+'" data-token="'+(it.token||'')+'" data-name="'+name+'" data-path="'+path+'" data-pub="'+(it.publicUrl||'')+'" data-lan="'+(it.lanUrl||'')+'">Console</button>';
-        actions += '<button class="btn danger" data-act="stop" data-pid="'+it.pid+'" data-name="'+name+'">Stop</button>';
-      }
-      return ''
-        + '<div class="'+cls+'" data-pid="'+it.pid+'">'
-        +   '<div class="card-head">'
-        +     '<span class="name">'+name+'</span>'
-        +     (it.isHub ? '<span class="hub-tag">HUB</span>' : '')
-        +   '</div>'
-        +   '<div class="card-path" title="'+path+'">'+path+'</div>'
-        +   '<div class="card-meta">'
-        +     '<span class="tag">:' + (it.port||'?') + '</span>'
-        +     '<span class="tag">pid ' + it.pid + '</span>'
-        +     '<span class="tag">up ' + fmtAge(it.startedAt) + '</span>'
-        +     (it.version ? '<span class="tag">' + escape(it.version) + '</span>' : '')
-        +   '</div>'
-        +   '<details><summary>URLs &middot; QR</summary>'
-        +     (lan ? '<div class="url-row">LAN: <a href="#" data-act="copy" data-text="'+lan+'">'+lan+'</a></div>':'')
-        +     (pub ? '<div class="url-row">Public: <a href="#" data-act="copy" data-text="'+pub+'">'+pub+'</a></div>':'')
-        +     (pub ? '<div class="qr" data-qr="'+pub+'"></div>':'')
-        +   '</details>'
-        +   '<div class="card-actions">' + actions + '</div>'
-        + '</div>';
-    }).join('');
+    // Group running instances by cwd. Same cwd → one rounded container with a
+    // shared header (alias / projectName / path / cwd-level actions) and a list
+    // of compact instance rows underneath. Cuts down on repeated path/name
+    // chrome when you have multiple ccvs in the same project.
+    const groupMap = new Map();
+    for (const it of items) {
+      const key = it.cwd || '';
+      if (!groupMap.has(key)) groupMap.set(key, []);
+      groupMap.get(key).push(it);
+    }
+    const groups = [];
+    for (const [cwd, list] of groupMap) {
+      list.sort((a,b) => (b.isHub?1:0) - (a.isHub?1:0) || (a.port||0) - (b.port||0));
+      const minPort = Math.min(...list.map(x => x.port || 99999));
+      const hasHub = list.some(x => x.isHub);
+      groups.push({ cwd, list, minPort, hasHub });
+    }
+    groups.sort((a,b) => (b.hasHub?1:0) - (a.hasHub?1:0) || a.minPort - b.minPort);
+
+    const projectsLabel = groups.length === 1 ? 'project' : 'projects';
+    let html = '';
+    if (items.length) {
+      html += '<div class="section-hd"><span class="dot green"></span>Running (' + items.length + ' · ' + groups.length + ' ' + projectsLabel + ')</div>';
+      html += groups.map(renderGroup).join('');
+    }
+
+    // Local CC sessions — bare claude processes the user started in a terminal,
+    // not yet under any ccv. Offer a one-click "Takeover" that kills the bare
+    // process and relaunches ccv -r <session-id> so the next prompt is recorded.
+    if (localCc && localCc.length) {
+      html += '<div class="section-hd" style="margin-top:16px"><span class="dot amber"></span>Local CC sessions (' + localCc.length + ') <span style="text-transform:none;font-weight:400;letter-spacing:0;color:var(--mute);margin-left:6px">— 本地裸跑的 claude,未被 ccv 接管</span></div>';
+      html += localCc.map(s => {
+        const cwd = s.cwd || '';
+        const name = escape(cwd ? cwd.split('/').pop() || cwd : '?');
+        const path = escape(cwd);
+        const sidShort = (s.sessionId || '').slice(0, 8);
+        const lastAgo = s.lastEntryAt ? fmtAge(s.lastEntryAt) + ' ago' : '';
+        const upAge = s.startedAt ? fmtAge(s.startedAt) : '';
+        return ''
+          + '<div class="local-cc-card" data-pid="'+s.pid+'">'
+          +   '<div class="local-cc-id">'
+          +     '<span class="name">'+name+'</span>'
+          +     '<span class="bare-tag" title="本地裸跑,未被 ccv 接管">未接管</span>'
+          +     (sidShort ? '<span class="session-tag" title="session id '+escape(s.sessionId||'')+'">'+sidShort+'</span>' : '')
+          +   '</div>'
+          +   '<div class="local-cc-path" title="'+path+'">'+path+'</div>'
+          +   '<div class="local-cc-meta">'
+          +     '<span class="tag">pid '+s.pid+'</span>'
+          +     (upAge ? '<span class="tag">up '+upAge+'</span>' : '')
+          +     (lastAgo ? '<span class="tag">last msg '+lastAgo+'</span>' : '')
+          +   '</div>'
+          +   '<div class="local-cc-actions">'
+          +     '<button class="btn primary" data-act="takeover" data-pid="'+s.pid+'" data-session="'+escape(s.sessionId||'')+'" data-cwd="'+path+'" data-name="'+name+'" title="终止本地 claude → 在新 Terminal 里启动 ccv -r 接上 session">接管 ▶</button>'
+          +     '<button class="btn" data-act="openterm" data-cwd="'+path+'" data-name="'+name+'">Shell</button>'
+          +   '</div>'
+          + '</div>';
+      }).join('');
+    }
 
     if (history && history.length) {
       history.sort((a,b) => new Date(b.lastUsed) - new Date(a.lastUsed));
@@ -726,6 +2057,8 @@ const HTML_PAGE = `<!doctype html>
     ev.preventDefault();
     const act = t.dataset.act;
     if (act === 'open') {
+      openCcvInline(t.dataset.href, t.dataset.name || ('ccv :' + (t.dataset.port||'')), t.dataset.port || '', t.dataset.path || '');
+    } else if (act === 'open-newtab') {
       // Reuse the per-instance tab on repeat clicks: a stable window name
       // (keyed by port) makes browsers focus the existing tab instead of
       // spawning a fresh one that has to reload from scratch.
@@ -741,6 +2074,15 @@ const HTML_PAGE = `<!doctype html>
     } else if (act === 'launch') {
       try { await api('/api/launcher/spawn', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd: t.dataset.cwd }) }); refresh(); }
       catch (e) { alert('Launch failed: ' + e.message); }
+    } else if (act === 'alias') {
+      const cwd = t.dataset.cwd;
+      const current = t.dataset.current || '';
+      const next = window.prompt('设置别名（≤32 字符，留空清除；只在 launcher 内部生效，跟 ccv 自己的别名不同步）', current);
+      if (next === null) return; // cancel
+      try {
+        await api('/api/launcher/prefs/alias', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd, alias: next.trim() }) });
+        refresh();
+      } catch (e) { alert('保存别名失败: ' + e.message); }
     } else if (act === 'newhere') {
       const prev = t.textContent;
       t.disabled = true; t.textContent = 'Launching…';
@@ -757,6 +2099,22 @@ const HTML_PAGE = `<!doctype html>
       openConsole(t.dataset.port, t.dataset.token, t.dataset.name, t.dataset.path, t.dataset.pub, t.dataset.lan);
     } else if (act === 'openterm') {
       openShell(t.dataset.cwd, t.dataset.name || t.dataset.cwd);
+    } else if (act === 'takeover') {
+      const pid = parseInt(t.dataset.pid, 10);
+      const sessionId = t.dataset.session;
+      const cwd = t.dataset.cwd;
+      const name = t.dataset.name || cwd;
+      if (!confirm('接管本地 cc session?\\n\\n会做这些事:\\n  1. SIGTERM kill pid ' + pid + '（你那个 terminal 里的 claude 会退出）\\n  2. 打开新的 Terminal 窗口在 ' + name + '\\n  3. 跑 ccv -r ' + (sessionId||'').slice(0,8) + '… 接上原 session\\n\\n确定继续?')) return;
+      const prev = t.textContent;
+      t.disabled = true; t.textContent = '接管中…';
+      try {
+        await api('/api/launcher/takeover-cc-session', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ pid, sessionId, cwd }) });
+        // Give Terminal.app + ccv a beat to register before refreshing
+        setTimeout(refresh, 1500);
+      } catch (e) {
+        alert('接管失败: ' + e.message);
+        t.disabled = false; t.textContent = prev;
+      }
     }
   });
 
@@ -951,13 +2309,229 @@ const HTML_PAGE = `<!doctype html>
     if (e.key === 'Escape' && termOverlay.classList.contains('open')) closeTerminal();
   });
 
+  // ---- ccv inline overlay (iframe) ----
+  // Open a ccv session inside the launcher tab via an iframe. Lets the user
+  // bounce between sessions without losing the launcher state. Closing clears
+  // the iframe src to free the WebSocket; reopening reloads from scratch.
+  const ccvOverlay = document.getElementById('ccv-overlay');
+  const ccvFrame = document.getElementById('ccv-frame');
+  const ccvName = document.getElementById('ccv-name');
+  const ccvPort = document.getElementById('ccv-port');
+  const ccvPath = document.getElementById('ccv-path');
+  const ccvFrameStatus = document.getElementById('ccv-frame-status');
+  const ccvFrameStatusLoading = ccvFrameStatus.querySelector('[data-state="loading"]');
+  const ccvFrameStatusError = ccvFrameStatus.querySelector('[data-state="error"]');
+  const ccvFrameErrDetail = document.getElementById('ccv-frame-err-detail');
+  let _ccvLastHref = '';
+  let _ccvLoadWatchdog = null;
+  let _ccvLoadStartedAt = 0;
+
+  function setCcvFrameState(state, detail) {
+    if (state === 'ok') {
+      ccvFrameStatus.classList.remove('show');
+      return;
+    }
+    ccvFrameStatus.classList.add('show');
+    if (state === 'loading') {
+      ccvFrameStatusLoading.style.display = 'flex';
+      ccvFrameStatusError.style.display = 'none';
+    } else { // error
+      ccvFrameStatusLoading.style.display = 'none';
+      ccvFrameStatusError.style.display = 'flex';
+      if (detail) ccvFrameErrDetail.textContent = detail;
+    }
+  }
+
+  function openCcvInline(href, name, port, path) {
+    if (!href || href === '#') return;
+    ccvName.textContent = name || '';
+    ccvPort.textContent = port ? ':' + port : '';
+    ccvPath.textContent = path || '';
+    // Always force a reload, even when reopening the same href — the ccv on
+    // that port may have restarted (token rotated) since we last loaded it,
+    // and a stale src would silently 403 → black screen. Setting src to
+    // about:blank first then to the target URL guarantees a fresh load even
+    // when href === current src.
+    setCcvFrameState('loading');
+    _ccvLoadStartedAt = Date.now();
+    ccvFrame.src = 'about:blank';
+    // Wait for blank to commit before navigating to target — otherwise some
+    // browsers coalesce the two navigations and the load event fires for blank.
+    requestAnimationFrame(() => {
+      ccvFrame.src = href;
+      _ccvLastHref = href;
+    });
+    ccvOverlay.classList.add('open');
+    // Watchdog: if ccv doesn't respond in 6s we surface a retry/new-tab UI
+    // instead of leaving the user staring at black. ccv's index.html is
+    // ~1.6KB + a few module chunks; on localhost this should always finish in
+    // well under a second when ccv is healthy.
+    if (_ccvLoadWatchdog) clearTimeout(_ccvLoadWatchdog);
+    _ccvLoadWatchdog = setTimeout(() => {
+      // Only surface error if we haven't seen a successful load
+      if (ccvFrameStatus.classList.contains('show')) {
+        setCcvFrameState('error', 'Timed out waiting for ccv to respond. The instance may have just been restarted, or the iframe was blocked.');
+      }
+    }, 6000);
+  }
+  function closeCcvInline() {
+    ccvOverlay.classList.remove('open');
+    if (_ccvLoadWatchdog) { clearTimeout(_ccvLoadWatchdog); _ccvLoadWatchdog = null; }
+    // Free the iframe so WebSocket / streaming connections drop. Reopening
+    // means a fresh load — ccv boots fast enough that this is the right
+    // tradeoff vs leaking N hidden iframes.
+    ccvFrame.src = 'about:blank';
+    _ccvLastHref = '';
+    setCcvFrameState('ok');
+  }
+  ccvFrame.addEventListener('load', () => {
+    // load fires for both about:blank and the real navigation; only count the
+    // real one (i.e., when src is not about:blank).
+    const src = ccvFrame.getAttribute('src') || '';
+    if (src === 'about:blank' || src === '') return;
+    // Tiny grace so SPA module imports get a chance to start rendering before
+    // we reveal the iframe — avoids a brief flash of pre-React DOM.
+    setTimeout(() => setCcvFrameState('ok'), 120);
+    if (_ccvLoadWatchdog) { clearTimeout(_ccvLoadWatchdog); _ccvLoadWatchdog = null; }
+  });
+  document.getElementById('ccv-close').addEventListener('click', closeCcvInline);
+  document.getElementById('ccv-reload').addEventListener('click', () => {
+    if (_ccvLastHref) openCcvInline(_ccvLastHref, ccvName.textContent, (ccvPort.textContent||'').replace(/^:/,''), ccvPath.textContent);
+  });
+  document.getElementById('ccv-frame-retry').addEventListener('click', () => {
+    if (_ccvLastHref) openCcvInline(_ccvLastHref, ccvName.textContent, (ccvPort.textContent||'').replace(/^:/,''), ccvPath.textContent);
+  });
+  document.getElementById('ccv-frame-newtab').addEventListener('click', () => {
+    if (!_ccvLastHref) return;
+    const winName = ccvPort.textContent ? 'ccv-' + ccvPort.textContent.replace(/^:/,'') : '_blank';
+    const w = window.open(_ccvLastHref, winName);
+    if (w) { try { w.focus(); } catch {} }
+    closeCcvInline();
+  });
+  document.getElementById('ccv-newtab').addEventListener('click', () => {
+    if (!_ccvLastHref) return;
+    const winName = ccvPort.textContent ? 'ccv-' + ccvPort.textContent.replace(/^:/,'') : '_blank';
+    const w = window.open(_ccvLastHref, winName);
+    if (w) { try { w.focus(); } catch {} }
+    closeCcvInline();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && ccvOverlay.classList.contains('open')) closeCcvInline();
+  });
+
   async function refresh() {
     try {
       const data = await api('/api/launcher/list');
-      render(data.instances || [], data.history || []);
+      render(data.instances || [], data.history || [], data.localCcSessions || []);
+      refreshActivity();
     }
     catch (e) { listEl.innerHTML = '<div class="empty err">'+escape(e.message)+'</div>'; }
   }
+
+  // ---- activity poll: per-card status badge + preview + drawer ----
+  function eventLineHtml(ev) {
+    const parts = [];
+    const ts = ev.ts ? new Date(ev.ts).toLocaleTimeString([], { hour12:false }) : '';
+    let body = '';
+    if (ev.userPrompt) body += '<div class="event-line user">user · ' + escape(ev.userPrompt) + '</div>';
+    if (ev.toolUse)    body += '<div class="event-line tool">🛠 ' + escape(ev.toolUse) + (ev.inProgress ? ' <span class="event-line flag">…streaming</span>' : '') + '</div>';
+    if (ev.assistantText && !ev.toolUse) body += '<div class="event-line assistant">claude · ' + escape(ev.assistantText) + '</div>';
+    if (!body) body = '<div class="event-line assistant">' + (ev.inProgress ? 'streaming…' : 'request') + '</div>';
+    parts.push('<div class="event-row"><span class="event-ts">' + escape(ts) + '</span><div class="event-body">' + body + '</div></div>');
+    return parts.join('');
+  }
+
+  function renderDrawer(act) {
+    const sections = [];
+    if (act.pendingAsks && act.pendingAsks.length) {
+      const items = act.pendingAsks.map(a => {
+        const q = (a.questions && a.questions[0]) || {};
+        const label = q.header || q.question || '(question)';
+        return '<div class="ask-row">⏳ ' + escape(label) + '</div>';
+      }).join('');
+      sections.push('<div class="drawer-section"><div class="drawer-h">pending asks (' + act.pendingAsks.length + ')</div>' + items + '</div>');
+    }
+    if (act.recentEvents && act.recentEvents.length) {
+      const rows = act.recentEvents.map(eventLineHtml).join('');
+      sections.push('<div class="drawer-section"><div class="drawer-h">recent activity</div>' + rows + '</div>');
+    } else {
+      sections.push('<div class="drawer-section"><div class="drawer-h">recent activity</div><div class="event-line assistant">no entries</div></div>');
+    }
+    if (act.logFile) {
+      sections.push('<div class="drawer-section"><div class="drawer-h">log file</div><div class="event-line assistant">' + escape(act.logFile) + '</div></div>');
+    }
+    return sections.join('');
+  }
+
+  async function refreshActivity() {
+    let data;
+    try { data = await api('/api/launcher/activity'); }
+    catch (e) { return; }
+    const acts = data.activity || [];
+    for (const act of acts) {
+      const row = document.querySelector('[data-act-row="' + act.pid + '"]');
+      if (!row) continue;
+      const badge = row.querySelector('.badge');
+      const preview = row.querySelector('.preview');
+      if (badge) {
+        badge.className = 'badge ' + (act.status || 'no_session');
+        badge.textContent = act.statusLabel || '';
+      }
+      if (preview) preview.textContent = act.preview || '';
+      const titleEl = document.querySelector('[data-title-for="' + act.pid + '"]');
+      if (titleEl) {
+        if (act.title) {
+          titleEl.textContent = act.title;
+          titleEl.title = act.title; // full text on hover
+        } else {
+          titleEl.textContent = '';
+          titleEl.removeAttribute('title');
+        }
+      }
+      const drawer = document.querySelector('[data-act-drawer="' + act.pid + '"]');
+      if (drawer) {
+        drawer.dataset.payload = JSON.stringify(act);
+        if (drawer.classList.contains('open')) drawer.innerHTML = renderDrawer(act);
+      }
+    }
+  }
+
+  // Drawer toggle (delegate click)
+  listEl.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-act="actdrawer"]');
+    if (!t) return;
+    e.preventDefault();
+    const pid = t.dataset.pid;
+    const drawer = document.querySelector('[data-act-drawer="' + pid + '"]');
+    if (!drawer) return;
+    const opening = !drawer.classList.contains('open');
+    drawer.classList.toggle('open', opening);
+    t.textContent = opening ? '▴' : '▾';
+    if (opening) {
+      let payload = null;
+      try { payload = drawer.dataset.payload ? JSON.parse(drawer.dataset.payload) : null; } catch {}
+      if (payload) drawer.innerHTML = renderDrawer(payload);
+      else drawer.innerHTML = '<div class="drawer-section"><div class="event-line assistant">loading…</div></div>';
+      // Pull fresh state on open
+      api('/api/launcher/instances/' + pid + '/activity').then(d => {
+        drawer.dataset.payload = JSON.stringify(d);
+        if (drawer.classList.contains('open')) drawer.innerHTML = renderDrawer(d);
+      }).catch(() => { /* keep stale view */ });
+    }
+  });
+
+  // 3s poll while page visible
+  let _activityTimer = null;
+  function startActivityPolling() {
+    if (_activityTimer) return;
+    _activityTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') refreshActivity();
+    }, 3000);
+  }
+  startActivityPolling();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') refreshActivity();
+  });
 
   // dir browser
   let _curDir = '';
@@ -984,20 +2558,48 @@ const HTML_PAGE = `<!doctype html>
   cwdInput.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') { ev.preventDefault(); loadDir(cwdInput.value.trim()); }
   });
-  document.getElementById('btn-new').onclick = () => { errEl.hidden = true; loadDir(_curDir || ''); dlg.showModal(); };
+  document.getElementById('btn-new').onclick = () => { errEl.hidden = true; loadDir(_curDir || ''); loadCcuseProfiles(); dlg.showModal(); };
   document.getElementById('btn-cancel').onclick = () => dlg.close();
   document.getElementById('btn-launch').onclick = async () => {
     errEl.hidden = true;
     const cwd = cwdInput.value.trim();
     if (!cwd) { errEl.textContent='Pick a directory first'; errEl.hidden=false; return; }
     const btn = document.getElementById('btn-launch');
+    const ccuseSelect = document.getElementById('ccuse-select');
+    const ccuseProfile = ccuseSelect ? ccuseSelect.value : '';
     btn.disabled = true; btn.textContent = 'Launching…';
     try {
-      await api('/api/launcher/spawn', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd }) });
+      await api('/api/launcher/spawn', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd, ccuseProfile }) });
       dlg.close(); refresh();
     } catch (e) { errEl.textContent = 'Launch failed: ' + e.message; errEl.hidden = false; }
     finally { btn.disabled = false; btn.textContent = 'Launch'; }
   };
+
+  // Populate ccuse profile dropdown on dialog open. Cached so we don't refetch
+  // every dialog show — the profile list rarely changes within a session.
+  let _ccuseProfilesLoaded = false;
+  async function loadCcuseProfiles() {
+    if (_ccuseProfilesLoaded) return;
+    try {
+      const data = await api('/api/launcher/prefs');
+      const select = document.getElementById('ccuse-select');
+      if (!select) return;
+      const profiles = data.availableProfiles || [];
+      const def = data.defaultCcuseProfile || '';
+      // preserve current selection if any
+      const cur = select.value;
+      // wipe existing options except the placeholder
+      while (select.options.length > 1) select.remove(1);
+      for (const p of profiles) {
+        const opt = document.createElement('option');
+        opt.value = p; opt.textContent = p + (p === def ? '  (默认)' : '');
+        select.appendChild(opt);
+      }
+      if (cur) select.value = cur;
+      else if (def) select.value = def;
+      _ccuseProfilesLoaded = true;
+    } catch { /* graceful: dropdown stays minimal */ }
+  }
 
   // Page Visibility-aware poller: pauses when tab is hidden (no point polling
   // a backgrounded iOS Safari tab whose connections may already be suspended)
@@ -1256,6 +2858,7 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
 
   if (url === '/api/launcher/list' && method === 'GET') {
     rescanRuntime();
+    await backfillExternalCcvs();
     const running = [...instances.values()];
     const runningCwds = new Set(running.map(i => i.cwd));
     // merge workspace-registry history: show idle projects not currently running
@@ -1275,8 +2878,100 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
           status: 'idle',
         }));
     } catch (e) { log('getWorkspaces error:', e.message); }
-    sendJson(res, 200, { instances: running, history: idle });
+    // Enrich each instance with launcher-side prefs (alias + ccuse profile) so
+    // the frontend can render them without an extra round-trip.
+    const enrichedRunning = running.map(i => ({
+      ...i,
+      alias: getAlias(i.cwd),
+      ccuseProfile: getCcuseProfile(i.cwd),
+    }));
+    const enrichedIdle = idle.map(i => ({
+      ...i,
+      alias: getAlias(i.cwd),
+    }));
+    sendJson(res, 200, { instances: enrichedRunning, history: enrichedIdle, localCcSessions: listLocalCcSessions() });
     return;
+  }
+
+  // POST { pid, sessionId, cwd } — kill the bare claude pid (SIGTERM, then
+  // SIGKILL after a grace period) then open a Terminal window with
+  // `ccv -r <sessionId> --d` so claude resumes inside the new ccv. The user
+  // gets one fresh Terminal window; the launcher then auto-discovers the new
+  // ccv via runtime/ + lsof backfill on next refresh.
+  if (url === '/api/launcher/takeover-cc-session' && method === 'POST') {
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { sendJson(res, 400, { error: 'invalid json' }); return; }
+    const { pid, sessionId, cwd } = body || {};
+    if (!Number.isFinite(pid) || pid <= 1) { sendJson(res, 400, { error: 'pid required' }); return; }
+    if (typeof sessionId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) {
+      sendJson(res, 400, { error: 'sessionId must be a UUID' });
+      return;
+    }
+    if (typeof cwd !== 'string' || !cwd) { sendJson(res, 400, { error: 'cwd required' }); return; }
+    // Re-scan ps to confirm the targeted pid still belongs to this session.
+    // Stops us from killing an unrelated process if the user lingered on a
+    // stale row. force=true skips the 5s cache.
+    const live = listLocalCcSessions(true).find(s => s.pid === pid && s.sessionId === sessionId);
+    if (!live) { sendJson(res, 409, { error: 'session no longer active or already under ccv' }); return; }
+    try {
+      await killClaudePid(pid);
+    } catch (err) {
+      sendJson(res, 500, { error: 'kill failed: ' + err.message });
+      return;
+    }
+    try {
+      spawnCcvInTerminal(cwd, ['-r', sessionId]);
+    } catch (err) {
+      sendJson(res, 500, { error: 'terminal launch failed: ' + err.message });
+      return;
+    }
+    // Invalidate cache so next /list doesn't show the dead pid for 5s.
+    _localCcCache.at = 0;
+    sendJson(res, 200, { ok: true, killedPid: pid, cwd, sessionId });
+    return;
+  }
+
+  // Batch activity probe — what each running ccv is doing right now.
+  // Cached per-pid 1.5s, ~1 fetch + 1 file tail per instance per poll.
+  if (url === '/api/launcher/activity' && method === 'GET') {
+    rescanRuntime();
+    await backfillExternalCcvs();
+    const running = [...instances.values()];
+    try {
+      const list = await Promise.all(running.map(async inst => {
+        try {
+          return await getInstanceActivity(inst);
+        } catch (err) {
+          return { pid: inst.pid, status: 'error', statusLabel: '⚠ ' + (err?.message || 'probe failed'), preview: '', recentEvents: [], pendingAsks: [] };
+        }
+      }));
+      sendJson(res, 200, { activity: list });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // Single-instance activity (for drawer expand)
+  {
+    const m = url.match(/^\/api\/launcher\/instances\/(\d+)\/activity$/);
+    if (m && method === 'GET') {
+      const pid = parseInt(m[1], 10);
+      rescanRuntime();
+      await backfillExternalCcvs();
+      const inst = instances.get(pid);
+      if (!inst) {
+        sendJson(res, 404, { error: 'instance not found' });
+        return;
+      }
+      try {
+        const data = await getInstanceActivity(inst);
+        sendJson(res, 200, data);
+      } catch (err) {
+        sendJson(res, 500, { error: err.message });
+      }
+      return;
+    }
   }
 
   if (url === '/api/launcher/browse-dir' && method === 'GET') {
@@ -1308,8 +3003,13 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
   if (url === '/api/launcher/spawn' && method === 'POST') {
     try {
       const raw = await readBody(req);
-      const { cwd, force } = JSON.parse(raw || '{}');
-      const entry = await serializeSpawn(() => doSpawn(cwd, { force: !!force }));
+      const { cwd, force, ccuseProfile } = JSON.parse(raw || '{}');
+      // If client passes a profile, persist it as this cwd's preferred profile
+      // so future spawns default to it without explicit selection.
+      if (typeof ccuseProfile === 'string' && cwd) {
+        setCcuseProfile(cwd, ccuseProfile);
+      }
+      const entry = await serializeSpawn(() => doSpawn(cwd, { force: !!force, ccuseProfile: ccuseProfile || '' }));
       sendJson(res, 200, { ok: true, instance: entry });
     } catch (err) {
       log('spawn error:', err.message);
@@ -1348,6 +3048,48 @@ async function dispatchLauncherRoute(req, res, parsedUrl) {
       sendJson(res, 200, { ok: removed });
     } catch (err) {
       log('forget error:', err.message);
+      sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  // Launcher-side prefs (aliases + ccuse profiles + default profile)
+  if (url === '/api/launcher/prefs' && method === 'GET') {
+    try {
+      const prefs = loadPrefs();
+      const profiles = await listCcuseProfiles();
+      sendJson(res, 200, { ...prefs, availableProfiles: profiles });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  if (url === '/api/launcher/prefs/alias' && method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      const { cwd: targetCwd, alias } = JSON.parse(raw || '{}');
+      if (!targetCwd) throw new Error('cwd required');
+      setAlias(targetCwd, alias || '');
+      sendJson(res, 200, { ok: true, alias: getAlias(targetCwd) });
+    } catch (err) {
+      sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  if (url === '/api/launcher/prefs/ccuse-profile' && method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      const body = JSON.parse(raw || '{}');
+      if (typeof body.default === 'string') {
+        setDefaultCcuseProfile(body.default);
+      }
+      if (body.cwd) {
+        setCcuseProfile(body.cwd, body.profile || '');
+      }
+      sendJson(res, 200, { ok: true });
+    } catch (err) {
       sendJson(res, 400, { error: err.message });
     }
     return;
@@ -1413,6 +3155,10 @@ function installShellWebSocket(httpServer) {
     pty = ccvRequire('node-pty');
   } catch (err) {
     log('node-pty not available, /ws/shell disabled:', err.message);
+    return;
+  }
+  if (!PtySessionManager) {
+    log('PtySessionManager not available in this cc-viewer build, /ws/shell disabled');
     return;
   }
   const { WebSocketServer } = ccvRequire('ws');
@@ -1608,10 +3354,12 @@ export default {
         _selfToken = ctx?.token ?? null;
         if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true });
         rescanRuntime();
+        backfillExternalCcvs(true).catch(err => log('initial backfill error:', err.message));
         loadSessions();
         startWatcher();
         if (ctx?.httpServer) {
           installRequestMultiplexer(ctx.httpServer, ctx.protocol);
+          await ensurePtySessionManager();
           installShellWebSocket(ctx.httpServer);
         } else {
           log('serverStarted: no httpServer in ctx, launcher routes will not work');
