@@ -137,15 +137,20 @@ export const HTML_PAGE = `<!doctype html>
   #help-dlg .kb-table td { padding:5px 0; vertical-align:top; }
   #help-dlg .kb-table td:first-child { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--accent); white-space:nowrap; padding-right:14px; min-width:90px; }
   #help-dlg .kb-row-hd td { color:var(--mute); font-size:10px; text-transform:uppercase; padding:10px 0 2px; border-bottom:1px solid var(--line); }
-  @media (max-width:640px) {
-    #tag-filter { min-width:0; flex:1 1 auto; max-width:140px; font-size:10px; padding:4px 7px; }
-    #btn-help { padding:4px 8px; }
-  }
-
   /* mobile narrow: shrink stats, hide labels, recenter popover.
-     Cost block collapses to one slot + tap-cycle controlled by
-     body[data-active-range="..."]; default is 'today'. */
+     Also wrap header into 2 rows so filter + Memory/?/New stay reachable
+     on phone widths (previously flex-wrap:nowrap pushed them off-screen). */
   @media (max-width:640px) {
+    header { flex-wrap:wrap; padding:10px 14px; gap:6px 8px; }
+    header h1 { font-size:14px; }
+    header .meta { font-size:11px; }
+    /* .grow becomes a 100%-wide row break, forcing filter + buttons onto row 2 */
+    header .grow { flex-basis:100%; height:0; flex-grow:0; }
+    header button { padding:5px 10px; font-size:11px; }
+    #tag-filter { min-width:0; flex:1 1 0; max-width:none; font-size:11px; padding:5px 8px; }
+    #btn-help { padding:5px 9px; }
+    #btn-mem  { padding:5px 9px; font-size:11px; }
+    #btn-wt   { padding:5px 9px; font-size:11px; }
     .topbar-stats { gap:6px; font-size:10px; }
     .stat { padding:3px 7px; gap:4px; }
     .stat .stat-label { display:none; }
@@ -160,6 +165,23 @@ export const HTML_PAGE = `<!doctype html>
     body[data-active-range="week"]  .cost-slot[data-range="week"],
     body[data-active-range="month"] .cost-slot[data-range="month"],
     body:not([data-active-range]) .cost-slot[data-range="today"] { display:flex; }
+    /* tighter outer padding so cards have breathing room */
+    .content { padding:10px 12px 28px; }
+    #pair-zone { padding:8px 12px 0; }
+    .group-head { padding:9px 12px; }
+    .card { padding:10px 12px; }
+    .instance { padding:9px 12px; }
+    footer { padding:8px 12px; }
+  }
+
+  /* very narrow (iPhone SE / small Android) — collapse Memory text to icon
+     and tighten button padding so row 2 still fits without wrapping. */
+  @media (max-width:420px) {
+    header { padding:8px 12px; }
+    #btn-mem .mem-label { display:none; }
+    #btn-new { padding:5px 8px; }
+    #btn-help { padding:5px 7px; }
+    #btn-wt { padding:5px 7px; }
   }
 
   /* sections */
@@ -496,7 +518,7 @@ export const HTML_PAGE = `<!doctype html>
   <span class="grow"></span>
   <input type="text" id="tag-filter" placeholder="filter tags (/)" autocomplete="off" spellcheck="false">
   <button id="btn-wt" title="git worktrees (click to manage)" hidden>🌿 <span id="btn-wt-count">0</span></button>
-  <button id="btn-mem" title="CLAUDE.md across all running instances (aggregated)">📖 Memory</button>
+  <button id="btn-mem" title="CLAUDE.md across all running instances (aggregated)">📖<span class="mem-label"> Memory</span></button>
   <button id="btn-help" title="Keyboard shortcuts (?)">?</button>
   <button id="btn-new">+ New</button>
 </header>
