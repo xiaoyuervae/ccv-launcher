@@ -412,7 +412,8 @@ export const HTML_PAGE = `<!doctype html>
   dialog { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:10px; padding:20px; max-width:500px; width:92%; }
   dialog::backdrop { background:rgba(0,0,0,.55); }
   dialog h2 { margin:0 0 12px; font-size:14px; font-weight:600; }
-  dialog input { width:100%; padding:7px 10px; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:5px; font-family:ui-monospace,monospace; font-size:12px; margin-bottom:8px; }
+  dialog input:not([type="checkbox"]):not([type="radio"]) { width:100%; padding:7px 10px; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:5px; font-family:ui-monospace,monospace; font-size:12px; margin-bottom:8px; }
+  dialog input[type="checkbox"] { flex-shrink:0; }
   dialog .row { display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
   .tree { font-family:ui-monospace,monospace; font-size:12px; color:var(--mute); max-height:220px; overflow:auto; background:var(--bg); padding:6px; border-radius:5px; }
   .tree .row { padding:3px 6px; cursor:pointer; border-radius:3px; display:flex; gap:6px; align-items:center; }

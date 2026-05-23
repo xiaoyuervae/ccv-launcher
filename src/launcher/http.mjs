@@ -8,7 +8,7 @@
 // Lives below all the domain modules; pulls EVERYTHING from them so the
 // dispatcher only needs to know "what endpoint maps to what call".
 
-import { existsSync, statSync, readFileSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs';
+import { existsSync, statSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync } from 'node:fs';
 import { dirname, join, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
