@@ -1768,26 +1768,13 @@ export const HTML_PAGE = `<!doctype html>
     return location.protocol + '//' + location.hostname + ':' + inst.port + '/' + (inst.token ? ('?token=' + encodeURIComponent(inst.token)) : '');
   }
   function openCcv(inst) {
-    var ov = document.getElementById('ccv-overlay');
-    var fr = document.getElementById('ccv-frame');
-    var err = document.getElementById('ccv-frame-err');
-    if (!ov || !fr) return;
-    document.getElementById('ccv-name').textContent = inst.alias || inst.displayName || inst.projectName || '?';
-    document.getElementById('ccv-port').textContent = inst.port ? ':' + inst.port : '';
-    document.getElementById('ccv-path').textContent = inst.cwd || '';
-    err.classList.remove('show');
-    ov.classList.add('open');
+    // Open ccv in a new browser tab so the launcher stays put and each
+    // session gets its own tab the user can pin / switch between. The old
+    // inline iframe overlay (#ccv-overlay) is left in the DOM for now but
+    // is no longer triggered.
+    if (!inst) return;
     var src = ccvUrl(inst);
-    fr.src = src;
-    if (_ccvWatchdog) clearTimeout(_ccvWatchdog);
-    _ccvWatchdog = setTimeout(function() { err.classList.add('show'); }, 6500);
-    fr.onload = function() { if (_ccvWatchdog) { clearTimeout(_ccvWatchdog); _ccvWatchdog = null; } };
-    document.getElementById('ccv-err-newtab').onclick = function() { window.open(src, '_blank'); };
-    document.getElementById('ccv-err-retry').onclick = function() {
-      err.classList.remove('show'); fr.src = src;
-    };
-    document.getElementById('ccv-newtab').onclick = function() { window.open(src, '_blank'); };
-    document.getElementById('ccv-reload').onclick = function() { fr.src = src; };
+    window.open(src, '_blank', 'noopener,noreferrer');
   }
   function closeCcv() {
     var ov = document.getElementById('ccv-overlay');
