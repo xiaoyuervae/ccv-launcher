@@ -248,7 +248,11 @@ export const HTML_PAGE = `<!doctype html>
   .focus-hd .row1 { display: flex; align-items: center; gap: 8px; }
   .focus-hd h1 { font-size: 17px; font-weight: 600; letter-spacing: -.3px; margin: 0; }
   .focus-hd .meta { color: var(--mute); font-size: 11px; font-family: var(--mono); }
-  .focus-hd .cwd { color: var(--mute); font-size: 11px; font-family: var(--mono); word-break: break-all; }
+  .focus-hd .cwd {
+    color: var(--mute); font-size: 11px; font-family: var(--mono);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .focus-hd .cwd-path { word-break: break-all; min-width: 0; flex: 1; }
   .focus-hd .topic {
     margin-top: 6px; padding: 6px 10px;
     background: var(--bg2); border-left: 2px solid var(--accent);
@@ -654,27 +658,48 @@ export const HTML_PAGE = `<!doctype html>
 
   /* ---------- mobile (≤640px) ---------- */
   @media (max-width: 640px) {
-    body {
-      padding-top: env(safe-area-inset-top);
-      padding-bottom: env(safe-area-inset-bottom);
-    }
+    /* App bar: sticky, single row, safe-area handled here (not body) */
     #app-bar {
-      flex-wrap: wrap; gap: 8px 10px; padding: 8px 12px;
+      position: sticky; top: 0; z-index: 50;
+      background: rgba(13,17,23,.92);
+      -webkit-backdrop-filter: saturate(160%) blur(10px);
+      backdrop-filter: saturate(160%) blur(10px);
+      padding: calc(env(safe-area-inset-top) + 8px) 12px 8px;
+      flex-wrap: nowrap; gap: 8px; height: auto;
     }
-    #app-bar #filter { display: none; }
-    #app-bar .grow { display: none; }
+    #app-bar .brand,
+    #app-bar .server,
+    #app-bar #filter,
     #app-bar .stat-quota .bar { display: none; }
-    #app-bar .brand { font-size: 13px; }
-    #app-bar .server { display: none; }
-    #app-bar { row-gap: 6px; }
-    #app-bar > .row2 {
-      flex-basis: 100%;
-      display: flex; align-items: center; gap: 8px;
+    #app-bar .grow { flex: 1; }
+    #app-bar .logo { width: 28px; height: 28px; font-size: 13px; }
+    #app-bar .stat-cost, #app-bar .stat-quota {
+      font-size: 11px; padding: 4px 8px;
     }
-    #tab-strip { padding: 8px 12px; gap: 6px; border-bottom: 1px solid var(--line); }
+    #btn-new {
+      padding: 9px 14px; font-size: 13px; font-weight: 700;
+      min-height: 36px;
+    }
+
+    /* Tab strip: horizontal scroll, no scrollbar, sticky under app bar */
+    #tab-strip {
+      position: sticky; top: 52px; z-index: 49;
+      background: var(--bg);
+      padding: 8px 12px; gap: 6px;
+      border-bottom: 1px solid var(--line);
+      overflow-x: auto; overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scroll-snap-type: x proximity;
+      scrollbar-width: none;
+      flex-wrap: nowrap;
+    }
+    #tab-strip::-webkit-scrollbar { display: none; }
     .tab {
+      flex: 0 0 auto;
+      scroll-snap-align: start;
       border: 1px solid var(--line); border-radius: 999px;
-      padding: 5px 11px; margin: 0; background: transparent;
+      padding: 7px 13px; margin: 0; background: transparent;
+      min-height: 34px; font-size: 13px;
     }
     .tab.active {
       background: var(--bg2); border-color: var(--accent);
@@ -683,7 +708,8 @@ export const HTML_PAGE = `<!doctype html>
     .tab.active.needs-ask { border-color: var(--ask); }
     .tab .port { display: none; }
     .tab .hub-tag { display: none; }
-    /* Slim alert becomes an expanded attention card */
+
+    /* Ask alert → expanded attention card */
     #ask-alert {
       flex-direction: column; align-items: stretch;
       background: linear-gradient(180deg, rgba(248,81,73,.12), rgba(248,81,73,.04));
@@ -693,35 +719,74 @@ export const HTML_PAGE = `<!doctype html>
     .alert-chips { flex-direction: column; gap: 8px; overflow: visible; }
     .alert-chip {
       background: var(--bg2); border-left: 2px solid var(--ask);
-      border-radius: 8px; padding: 10px 12px;
+      border-radius: 8px; padding: 11px 12px;
       align-items: flex-start; flex-direction: column; gap: 4px;
-      white-space: normal;
+      white-space: normal; min-height: 44px;
     }
     .alert-chip .q { max-width: 100%; white-space: normal; }
     #ask-alert .kbd-hint { display: none; }
+
+    /* Layout: single column, no rail, no docked terminal */
     #mc-grid { grid-template-columns: 1fr; }
     #rail { display: none; }
     #term-panel { display: none; }
-    #focus { padding-bottom: 110px; }
+    #focus { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
     .focus-inner { padding: 12px 14px; gap: 10px; }
     .focus-hd h1 { font-size: 16px; }
-    .stat-grid { grid-template-columns: 1fr 1fr; }
+
+    /* Header: hide redundant "Open ccv" (bottom bar already has it) */
+    .focus-hd .row1 .btn-primary[data-act="open-ccv"] { display: none; }
+
+    /* cwd: show tail of path on overflow, copy chip stays right */
+    .focus-hd .cwd { font-size: 12px; }
+    .focus-hd .cwd-path {
+      flex: 1; min-width: 0;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      direction: rtl; text-align: left; unicode-bidi: plaintext;
+    }
+    .action-chip.cwd-copy { padding: 8px 10px; min-height: 32px; }
+
+    /* Action chips: comfy tap targets */
+    .focus-actions { gap: 8px; margin-top: 8px; }
+    .action-chip {
+      padding: 8px 12px; font-size: 12px;
+      min-height: 36px; border-radius: 6px;
+    }
+    .action-chip .lbl { font-size: 10px; }
+
+    /* Ask choices: full-width tap targets, primary big */
+    .ask-choices { gap: 8px; flex-direction: column; }
+    .ask-btn {
+      width: 100%; min-height: 44px; padding: 11px 14px;
+      font-size: 14px; border-radius: 8px;
+      justify-content: center; text-align: center;
+    }
+
+    /* Stat boxes */
+    .stat-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .stat-box { padding: 10px 12px; }
+
+    /* Bottom action bar: safe-area, ≥44px tap targets */
     #mobile-bar {
       display: flex; gap: 8px;
       position: fixed; left: 0; right: 0; bottom: 0;
-      padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
-      background: linear-gradient(180deg, transparent, var(--bg) 30%, var(--bg2));
+      padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+      background: linear-gradient(180deg, transparent, rgba(13,17,23,.85) 30%, var(--bg2));
+      -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
       border-top: 1px solid var(--line);
       z-index: 40;
     }
     #mobile-bar .primary {
-      flex: 1; background: var(--accent); color: var(--bg); border: 0;
-      padding: 11px 14px; border-radius: 10px;
-      font-size: 14px; font-weight: 700; cursor: pointer;
+      flex: 1.4; background: var(--accent); color: var(--bg); border: 0;
+      padding: 12px 14px; border-radius: 10px;
+      font-size: 15px; font-weight: 700; cursor: pointer;
+      min-height: 44px;
     }
     #mobile-bar .secondary {
-      background: var(--bg3); color: var(--fg); border: 1px solid var(--line);
-      padding: 11px 13px; border-radius: 10px; font-size: 13px; cursor: pointer;
+      flex: 1; background: var(--bg3); color: var(--fg);
+      border: 1px solid var(--line);
+      padding: 12px 12px; border-radius: 10px; font-size: 14px;
+      cursor: pointer; min-height: 44px;
     }
   }
 </style>
@@ -1248,9 +1313,9 @@ export const HTML_PAGE = `<!doctype html>
     html += '<button class="btn-primary" data-act="open-ccv">Open ccv ↗</button>';
     html += '</div>';
     html += '<div class="cwd">';
-    html += escape(inst.cwd || '');
+    html += '<span class="cwd-path" title="' + escape(inst.cwd || '') + '">' + escape(inst.cwd || '') + '</span>';
     if (inst.cwd) {
-      html += ' <button class="action-chip cwd-copy" data-act="copy-cwd" title="复制路径">📋</button>';
+      html += '<button class="action-chip cwd-copy" data-act="copy-cwd" title="复制路径">📋</button>';
     }
     html += '</div>';
     if (!inst.isHub) {
