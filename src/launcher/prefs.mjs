@@ -253,17 +253,36 @@ export async function listCcuseProfiles() {
       p.on('close', () => resolve(stdout + stderr));
       p.on('error', reject);
     });
-    // Look for the usage line: 用法: ccuse {a|b|c|...}  or  Usage: ccuse {a|b|c}
-    const m = out.match(/ccuse\s*\{([^}]+)\}/);
-    if (m) {
-      const list = m[1].split('|').map(s => s.trim()).filter(Boolean);
-      _ccuseProfilesCache = list;
-      _ccuseProfilesAt = now;
-      return list;
+    // Two known formats:
+    //   1) Brace form:  用法: ccuse {a|b|c}   or   Usage: ccuse {a|b|c}
+    //   2) Bullet form: 用法: ccuse <场景>     (or Usage: ccuse <scenario>)
+    //                     official  - <desc>
+    //                     api       - <desc>
+    //                     yuge      - <desc>
+    let list = [];
+    const brace = out.match(/ccuse\s*\{([^}]+)\}/);
+    if (brace) {
+      list = brace[1].split('|').map(s => s.trim()).filter(Boolean);
+    } else {
+      // Bullet form: find header line, then collect indented "<name>  - <desc>"
+      // rows until a blank line or a non-matching line.
+      const lines = out.split(/\r?\n/);
+      let inUsage = false;
+      for (const raw of lines) {
+        if (!inUsage) {
+          if (/(用法|Usage)\s*[:：]\s*ccuse\s*<[^>]+>/.test(raw)) inUsage = true;
+          continue;
+        }
+        if (!raw.trim()) break;
+        // Indented "  name  - description" — name is the first whitespace-bounded token.
+        const m2 = raw.match(/^\s+([A-Za-z][\w-]*)\s+[-—]/);
+        if (m2) list.push(m2[1]);
+        else if (!/^\s/.test(raw)) break; // hit a non-indented line → section ended
+      }
     }
-    _ccuseProfilesCache = [];
+    _ccuseProfilesCache = list;
     _ccuseProfilesAt = now;
-    return [];
+    return list;
   } catch (err) {
     log('listCcuseProfiles error:', err.message);
     return _ccuseProfilesCache || [];

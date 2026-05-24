@@ -27,6 +27,12 @@ import { getCcuseProfile } from './prefs.mjs';
 // ----- module-level config (env-derived) -----
 const HUB_ENABLED = process.env.CCV_HUB === '1';
 export const RUNTIME_DIR = join(homedir(), '.claude', 'cc-viewer', 'runtime');
+// Per-port stdout/stderr capture for spawned ccv children. The /api/launcher/
+// instances/<pid>/ccv-log endpoint tails these so the redesigned launcher's
+// embedded terminal Logs tab can show what ccv is logging without needing a
+// separate ws subscription. Files are truncated on each spawn.
+export const LAUNCHER_LOG_DIR = join(homedir(), '.claude', 'cc-viewer', 'launcher-logs');
+export function ccvLogPath(port) { return join(LAUNCHER_LOG_DIR, `ccv-${port}.log`); }
 // Public URL template for child instances exposed via a reverse proxy.
 // When unset, buildPublicUrl returns '' and the UI shows only the LAN URL.
 // Placeholders: {port} {token} {host}.
@@ -863,30 +869,37 @@ export async function doSpawn(targetCwd, { force = false, ccuseProfile = '', use
   // in `zsh -i -c 'ccuse <profile> && exec node cli.js ...'` so .zshrc gets
   // sourced first. Falls through to direct spawn when no profile is set.
   const profile = ccuseProfile || getCcuseProfile(targetCwd);
+  // Capture child stdout+stderr to a per-port log so the launcher's Logs tab
+  // can tail it. Truncate on spawn ("w") to keep the file scoped to this run.
+  if (!existsSync(LAUNCHER_LOG_DIR)) mkdirSync(LAUNCHER_LOG_DIR, { recursive: true });
+  const logFd = openSync(ccvLogPath(port), 'w');
+  const childStdio = ['ignore', logFd, logFd];
   let child;
   if (profile) {
     // Properly quote the profile name for zsh
     const safeProfile = profile.replace(/[^a-zA-Z0-9_\-.]/g, '');
     if (safeProfile !== profile) {
+      closeSync(logFd);
       throw new Error(`ccuse profile "${profile}" contains invalid characters`);
     }
     const shellCmd = `ccuse ${safeProfile} && exec ${JSON.stringify(process.execPath)} ${JSON.stringify(cliPath)} --d --no-open`;
     child = spawn('/bin/zsh', ['-i', '-c', shellCmd], {
       cwd: targetCwd,
       detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: childStdio,
       env,
     });
   } else {
     child = spawn(process.execPath, [cliPath, '--d', '--no-open'], {
       cwd: targetCwd,
       detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: childStdio,
       env,
     });
   }
-  child.stdout?.on('data', () => {}); // drain
-  child.stderr?.on('data', () => {}); // drain
+  // Node dup'd the fd into the child; close our copy so the launcher hub
+  // doesn't hold an open handle to every child's log file forever.
+  closeSync(logFd);
   child.unref();
 
   try {

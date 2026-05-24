@@ -491,6 +491,11 @@ export function resolveNativeJsonl(instance) {
 // All tiers cached 30s in memory + 5min on disk (launcher-cache.json).
 export const CCLINE_CACHE_FILE = join(homedir(), '.claude', 'ccline', '.api_usage_cache.json');
 export const CLAUDE_CREDS_FILE = join(homedir(), '.claude', '.credentials.json');
+// Claude Code's own server-sourced cache. Refreshed on CC session start +
+// periodic /usage queries. Schema matches the OAuth /api/oauth/usage response.
+export const CC_USAGE_CACHE_FILE = join(homedir(), '.claude', '.usage-cache.json');
+export const CC_USAGE_CACHE_FRESH_MS = 10 * 60_000;   // ≤10 min: trust as fresh
+export const CC_USAGE_CACHE_STALE_MS = 4 * 3600_000;  // >4h: drop and fall through
 export const QUOTA_5H_MEM_TTL_MS = 30_000;
 export const QUOTA_5H_DISK_TTL_MS = 5 * 60_000;
 export const PLAN_THRESHOLDS = [
@@ -501,6 +506,36 @@ export const PLAN_THRESHOLDS = [
 
 let _quota5hMem = null;
 let _quota5hRefreshing = false;
+
+// Tier 1.5: Claude Code's native usage cache at ~/.claude/.usage-cache.json.
+// Same shape as OAuth /api/oauth/usage. Carries percent + reset time, no raw
+// token counts. Fresher than ccline (CC refreshes per-session), but can still
+// lag a real session by hours if CC didn't run a /usage probe recently.
+export function readCcUsageCache() {
+  if (!existsSync(CC_USAGE_CACHE_FILE)) return null;
+  let st; try { st = statSync(CC_USAGE_CACHE_FILE); } catch { return null; }
+  const ageMs = Date.now() - st.mtimeMs;
+  // Don't hard-skip on age — buildQuota5h gates by reset_at which is stronger.
+  // If reset hasn't happened, the cached % is still meaningful even at 8h+ old.
+  try {
+    const raw = JSON.parse(readFileSync(CC_USAGE_CACHE_FILE, 'utf-8'));
+    const fh = raw && raw.five_hour;
+    if (!fh || typeof fh.utilization !== 'number') return null;
+    return {
+      five_hour_utilization: fh.utilization,
+      five_hour_resets_at: fh.resets_at || null,
+      seven_day_utilization: raw.seven_day && raw.seven_day.utilization,
+      seven_day_resets_at: raw.seven_day && raw.seven_day.resets_at,
+      fetched_at: raw._fetched_at || null,
+      mtimeMs: st.mtimeMs,
+      ageMs,
+      stale: ageMs > CC_USAGE_CACHE_FRESH_MS,
+    };
+  } catch (err) {
+    log('readCcUsageCache error:', err.message);
+    return null;
+  }
+}
 
 export function readCclineCache() {
   if (!existsSync(CCLINE_CACHE_FILE)) return null;
@@ -525,16 +560,39 @@ export function readCclineCache() {
   }
 }
 
-// Tier-2 token retrieval: best-effort cleartext credentials.json. macOS
-// keychain access via `security` would block on user approval and isn't
-// suitable for an unattended hub. Returns null when unavailable.
+// Tier-2 token retrieval. Tries in order:
+//   1) ~/.claude/.credentials.json (cleartext, rare — most installs use keychain)
+//   2) macOS keychain entry "Claude Code-credentials" via `security` CLI
+// The keychain call may surface a one-time "Allow / Always Allow" dialog the
+// FIRST time hub runs under launchd; we run with a 2s timeout so we don't
+// block the request path if the user dismisses or never clicks. After Allow,
+// subsequent reads are silent. Cached for the lifetime of the process.
+let _ccTokenMem = null; // { token, fetchedAt } | { token: null, fetchedAt }
+const CC_TOKEN_TTL_MS = 30 * 60_000;
+
 export function readClaudeOauthToken() {
-  if (!existsSync(CLAUDE_CREDS_FILE)) return null;
-  try {
-    const raw = JSON.parse(readFileSync(CLAUDE_CREDS_FILE, 'utf-8'));
-    const t = raw && raw.claudeAiOauth && raw.claudeAiOauth.accessToken;
-    return typeof t === 'string' && t ? t : null;
-  } catch { return null; }
+  const now = Date.now();
+  if (_ccTokenMem && now - _ccTokenMem.fetchedAt < CC_TOKEN_TTL_MS) return _ccTokenMem.token;
+  let token = null;
+  if (existsSync(CLAUDE_CREDS_FILE)) {
+    try {
+      const raw = JSON.parse(readFileSync(CLAUDE_CREDS_FILE, 'utf-8'));
+      const t = raw && raw.claudeAiOauth && raw.claudeAiOauth.accessToken;
+      if (typeof t === 'string' && t) token = t;
+    } catch (err) { log('readClaudeOauthToken cleartext error:', err.message); }
+  }
+  if (!token && process.platform === 'darwin') {
+    try {
+      const out = execFileSync('/usr/bin/security',
+        ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
+        { encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const parsed = JSON.parse(String(out).trim());
+      const t = parsed && parsed.claudeAiOauth && parsed.claudeAiOauth.accessToken;
+      if (typeof t === 'string' && t) token = t;
+    } catch (err) { log('readClaudeOauthToken keychain error:', err.message); }
+  }
+  _ccTokenMem = { token, fetchedAt: now };
+  return token;
 }
 
 export async function fetchOauthUsage() {
@@ -644,10 +702,14 @@ export async function gatherTurnsForBlocks(now) {
       if (!u) return;
       const ts = e.timestamp ? Date.parse(e.timestamp) : 0;
       if (!ts || ts < horizon) return;
+      // Match Claude.ai's plan quota accounting: count input + output +
+      // cache_creation. cache_read is excluded — it's effectively free and
+      // typically dominates raw token counts (>99%), so including it would
+      // overstate utilization by 100×–1000× and trip the wrong plan tier in
+      // detectPlan(). Verified against console.anthropic.com session bar.
       const tokens = (+u.input_tokens || 0)
                    + (+u.output_tokens || 0)
-                   + (+u.cache_creation_input_tokens || 0)
-                   + (+u.cache_read_input_tokens || 0);
+                   + (+u.cache_creation_input_tokens || 0);
       turns.push({ ts, tokens, model: msg.model || null });
     });
   }
@@ -717,7 +779,39 @@ export function saveQuota5hToDisk(result) {
 }
 
 export async function buildQuota5h() {
-  // Tier 1: ccline cache (utilization only, no raw token counts).
+  // Tier 1a: Claude Code's native usage cache (~/.claude/.usage-cache.json).
+  // Same provenance as Claude.ai's session bar — most accurate when fresh.
+  const ccCache = readCcUsageCache();
+  // Drop the cache if its 5h window already reset — the cached percent would
+  // belong to a previous window and have no relation to current usage.
+  if (ccCache && ccCache.five_hour_resets_at) {
+    const resetMs = Date.parse(ccCache.five_hour_resets_at);
+    if (Number.isFinite(resetMs) && Date.now() >= resetMs) {
+      // skip — fall through to next tier
+    } else {
+      return {
+        source: 'cc_usage_cache',
+        percent: ccCache.five_hour_utilization,
+        used: null,
+        limit: null,
+        reset_at: ccCache.five_hour_resets_at,
+        plan_name: null,
+        burn_rate: null,
+        projection_minutes: null,
+        seven_day_utilization: ccCache.seven_day_utilization,
+        seven_day_resets_at: ccCache.seven_day_resets_at,
+        fetched_at: ccCache.fetched_at,
+        // `stale` is owned by getCachedQuota5h (mem-TTL semantics); use a
+        // dedicated key for "source data itself is old" so it survives the
+        // spread merge in the cache wrapper.
+        sourceStale: ccCache.stale,
+        sourceAgeMs: ccCache.ageMs,
+        computedAt: Date.now(),
+      };
+    }
+  }
+
+  // Tier 1b: ccline cache (utilization only, no raw token counts).
   const ccline = readCclineCache();
   if (ccline && !ccline.stale && ccline.five_hour_utilization != null) {
     return {
@@ -756,14 +850,10 @@ export async function buildQuota5h() {
     };
   }
 
-  // Tier 3: local jsonl compute.
-  try {
-    return await computeFiveHourBlock();
-  } catch (err) {
-    log('computeFiveHourBlock error:', err.message);
-  }
-
-  // Tier 4: nothing worked.
+  // Tier 3 deliberately removed: local jsonl token compute uses a different
+  // unit from Claude.ai's "compute units" (cache_read inflates raw tokens
+  // ~100x), so even a "fresh" number from there is misleading. Better to
+  // show "—" until a real source comes back.
   return {
     source: 'unavailable',
     percent: null,
@@ -773,7 +863,7 @@ export async function buildQuota5h() {
     plan_name: null,
     burn_rate: null,
     projection_minutes: null,
-    reason: 'no quota source reachable (ccline cache absent + no oauth token + jsonl compute failed)',
+    reason: 'no quota source reachable (cc_usage_cache stale/past-reset + oauth unreachable; jsonl-compute intentionally disabled)',
     computedAt: Date.now(),
   };
 }
@@ -783,6 +873,14 @@ export function refreshQuota5hInBackground() {
   _quota5hRefreshing = true;
   buildQuota5h()
     .then((result) => {
+      // Don't clobber a usable mem value with `unavailable` (e.g. transient
+      // OAuth API blip). Keep the last good number and mark it stale so the
+      // chip shows ⏱ instead of flashing "—".
+      if (result && result.source === 'unavailable'
+          && _quota5hMem && _quota5hMem.source && _quota5hMem.source !== 'unavailable') {
+        _quota5hMem = { ..._quota5hMem, sourceStale: true, sourceAgeMs: Date.now() - (_quota5hMem.computedAt || 0) };
+        return;
+      }
       _quota5hMem = { ...result, fromCache: false, stale: false };
       saveQuota5hToDisk(_quota5hMem);
     })

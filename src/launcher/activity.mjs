@@ -310,36 +310,65 @@ export function stripUserPromptFraming(text) {
   if (/^Base directory for this skill\b/i.test(t)) return '';
   // Drop bare tool_use_result envelopes that CC reformats as user text
   if (/^<tool_use_result\b/.test(t) || /^<\/?tool_use\b/.test(t)) return '';
+  // Drop SessionEnd / suggestion-mode skill activations — these are injected
+  // as user-role text by an external hook, not typed by the human.
+  if (/^\[SUGGESTION MODE\b/i.test(t)) return '';
+  // Drop pure-attachment markers — user pasted an image/file but did not type
+  // anything meaningful alongside it. "[Image: source: ...]" without other
+  // text on its own line is not informative as a session topic.
+  if (/^\[Image:\s+source:\s+[^\]]+]\s*$/.test(t)) return '';
   return t.trim();
 }
 
-// File-level cache of first user prompt — one read per session log file. Cleared
-// when file mtime changes (rare for the first line of an append-only jsonl).
-const _firstPromptCache = new Map(); // filePath -> { mtime, size, text }
-const FIRST_LINE_MAX_BYTES = 4 * 1024 * 1024; // first jsonl line can be 100s of KB (system-reminders + skills)
+// File-level cache of first user prompt — one read per session log file. Keyed
+// on (mtime, scannedBytes). If the file grows past what we scanned and we still
+// haven't found a substantial prompt, the cache invalidates so we rescan.
+const _firstPromptCache = new Map(); // filePath -> { mtime, scannedBytes, text }
+const FIRST_PROMPT_SCAN_BYTES = 8 * 1024 * 1024; // window from file head — skips heartbeats / `quota` probe / etc.
+const SUBSTANTIAL_PROMPT_MIN_CHARS = 16; // pick the first user prompt this long (skip "quota", "继续", "ok"…)
+const MAX_CANDIDATES = 12; // give up after this many user prompts and take the longest
 
 export function readFirstUserPrompt(filePath) {
   let st;
   try { st = statSync(filePath); } catch { return ''; }
   if (st.size === 0) return '';
   const cached = _firstPromptCache.get(filePath);
-  if (cached && cached.mtime === st.mtimeMs) return cached.text;
+  if (cached && cached.mtime === st.mtimeMs && (cached.text || st.size <= cached.scannedBytes)) {
+    return cached.text;
+  }
   let fd;
   try {
     fd = openSync(filePath, 'r');
-    const len = Math.min(st.size, FIRST_LINE_MAX_BYTES);
+    const len = Math.min(st.size, FIRST_PROMPT_SCAN_BYTES);
     const buf = Buffer.alloc(len);
     readSync(fd, buf, 0, len, 0);
     closeSync(fd);
-    const nl = buf.indexOf(0x0a);
-    const lineBuf = nl >= 0 ? buf.slice(0, nl) : buf;
-    let text = '';
-    try {
-      const obj = JSON.parse(lineBuf.toString('utf-8'));
-      text = firstUserPrompt(obj);
-    } catch { /* truncated first line — skip */ }
-    _firstPromptCache.set(filePath, { mtime: st.mtimeMs, size: st.size, text });
-    return text;
+    const candidates = [];
+    const seen = new Set();
+    let off = 0;
+    let pick = '';
+    while (off < len && candidates.length < MAX_CANDIDATES) {
+      const nl = buf.indexOf(0x0a, off);
+      const end = nl >= 0 ? nl : len;
+      if (end > off) {
+        try {
+          const obj = JSON.parse(buf.slice(off, end).toString('utf-8'));
+          const t = firstUserPrompt(obj);
+          if (t && !seen.has(t)) {
+            seen.add(t);
+            candidates.push(t);
+            if (t.length >= SUBSTANTIAL_PROMPT_MIN_CHARS) { pick = t; break; }
+          }
+        } catch { /* malformed / truncated line — skip */ }
+      }
+      if (nl < 0) break;
+      off = nl + 1;
+    }
+    if (!pick && candidates.length) {
+      pick = candidates.reduce((a, b) => (b.length > a.length ? b : a));
+    }
+    _firstPromptCache.set(filePath, { mtime: st.mtimeMs, scannedBytes: len, text: pick });
+    return pick;
   } catch {
     try { if (fd != null) closeSync(fd); } catch {}
     return '';

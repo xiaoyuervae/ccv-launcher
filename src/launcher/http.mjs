@@ -8,7 +8,7 @@
 // Lives below all the domain modules; pulls EVERYTHING from them so the
 // dispatcher only needs to know "what endpoint maps to what call".
 
-import { existsSync, statSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync } from 'node:fs';
+import { existsSync, statSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, join, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -16,7 +16,7 @@ import { randomBytes } from 'node:crypto';
 import { log, jlog } from './log.mjs';
 import { HTML_PAGE } from './html-page.mjs';
 import {
-  RUNTIME_DIR, instances, setSelfBinding, safeJson, pidAlive, renderTemplate, buildPublicUrl, buildLanUrl, loadRuntimeFile, rescanRuntime, BACKFILL_TTL_MS, PROBE_TIMEOUT_MS, probeCcv, listListeningNodePids, readPidCwd, readPidStartedMs, backfillExternalCcvs, LOCAL_CC_CACHE_TTL_MS, decodeProjectDirName, readJsonlCwd, readJsonlLastTimestamp, readPidLstart, listLocalCcSessions, spawnCcvInTerminal, killClaudePid, startWatcher, serializeSpawn, nextFreePort, findRunningByCwd, waitForChildRuntime, _pidWorktrees, WORKTREE_NAME_RE, BRANCH_NAME_RE, isInsideDir, gitInCwd, detectBaseRef, createWorktree, removeWorktree, worktreeForPid, MD_FILE_MAX_BYTES, MD_PREVIEW_BYTES, MD_BACKUP_KEEP, HOME_CLAUDE_DIR, safeRealpath, isAllowedMdPath, safeReadPreview, pushMdFile, scanClaudeMd, backupMdBeforeWrite, doSpawn,
+  RUNTIME_DIR, instances, setSelfBinding, safeJson, pidAlive, renderTemplate, buildPublicUrl, buildLanUrl, loadRuntimeFile, rescanRuntime, BACKFILL_TTL_MS, PROBE_TIMEOUT_MS, probeCcv, listListeningNodePids, readPidCwd, readPidStartedMs, backfillExternalCcvs, LOCAL_CC_CACHE_TTL_MS, decodeProjectDirName, readJsonlCwd, readJsonlLastTimestamp, readPidLstart, listLocalCcSessions, spawnCcvInTerminal, killClaudePid, startWatcher, serializeSpawn, nextFreePort, findRunningByCwd, waitForChildRuntime, _pidWorktrees, WORKTREE_NAME_RE, BRANCH_NAME_RE, isInsideDir, gitInCwd, detectBaseRef, createWorktree, removeWorktree, worktreeForPid, MD_FILE_MAX_BYTES, MD_PREVIEW_BYTES, MD_BACKUP_KEEP, HOME_CLAUDE_DIR, safeRealpath, isAllowedMdPath, safeReadPreview, pushMdFile, scanClaudeMd, backupMdBeforeWrite, doSpawn, LAUNCHER_LOG_DIR, ccvLogPath,
 } from './runtime.mjs';
 import {
   USAGE_CACHE_FILE, USAGE_CACHE_TTL_MS, loadPricing, loadModels, getModelInfo, computeContextUsage, priceForModel, emptyTokenBucket, computeCostForEntry, costFromUsage, usageFromEntries, readJsonlEntries, rangeStartMs, listSessionJsonlPaths, aggregateUsage, loadUsageCacheFromDisk, saveUsageCacheToDisk, refreshUsageInBackground, getCachedUsage, readInstanceUsage, encodeCwdToProjectDir, resolveNativeJsonl, CCLINE_CACHE_FILE, CLAUDE_CREDS_FILE, QUOTA_5H_MEM_TTL_MS, QUOTA_5H_DISK_TTL_MS, PLAN_THRESHOLDS, readCclineCache, readClaudeOauthToken, fetchOauthUsage, blocksFromTurns, detectPlan, p90, gatherTurnsForBlocks, computeFiveHourBlock, loadQuota5hFromDisk, saveQuota5hToDisk, buildQuota5h, refreshQuota5hInBackground, getCachedQuota5h, COMPACT_COOLDOWN_MS, injectPromptToCcv, checkCompactThresholds, readJsonlEntriesIndexed, truncateLabel, classifyEntry, JSONL_SCAN_TTL_MS, RUN_SUMMARY_MAX_EVENTS, ERROR_SAMPLES_PER_GROUP, scanJsonlAll, computeRunSummary, computeRecentEdits, computeErrors,
@@ -53,6 +53,91 @@ export function wireEntryBindings(bindings = {}) {
 
 let _shellWssGetter = () => _shellWss;
 let _ptyManagerGetter = () => _ptyManager;
+
+// Open a short-lived WebSocket to ccv's main /ws endpoint and deliver an
+// ask answer. Times out after 4s — first-write-wins, so if the answer is
+// rejected because another client already answered, we still return 200
+// with `ack.alreadyAnswered: true` so the UI can recover gracefully.
+function sendAnswerOverWs(inst, askId, answers) {
+  return new Promise((resolve, reject) => {
+    if (typeof WebSocket === 'undefined') return reject(new Error('WebSocket not available in this Node runtime'));
+    const url = 'ws://127.0.0.1:' + inst.port + '/ws?token=' + encodeURIComponent(inst.token);
+    let settled = false;
+    const ws = new WebSocket(url);
+    const t = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch {}
+      reject(new Error('timeout waiting for ccv ack'));
+    }, 4000);
+    ws.addEventListener('open', () => {
+      try {
+        ws.send(JSON.stringify({ type: 'ask-hook-answer', id: askId, answers }));
+      } catch (err) {
+        if (settled) return; settled = true; clearTimeout(t); reject(err);
+      }
+    });
+    ws.addEventListener('message', (ev) => {
+      let msg;
+      try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data.toString()); } catch { return; }
+      // ccv broadcasts ask-hook-resolved / ask-hook-answered / ack on success.
+      // first-write-wins: if our send loses the race, server still acks.
+      if (msg && (msg.type === 'ask-hook-resolved' || msg.type === 'ask-hook-answered' || msg.type === 'ask-hook-ack')) {
+        if (settled) return; settled = true; clearTimeout(t);
+        try { ws.close(); } catch {}
+        resolve({ delivered: true, message: msg });
+      }
+    });
+    ws.addEventListener('close', () => {
+      if (settled) return; settled = true; clearTimeout(t);
+      // We sent the answer but never got a typed ack — treat as best-effort
+      // success; the launcher's next 3s activity poll confirms if the ask
+      // cleared.
+      resolve({ delivered: true, message: null, note: 'no typed ack; assuming send succeeded' });
+    });
+    ws.addEventListener('error', (err) => {
+      if (settled) return; settled = true; clearTimeout(t);
+      reject(new Error('ws error: ' + (err && err.message || 'unknown')));
+    });
+  });
+}
+
+// ccv-log tail cache (per file path + tail count, keyed on mtime+size so a
+// growing log invalidates immediately). 5s TTL matches the launcher's 3s
+// activity poll cadence — at most one disk read per poll cycle.
+const _ccvLogCache = new Map();
+const CCV_LOG_CACHE_TTL_MS = 5_000;
+// Read the last N \n-delimited lines from a file by scanning backward from
+// the end in 16KB chunks. Avoids pulling whole multi-MB logs into memory just
+// to slice off the tail. Returns an array of strings (no trailing newlines).
+function tailFileLines(path, n, size) {
+  if (size === 0) return [];
+  const CHUNK = 16 * 1024;
+  const fd = openSync(path, 'r');
+  try {
+    let pos = size;
+    let lines = [];
+    let leftover = '';
+    while (pos > 0 && lines.length <= n) {
+      const readLen = Math.min(CHUNK, pos);
+      pos -= readLen;
+      const buf = Buffer.alloc(readLen);
+      readSync(fd, buf, 0, readLen, pos);
+      const chunk = buf.toString('utf-8') + leftover;
+      const parts = chunk.split('\n');
+      // First element may be a partial line (continues into the previous chunk).
+      // Stash it as leftover only if we'll read more.
+      leftover = pos > 0 ? parts.shift() : '';
+      // Prepend parts (which are in file order) to our accumulator.
+      lines = parts.concat(lines);
+    }
+    // Drop trailing empty line that comes from a file ending in \n.
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+    return lines.length > n ? lines.slice(lines.length - n) : lines;
+  } finally {
+    closeSync(fd);
+  }
+}
 
 // ---------- HTTP routes via beforeRequest hook ----------
 
@@ -420,6 +505,16 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
   if (url === '/launcher' && method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(HTML_PAGE);
+    return;
+  }
+
+  // Capabilities probe — lets the launcher UI grey-out features that depend
+  // on optional cc-viewer bits (shell PTY needs PtySessionManager which some
+  // cc-viewer builds ship without).
+  if (url === '/api/launcher/capabilities' && method === 'GET') {
+    sendJson(res, 200, {
+      shell: !!_shellWssGetter(),
+    });
     return;
   }
 
@@ -1315,6 +1410,89 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
       }
       const urlLine = out.split('\n').map(s => s.trim()).find(s => /^https?:\/\//.test(s)) || out.trim();
       sendJson(res, 200, { ok: true, url: urlLine });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // Per-instance ask answer: opens a short-lived WebSocket to the target
+  // ccv's main /ws endpoint, sends an `ask-hook-answer` envelope with
+  // answers shaped `{ [questionText]: choiceLabel }` (matching what ccv's
+  // bundled UI sends), waits for the server's first-write-wins ack.
+  // The launcher's MC redesign uses this for inline ask answering.
+  const answerAskM = url.match(/^\/api\/launcher\/instances\/(\d+)\/answer-ask$/);
+  if (answerAskM && method === 'POST') {
+    try {
+      const pid = parseInt(answerAskM[1], 10);
+      const inst = instances.get(pid);
+      if (!inst) { sendJson(res, 404, { error: 'instance not found' }); return; }
+      if (!inst.port || !inst.token) { sendJson(res, 400, { error: 'instance missing port/token' }); return; }
+      const raw = await readBody(req);
+      const body = JSON.parse(raw || '{}');
+      const askId = body.askId;
+      const choiceLabel = body.choiceLabel;
+      if (!askId || choiceLabel == null) { sendJson(res, 400, { error: 'askId + choiceLabel required' }); return; }
+      // Resolve the question text from the live pendingAsks (single source of
+      // truth for which questions are in flight). Falls back to the choice
+      // label keyed under an empty string — ccv tolerates it but the bridge
+      // hook may not match, so we log a warning if so.
+      const asks = await fetchPendingAsks(inst);
+      const target = asks.find(a => a.id === askId);
+      let questionText = '';
+      if (target && Array.isArray(target.questions) && target.questions[0]) {
+        questionText = target.questions[0].question || target.questions[0].header || '';
+      }
+      if (!questionText) {
+        jlog('answer-ask-no-question-text', { pid, askId });
+      }
+      const result = await sendAnswerOverWs(inst, askId, { [questionText]: choiceLabel });
+      sendJson(res, 200, { ok: true, ack: result });
+    } catch (err) {
+      jlog('answer-ask-error', { error: err.message });
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // Per-instance ccv-log tail: reads the last N lines of the per-port stdout
+  // capture written by doSpawn (~/.claude/cc-viewer/launcher-logs/ccv-<port>.log).
+  // Powers the embedded terminal's "Logs" tab in the redesigned launcher.
+  // 5s in-memory cache keyed by (path, mtime, size, tail).
+  const ccvLogM = url.match(/^\/api\/launcher\/instances\/(\d+)\/ccv-log$/);
+  if (ccvLogM && method === 'GET') {
+    try {
+      const pid = parseInt(ccvLogM[1], 10);
+      const inst = instances.get(pid);
+      if (!inst) { sendJson(res, 404, { error: 'instance not found' }); return; }
+      let tail = parseInt(parsedUrl.searchParams.get('tail') || '200', 10);
+      if (!Number.isFinite(tail) || tail < 1) tail = 200;
+      if (tail > 2000) tail = 2000;
+      const path = ccvLogPath(inst.port);
+      if (!existsSync(path)) {
+        // No capture file. Most common cause: instance was spawned before the
+        // launcher started writing per-port stdout logs (instances that
+        // pre-date the Mission Control redesign don't have logs).
+        sendJson(res, 200, { pid, port: inst.port, path, lines: [], truncated: false, size: 0, mtime: 0, reason: 'no_log_file' });
+        return;
+      }
+      const st = statSync(path);
+      const cacheKey = path + '|' + st.size + '|' + st.mtimeMs + '|' + tail;
+      const cached = _ccvLogCache.get(cacheKey);
+      const now = Date.now();
+      if (cached && now - cached.computedAt < CCV_LOG_CACHE_TTL_MS) {
+        sendJson(res, 200, cached.payload);
+        return;
+      }
+      const lines = tailFileLines(path, tail, st.size);
+      const payload = { pid, port: inst.port, path, lines, truncated: lines.length === tail && st.size > 0, size: st.size, mtime: st.mtimeMs };
+      _ccvLogCache.set(cacheKey, { computedAt: now, payload });
+      // simple LRU-ish: drop oldest when over 64 entries
+      if (_ccvLogCache.size > 64) {
+        const firstKey = _ccvLogCache.keys().next().value;
+        if (firstKey) _ccvLogCache.delete(firstKey);
+      }
+      sendJson(res, 200, payload);
     } catch (err) {
       sendJson(res, 500, { error: err.message });
     }
