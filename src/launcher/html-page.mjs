@@ -679,6 +679,17 @@ export const HTML_PAGE = `<!doctype html>
 
   /* ---------- mobile (≤640px) ---------- */
   @media (max-width: 640px) {
+    /* Base typography: iOS reads 13px as "tiny". 15px is the natural body
+       size on phones; iOS also won't auto-zoom inputs that are ≥16px. */
+    body { font-size: 15px; line-height: 1.5; }
+    .focus-inner { gap: 14px; padding: 14px 14px; }
+    .focus-hd { gap: 6px; }
+    .focus-card { padding: 12px 14px; }
+    .card-hd { font-size: 11px; margin-bottom: 6px; }
+    .card-title { font-size: 14.5px; line-height: 1.5; }
+    .focus-hd .topic { font-size: 13px; padding: 8px 28px 8px 10px; }
+    .focus-hd .topic .topic-hd { font-size: 10px; }
+
     /* App bar: sticky, single row, safe-area handled here (not body) */
     #app-bar {
       position: sticky; top: 0; z-index: 50;
@@ -772,9 +783,14 @@ export const HTML_PAGE = `<!doctype html>
     .focus-hd .row1 { gap: 10px; row-gap: 6px; flex-wrap: wrap; }
     .focus-hd h1 { font-size: 18px; line-height: 1.25; }
 
-    /* Topic quotes (第一条 / 最近一条): clamp to 1 line, tap to expand */
+    /* Topic quotes (第一条 / 最近一条): clamp to 1 line, tap to expand.
+       Current Chromium aliases display:-webkit-box to flow-root, which
+       disables -webkit-line-clamp. Use classic nowrap+ellipsis for the
+       single-line case; the expanded state restores wrapping. */
     .focus-hd .topic {
-      -webkit-line-clamp: 1; line-clamp: 1;
+      display: block;
+      white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
       cursor: pointer; position: relative;
       padding-right: 28px;
     }
@@ -783,8 +799,7 @@ export const HTML_PAGE = `<!doctype html>
       transform: translateY(-50%); color: var(--mute); font-size: 10px;
     }
     .focus-hd .topic.expanded {
-      -webkit-line-clamp: unset; line-clamp: unset;
-      display: block; -webkit-box-orient: unset;
+      white-space: normal; overflow: visible; text-overflow: clip;
     }
     .focus-hd .topic.expanded::after { content: '▴'; }
 
