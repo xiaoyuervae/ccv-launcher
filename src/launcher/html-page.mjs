@@ -1301,12 +1301,13 @@ export const HTML_PAGE = `<!doctype html>
       if (a.choices.length) {
         for (var i = 0; i < a.choices.length; i++) {
           var c = a.choices[i];
-          html += '<button class="ask-btn' + (i === 0 ? ' primary' : '') + '" data-act="answer" data-ask="' + escape(a.id || '') + '" data-idx="' + i + '" data-label="' + escape(c.label) + '"' + (c.description ? ' title="' + escape(c.description) + '"' : '') + '>' + escape(c.label) + '</button>';
+          html += '<button class="ask-btn' + (i === 0 ? ' primary' : '') + '" data-act="open-ccv"' + (c.description ? ' title="' + escape(c.description) + '"' : '') + '>' + escape(c.label) + ' ↗</button>';
         }
       } else {
         html += '<button class="ask-btn primary" data-act="open-ccv">在 ccv 内回答 ↗</button>';
       }
       html += '</div>';
+      html += '<div class="ask-ctx" style="margin-top:8px;margin-bottom:0">点选项跳到 ccv 页面回答</div>';
       html += '</div>';
     } else if (answered) {
       html += '<div class="focus-card ok">';
@@ -1401,14 +1402,6 @@ export const HTML_PAGE = `<!doctype html>
     [].forEach.call(el.querySelectorAll('[data-act="open-ccv"]'), function(btn) {
       btn.addEventListener('click', function() { openCcv(inst); });
     });
-    [].forEach.call(el.querySelectorAll('[data-act="answer"]'), function(btn) {
-      btn.addEventListener('click', function() {
-        var askId = btn.getAttribute('data-ask');
-        var idx = +btn.getAttribute('data-idx');
-        var label = btn.getAttribute('data-label');
-        answerAsk(inst, askId, idx, label, btn);
-      });
-    });
     [].forEach.call(el.querySelectorAll('[data-act="copy-cwd"]'), function(btn) {
       btn.addEventListener('click', function(e) {
         e.stopPropagation();
@@ -1455,25 +1448,6 @@ export const HTML_PAGE = `<!doctype html>
     detachShell();
     stopLogsPoll();
     setTermTab(_state.termTab, true);
-  }
-
-  // ---------- answer ask ----------
-  function answerAsk(inst, askId, idx, label, btn) {
-    if (btn) btn.disabled = true;
-    _state.answered[inst.pid] = { askId: askId, label: label, at: Date.now() };
-    renderAskAlert(); renderTabStrip(); renderFocus();
-    api('/api/launcher/instances/' + inst.pid + '/answer-ask', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ askId: askId, choiceIndex: idx, choiceLabel: label }),
-    }).then(function(resp) {
-      // Success — keep optimistic state until next poll confirms ask cleared.
-    }).catch(function(err) {
-      // Revert; fall back to opening ccv so user can answer there.
-      delete _state.answered[inst.pid];
-      renderAskAlert(); renderTabStrip(); renderFocus();
-      openCcv(inst);
-    });
   }
 
   // ---------- per-instance actions ----------
