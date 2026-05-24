@@ -752,12 +752,30 @@ export const HTML_PAGE = `<!doctype html>
     .focus-inner { padding: 12px 14px; gap: 10px; }
     .focus-hd h1 { font-size: 16px; }
 
-    /* Header: hide redundant "Open ccv" (bottom bar already has it) +
-       hide pid/port meta (diagnostic, no operator value on phone) */
+    /* Header: hide redundant "Open ccv" + pid/port meta + row1 status badge
+       (the "现在在做的事" card below already conveys the same status with
+       a clearer label and avoids iOS's weird ⌨/⏸ glyph fallbacks). */
     .focus-hd .row1 .btn-primary[data-act="open-ccv"] { display: none; }
     .focus-hd .row1 .meta { display: none; }
+    .focus-hd .row1 .status-badge { display: none; }
     .focus-hd .row1 { gap: 10px; row-gap: 6px; flex-wrap: wrap; }
-    .focus-hd h1 { font-size: 17px; line-height: 1.25; }
+    .focus-hd h1 { font-size: 18px; line-height: 1.25; }
+
+    /* Topic quotes (第一条 / 最近一条): clamp to 1 line, tap to expand */
+    .focus-hd .topic {
+      -webkit-line-clamp: 1; line-clamp: 1;
+      cursor: pointer; position: relative;
+      padding-right: 28px;
+    }
+    .focus-hd .topic::after {
+      content: '▾'; position: absolute; right: 8px; top: 50%;
+      transform: translateY(-50%); color: var(--mute); font-size: 10px;
+    }
+    .focus-hd .topic.expanded {
+      -webkit-line-clamp: unset; line-clamp: unset;
+      display: block; -webkit-box-orient: unset;
+    }
+    .focus-hd .topic.expanded::after { content: '▴'; }
 
     /* cwd: show tail of path on overflow, copy chip stays right */
     .focus-hd .cwd { font-size: 12px; }
@@ -784,9 +802,22 @@ export const HTML_PAGE = `<!doctype html>
       justify-content: center; text-align: center;
     }
 
-    /* Stat boxes */
-    .stat-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
-    .stat-box { padding: 10px 12px; }
+    /* Stat boxes: single column on phone so big numbers and subtexts read well */
+    .stat-grid { grid-template-columns: 1fr; gap: 8px; }
+    .stat-box { padding: 12px 14px; }
+    .stat-box .big { font-size: 18px; }
+    .stat-box .sub { font-size: 11.5px; margin-top: 5px; }
+
+    /* Recent edits: bigger font, RTL-trick ellipsis to keep filename visible */
+    .edits-list { gap: 6px; }
+    .edit-row {
+      font-size: 12.5px; padding: 4px 0; gap: 10px;
+    }
+    .edit-tool { font-size: 11px; min-width: 42px; }
+    .edit-path {
+      direction: rtl; text-align: left; unicode-bidi: plaintext;
+    }
+    .edit-n { font-size: 11px; }
 
     /* Bottom action bar: safe-area, ≥44px tap targets */
     #mobile-bar {
@@ -1434,12 +1465,12 @@ export const HTML_PAGE = `<!doctype html>
       html += '<div class="big">—</div>';
     }
     html += '</div>';
-    // Git
+    // Git — only render box when there's a worktree (empty state wastes space)
     var git = (_state.gitByPid[inst.pid] || {}).data;
     var wt = (git && git.worktree) || inst.worktree;
-    html += '<div class="stat-box">';
-    html += '<div class="hd">Git</div>';
     if (wt) {
+      html += '<div class="stat-box">';
+      html += '<div class="hd">Git</div>';
       html += '<div style="font-family:var(--mono);font-size:11px;color:#a5d6ff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">🌿 ' + escape(wt.branch || '?') + '</div>';
       if (git && git.stat) {
         html += '<div class="sub"><span style="color:var(--ok)">+' + (git.stat.additions || 0) + '</span> <span style="color:var(--bad);margin:0 6px">−' + (git.stat.deletions || 0) + '</span> <span>' + (git.stat.files || 0) + ' files</span></div>';
@@ -1458,10 +1489,8 @@ export const HTML_PAGE = `<!doctype html>
         }
         html += '</div>';
       }
-    } else {
-      html += '<div class="big">—</div><div class="sub">no worktree</div>';
+      html += '</div>';
     }
-    html += '</div>';
     html += '</div>';
 
     // recent edits
@@ -1506,6 +1535,9 @@ export const HTML_PAGE = `<!doctype html>
     });
     [].forEach.call(el.querySelectorAll('[data-act="kill"]'), function(btn) {
       btn.addEventListener('click', function() { killCcv(inst); });
+    });
+    [].forEach.call(el.querySelectorAll('.focus-hd .topic'), function(t) {
+      t.addEventListener('click', function() { t.classList.toggle('expanded'); });
     });
   }
 
