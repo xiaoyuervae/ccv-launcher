@@ -14,9 +14,27 @@ export const HTML_PAGE = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>ccv launcher</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<script>
+  // Lazy-load xterm only on viewports that show the docked terminal (>640px).
+  // Saves ~200KB + 3 cross-origin RTTs on mobile, where #term-panel is hidden.
+  (function() {
+    if (matchMedia('(max-width: 640px)').matches) return;
+    var head = document.head;
+    var css = document.createElement('link');
+    css.rel = 'stylesheet';
+    css.href = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css';
+    head.appendChild(css);
+    var s1 = document.createElement('script');
+    s1.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js';
+    s1.async = false;
+    head.appendChild(s1);
+    var s2 = document.createElement('script');
+    s2.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js';
+    s2.async = false;
+    head.appendChild(s2);
+  })();
+</script>
 <style>
   :root {
     --bg:#0d1117; --bg2:#161b22; --bg3:#1c2128;
@@ -734,8 +752,12 @@ export const HTML_PAGE = `<!doctype html>
     .focus-inner { padding: 12px 14px; gap: 10px; }
     .focus-hd h1 { font-size: 16px; }
 
-    /* Header: hide redundant "Open ccv" (bottom bar already has it) */
+    /* Header: hide redundant "Open ccv" (bottom bar already has it) +
+       hide pid/port meta (diagnostic, no operator value on phone) */
     .focus-hd .row1 .btn-primary[data-act="open-ccv"] { display: none; }
+    .focus-hd .row1 .meta { display: none; }
+    .focus-hd .row1 { gap: 10px; row-gap: 6px; flex-wrap: wrap; }
+    .focus-hd h1 { font-size: 17px; line-height: 1.25; }
 
     /* cwd: show tail of path on overflow, copy chip stays right */
     .focus-hd .cwd { font-size: 12px; }
@@ -912,6 +934,9 @@ export const HTML_PAGE = `<!doctype html>
       if (!r.ok) throw new Error('http ' + r.status);
       return r.json();
     });
+  }
+  function isMobileViewport() {
+    return window.matchMedia && window.matchMedia('(max-width: 640px)').matches;
   }
   function escape(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
@@ -1512,6 +1537,7 @@ export const HTML_PAGE = `<!doctype html>
     detachConsole();
     detachShell();
     stopLogsPoll();
+    if (isMobileViewport()) return; // term panel hidden on mobile
     setTermTab(_state.termTab, true);
   }
 
@@ -1776,6 +1802,7 @@ export const HTML_PAGE = `<!doctype html>
   function startLogsPoll(inst) {
     stopLogsPoll();
     if (!inst || !inst.pid) return;
+    if (isMobileViewport()) return; // term panel hidden on mobile
     var pid = inst.pid;
     var host = document.getElementById('host-logs');
     function tick() {
@@ -2286,7 +2313,7 @@ export const HTML_PAGE = `<!doctype html>
     loadPrefs();
     refreshList().then(function() {
       refreshActivity().then(function() {
-        setTermTab(_state.termTab, true);
+        if (!isMobileViewport()) setTermTab(_state.termTab, true);
       });
       refreshStats();
     });
