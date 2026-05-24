@@ -529,7 +529,49 @@ export const HTML_PAGE = `<!doctype html>
     background: var(--bg3); color: var(--fg); border: 1px solid var(--line);
     border-radius: 5px; padding: 4px 10px; font-size: 12px; cursor: pointer;
   }
-  #ccv-overlay iframe { flex: 1; min-height: 0; border: 0; background: var(--bg); width: 100%; }
+  #ccv-overlay #ccv-frames {
+    position: relative; flex: 1; min-height: 0; background: var(--bg);
+  }
+  #ccv-overlay #ccv-frames iframe {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    border: 0; background: var(--bg);
+  }
+  #ccv-overlay #ccv-frames iframe.hidden {
+    display: none;
+  }
+  #ccv-overlay .ov-hd .grow { flex: 1; }
+  #ccv-tabs {
+    display: flex; align-items: center; gap: 4px;
+    overflow-x: auto; min-width: 0;
+  }
+  #ccv-tabs::-webkit-scrollbar { display: none; }
+  .ccv-tab {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 4px 3px 10px; cursor: pointer;
+    background: var(--bg3); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 5px;
+    font-size: 11px; font-family: var(--mono);
+    max-width: 200px;
+    user-select: none; white-space: nowrap;
+  }
+  .ccv-tab:hover { border-color: var(--accent); }
+  .ccv-tab.active {
+    background: var(--accent); color: var(--bg);
+    border-color: var(--accent); font-weight: 600;
+  }
+  .ccv-tab .nm {
+    overflow: hidden; text-overflow: ellipsis;
+    max-width: 120px;
+  }
+  .ccv-tab .port { opacity: .7; font-size: 10px; }
+  .ccv-tab .x {
+    border: 0; background: transparent;
+    color: inherit; opacity: .6; cursor: pointer;
+    padding: 0 4px; font-size: 13px; line-height: 1;
+    border-radius: 3px;
+  }
+  .ccv-tab .x:hover { opacity: 1; background: rgba(0,0,0,.18); }
+  .ccv-tab.active .x:hover { background: rgba(255,255,255,.22); }
   #ccv-frame-err {
     display: none; position: absolute; inset: 41px 0 0 0;
     background: rgba(13, 17, 23, .96); color: var(--fg);
@@ -756,14 +798,13 @@ export const HTML_PAGE = `<!doctype html>
 <div id="ccv-overlay">
   <div class="ov-hd">
     <span class="tag">CCV</span>
-    <span class="name" id="ccv-name">—</span>
-    <span class="port" id="ccv-port"></span>
-    <span class="path" id="ccv-path"></span>
-    <button id="ccv-newtab" title="新标签页">↗</button>
-    <button id="ccv-reload" title="刷新">⟳</button>
-    <button id="ccv-close" title="关闭 (Esc)">Close</button>
+    <div id="ccv-tabs"></div>
+    <span class="grow"></span>
+    <button id="ccv-newtab" title="在浏览器新 tab 打开当前 session">↗</button>
+    <button id="ccv-reload" title="刷新当前 tab">⟳</button>
+    <button id="ccv-close" title="关闭 (Esc) — iframe 保留在内存中">Close</button>
   </div>
-  <iframe id="ccv-frame" src="about:blank" allow="clipboard-read; clipboard-write; fullscreen"></iframe>
+  <div id="ccv-frames"></div>
   <div id="ccv-frame-err">
     <div class="err-title">⚠ Failed to load ccv</div>
     <div id="ccv-err-detail" style="color:var(--mute);font-size:12px">The ccv at this port did not respond.</div>
@@ -872,6 +913,8 @@ export const HTML_PAGE = `<!doctype html>
     localCcSessions: [],    // bare claude processes not under ccv
     prefs: null,            // { availableProfiles: [], defaultCcuseProfile, ... }
     railOpen: { hist: false, untracked: false },
+    openCcvs: [],           // pids of ccv iframes currently mounted in overlay
+    activeOverlayPid: null, // which pid is visible in #ccv-overlay
   };
   try {
     var p = JSON.parse(localStorage.getItem('ccvMcState') || '{}');
@@ -1760,28 +1803,123 @@ export const HTML_PAGE = `<!doctype html>
     }
   }
 
-  // ---------- ccv iframe overlay ----------
-  var _ccvWatchdog = null;
+  // ---------- ccv iframe overlay (multi-tab) ----------
   function ccvUrl(inst) {
     if (inst.publicUrl) return inst.publicUrl;
     if (inst.lanUrl) return inst.lanUrl;
     return location.protocol + '//' + location.hostname + ':' + inst.port + '/' + (inst.token ? ('?token=' + encodeURIComponent(inst.token)) : '');
   }
+  // Multi-tab ccv overlay. Each "Open ccv" call adds (or focuses) a tab in
+  // the overlay's top strip; iframes for non-active tabs are kept alive but
+  // hidden so switching is instant and state (scroll, input, sse stream)
+  // is preserved.
   function openCcv(inst) {
-    // Open ccv in a new browser tab so the launcher stays put and each
-    // session gets its own tab the user can pin / switch between. The old
-    // inline iframe overlay (#ccv-overlay) is left in the DOM for now but
-    // is no longer triggered.
     if (!inst) return;
-    var src = ccvUrl(inst);
-    window.open(src, '_blank', 'noopener,noreferrer');
+    var pid = inst.pid;
+    if (!_state.openCcvs.includes(pid)) _state.openCcvs.push(pid);
+    _state.activeOverlayPid = pid;
+    var ov = document.getElementById('ccv-overlay');
+    if (ov) ov.classList.add('open');
+    ensureCcvFrame(inst);
+    renderCcvTabs();
+    showActiveCcvFrame();
   }
+
+  function ensureCcvFrame(inst) {
+    var host = document.getElementById('ccv-frames');
+    if (!host) return;
+    var existing = host.querySelector('iframe[data-pid="' + inst.pid + '"]');
+    if (existing) return existing;
+    var fr = document.createElement('iframe');
+    fr.setAttribute('data-pid', String(inst.pid));
+    fr.setAttribute('allow', 'clipboard-read; clipboard-write; fullscreen');
+    fr.className = 'hidden';
+    fr.src = ccvUrl(inst);
+    host.appendChild(fr);
+    return fr;
+  }
+
+  function showActiveCcvFrame() {
+    var host = document.getElementById('ccv-frames');
+    if (!host) return;
+    var pid = _state.activeOverlayPid;
+    [].forEach.call(host.querySelectorAll('iframe'), function(fr) {
+      var p = +fr.getAttribute('data-pid');
+      fr.classList.toggle('hidden', p !== pid);
+    });
+    var err = document.getElementById('ccv-frame-err');
+    if (err) err.classList.remove('show');
+  }
+
+  function renderCcvTabs() {
+    var el = document.getElementById('ccv-tabs');
+    if (!el) return;
+    var html = '';
+    for (var i = 0; i < _state.openCcvs.length; i++) {
+      var pid = _state.openCcvs[i];
+      var inst = _state.instances.find(function(x) { return x.pid === pid; });
+      var label = inst ? (inst.alias || inst.displayName || inst.projectName || ('pid ' + pid)) : ('pid ' + pid);
+      var port = inst && inst.port ? (':' + inst.port) : '';
+      var active = pid === _state.activeOverlayPid;
+      html += '<div class="ccv-tab' + (active ? ' active' : '') + '" data-pid="' + pid + '" title="' + escape((inst && inst.cwd) || '') + '">';
+      html += '<span class="nm">' + escape(label) + '</span>';
+      if (port) html += '<span class="port">' + escape(port) + '</span>';
+      html += '<button class="x" data-close-pid="' + pid + '" title="关闭此 tab">×</button>';
+      html += '</div>';
+    }
+    el.innerHTML = html;
+    [].forEach.call(el.querySelectorAll('.ccv-tab'), function(t) {
+      t.addEventListener('click', function(e) {
+        if (e.target && e.target.classList && e.target.classList.contains('x')) return;
+        var pid = +t.getAttribute('data-pid');
+        _state.activeOverlayPid = pid;
+        renderCcvTabs();
+        showActiveCcvFrame();
+      });
+    });
+    [].forEach.call(el.querySelectorAll('.x'), function(x) {
+      x.addEventListener('click', function(e) {
+        e.stopPropagation();
+        closeCcvTab(+x.getAttribute('data-close-pid'));
+      });
+    });
+  }
+
+  function closeCcvTab(pid) {
+    var idx = _state.openCcvs.indexOf(pid);
+    if (idx < 0) return;
+    _state.openCcvs.splice(idx, 1);
+    var host = document.getElementById('ccv-frames');
+    var fr = host && host.querySelector('iframe[data-pid="' + pid + '"]');
+    if (fr) fr.remove();
+    if (_state.activeOverlayPid === pid) {
+      _state.activeOverlayPid = _state.openCcvs[Math.min(idx, _state.openCcvs.length - 1)] || null;
+    }
+    if (!_state.openCcvs.length) {
+      closeCcv();
+      return;
+    }
+    renderCcvTabs();
+    showActiveCcvFrame();
+  }
+
   function closeCcv() {
     var ov = document.getElementById('ccv-overlay');
-    var fr = document.getElementById('ccv-frame');
     if (ov) ov.classList.remove('open');
-    if (fr) fr.src = 'about:blank';
-    if (_ccvWatchdog) { clearTimeout(_ccvWatchdog); _ccvWatchdog = null; }
+    // Keep iframes alive so reopening is instant — only hide the panel.
+    // Use closeAllCcvTabs() if a true "destroy everything" path is needed.
+  }
+
+  function reloadActiveCcv() {
+    var pid = _state.activeOverlayPid;
+    var host = document.getElementById('ccv-frames');
+    var fr = host && host.querySelector('iframe[data-pid="' + pid + '"]');
+    if (fr) fr.src = fr.src;
+  }
+  function openActiveCcvInNewTab() {
+    var pid = _state.activeOverlayPid;
+    var inst = _state.instances.find(function(x) { return x.pid === pid; });
+    if (inst) window.open(ccvUrl(inst), '_blank', 'noopener,noreferrer');
   }
 
   // ---------- mobile sheet (fullscreen Console/Shell) ----------
@@ -2068,6 +2206,10 @@ export const HTML_PAGE = `<!doctype html>
     document.getElementById('new-cancel').addEventListener('click', function() { document.getElementById('dlg').close(); });
     document.getElementById('new-launch').addEventListener('click', submitNew);
     document.getElementById('ccv-close').addEventListener('click', closeCcv);
+    document.getElementById('ccv-reload').addEventListener('click', reloadActiveCcv);
+    document.getElementById('ccv-newtab').addEventListener('click', openActiveCcvInNewTab);
+    document.getElementById('ccv-err-retry').addEventListener('click', reloadActiveCcv);
+    document.getElementById('ccv-err-newtab').addEventListener('click', openActiveCcvInNewTab);
     document.getElementById('term-toggle').addEventListener('click', toggleTerm);
     document.getElementById('term-clear').addEventListener('click', function() {
       if (_state.termTab === 'console' && _console) _console.term.clear();
