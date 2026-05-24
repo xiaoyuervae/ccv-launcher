@@ -45,12 +45,15 @@ export const HTML_PAGE = `<!doctype html>
     --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { background: var(--bg); color: var(--fg); }
+  html, body {
+    background: var(--bg); color: var(--fg);
+    overflow-x: hidden; max-width: 100vw;
+  }
   body {
     font: 13px/1.45 var(--sans);
     min-height: 100vh; min-height: 100dvh;
     display: flex; flex-direction: column;
-    overflow: hidden;
+    overflow-y: hidden;
   }
 
   /* ---------- app bar ---------- */
@@ -181,8 +184,8 @@ export const HTML_PAGE = `<!doctype html>
   /* ---------- main grid: rail + focus column ---------- */
   #mc-grid {
     flex: 1; display: grid;
-    grid-template-columns: 220px 1fr;
-    min-height: 0;
+    grid-template-columns: 220px minmax(0, 1fr);
+    min-height: 0; min-width: 0;
   }
   #rail {
     background: var(--bg); padding: 10px 8px;
@@ -259,9 +262,9 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   /* ---------- focus column ---------- */
-  #focus-col { display: flex; flex-direction: column; min-height: 0; }
-  #focus { flex: 1 1 0; min-height: 0; overflow: auto; }
-  .focus-inner { padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; }
+  #focus-col { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  #focus { flex: 1 1 0; min-height: 0; min-width: 0; overflow: auto; }
+  .focus-inner { padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
   .focus-hd { display: flex; flex-direction: column; gap: 3px; }
   .focus-hd .row1 { display: flex; align-items: center; gap: 8px; }
   .focus-hd h1 { font-size: 17px; font-weight: 600; letter-spacing: -.3px; margin: 0; }
@@ -428,7 +431,7 @@ export const HTML_PAGE = `<!doctype html>
   }
   .edit-tool { color: var(--warn); min-width: 48px; font-weight: 600; }
   .edit-path {
-    color: var(--fg); flex: 1; overflow: hidden;
+    color: var(--fg); flex: 1; min-width: 0; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap;
   }
   .edit-n { color: var(--mute); font-size: 10px; }
