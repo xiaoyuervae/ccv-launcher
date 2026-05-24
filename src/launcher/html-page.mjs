@@ -727,21 +727,29 @@ export const HTML_PAGE = `<!doctype html>
     .tab .port { display: none; }
     .tab .hub-tag { display: none; }
 
-    /* Ask alert → expanded attention card */
+    /* Ask alert: compact strip, not a giant card. Hide the "N 等回答" tag
+       (the chip's red left bar + dot already say "ask"), single-line chip
+       with name + question, full-width tap. */
     #ask-alert {
       flex-direction: column; align-items: stretch;
-      background: linear-gradient(180deg, rgba(248,81,73,.12), rgba(248,81,73,.04));
-      border: 1px solid rgba(248,81,73,.30); border-radius: 10px;
-      margin: 10px 12px 0; padding: 10px 12px 12px;
+      background: rgba(248,81,73,.08);
+      border-top: 1px solid rgba(248,81,73,.25);
+      border-bottom: 1px solid rgba(248,81,73,.25);
+      margin: 0; padding: 6px 12px;
     }
-    .alert-chips { flex-direction: column; gap: 8px; overflow: visible; }
+    #ask-alert .alert-tag { display: none; }
+    .alert-chips { flex-direction: column; gap: 4px; overflow: visible; }
     .alert-chip {
-      background: var(--bg2); border-left: 2px solid var(--ask);
-      border-radius: 8px; padding: 11px 12px;
-      align-items: flex-start; flex-direction: column; gap: 4px;
-      white-space: normal; min-height: 44px;
+      background: var(--bg2); border-left: 3px solid var(--ask);
+      border-radius: 6px; padding: 8px 10px;
+      align-items: center; flex-direction: row; gap: 6px;
+      white-space: nowrap; min-height: 38px;
+      overflow: hidden;
     }
-    .alert-chip .q { max-width: 100%; white-space: normal; }
+    .alert-chip .q {
+      max-width: none; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0;
+    }
     #ask-alert .kbd-hint { display: none; }
 
     /* Layout: single column, no rail, no docked terminal */
@@ -802,11 +810,13 @@ export const HTML_PAGE = `<!doctype html>
       justify-content: center; text-align: center;
     }
 
-    /* Stat boxes: single column on phone so big numbers and subtexts read well */
-    .stat-grid { grid-template-columns: 1fr; gap: 8px; }
-    .stat-box { padding: 12px 14px; }
-    .stat-box .big { font-size: 18px; }
-    .stat-box .sub { font-size: 11.5px; margin-top: 5px; }
+    /* Stat boxes: 2-col is fine on phone (CONTEXT + COST), since GIT is
+       hidden when no worktree. If a worktree exists, the third box wraps
+       to a new row at half width, which still reads cleanly. */
+    .stat-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .stat-box { padding: 10px 12px; }
+    .stat-box .big { font-size: 16px; }
+    .stat-box .sub { font-size: 11px; margin-top: 4px; }
 
     /* Recent edits: bigger font, RTL-trick ellipsis to keep filename visible */
     .edits-list { gap: 6px; }
