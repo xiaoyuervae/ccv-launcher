@@ -1693,21 +1693,32 @@ export const HTML_PAGE = `<!doctype html>
     // ask card
     if (asks.length > 0 && !answered) {
       var a = asks[0];
+      // multi-select 没法用单按钮回，回退到跳 ccv 的旧行为
+      var multi = !!a.multiSelect;
       html += '<div class="focus-card ask">';
       html += '<div class="card-hd">⏳ ccv 在等你回答</div>';
       html += '<div class="ask-q">' + escape(a.question) + '</div>';
       if (a.context) html += '<div class="ask-ctx">' + escape(a.context) + '</div>';
       html += '<div class="ask-choices">';
-      if (a.choices.length) {
+      if (a.choices.length && !multi) {
         for (var i = 0; i < a.choices.length; i++) {
           var c = a.choices[i];
-          html += '<button class="ask-btn' + (i === 0 ? ' primary' : '') + '" data-act="open-ccv"' + (c.description ? ' title="' + escape(c.description) + '"' : '') + '>' + escape(c.label) + ' ↗</button>';
+          html += '<button class="ask-btn' + (i === 0 ? ' primary' : '') + '" data-act="answer-ask" data-ask="' + escape(a.id || '') + '" data-idx="' + i + '" data-label="' + escape(c.label) + '"' + (c.description ? ' title="' + escape(c.description) + '"' : '') + '>' + escape(c.label) + '</button>';
+        }
+        html += '<button class="ask-btn" data-act="open-ccv" title="在 ccv 内查看完整上下文 / 选 Other">↗</button>';
+      } else if (a.choices.length && multi) {
+        // multi-select：保留跳 ccv 的入口（直接答需要多选 UI）
+        for (var j = 0; j < a.choices.length; j++) {
+          var cc = a.choices[j];
+          html += '<button class="ask-btn' + (j === 0 ? ' primary' : '') + '" data-act="open-ccv"' + (cc.description ? ' title="' + escape(cc.description) + '"' : '') + '>' + escape(cc.label) + ' ↗</button>';
         }
       } else {
         html += '<button class="ask-btn primary" data-act="open-ccv">在 ccv 内回答 ↗</button>';
       }
       html += '</div>';
-      html += '<div class="ask-ctx" style="margin-top:8px;margin-bottom:0">点选项跳到 ccv 页面回答</div>';
+      if (multi) {
+        html += '<div class="ask-ctx" style="margin-top:8px;margin-bottom:0">多选题，跳到 ccv 页面勾选</div>';
+      }
       html += '</div>';
     } else if (answered) {
       html += '<div class="focus-card ok">';
@@ -1831,6 +1842,14 @@ export const HTML_PAGE = `<!doctype html>
     [].forEach.call(el.querySelectorAll('[data-act="open-ccv"]'), function(btn) {
       btn.addEventListener('click', function() { openCcv(inst); });
     });
+    [].forEach.call(el.querySelectorAll('[data-act="answer-ask"]'), function(btn) {
+      btn.addEventListener('click', function() {
+        var askId = btn.getAttribute('data-ask');
+        var idx = +btn.getAttribute('data-idx');
+        var label = btn.getAttribute('data-label');
+        answerAsk(inst, askId, idx, label, btn);
+      });
+    });
     [].forEach.call(el.querySelectorAll('[data-act="copy-cwd"]'), function(btn) {
       btn.addEventListener('click', function(e) {
         e.stopPropagation();
@@ -1851,6 +1870,25 @@ export const HTML_PAGE = `<!doctype html>
     });
     [].forEach.call(el.querySelectorAll('.focus-hd .topic'), function(t) {
       t.addEventListener('click', function() { t.classList.toggle('expanded'); });
+    });
+  }
+
+  // ---------- answer ask ----------
+  // 把 launcher 上选中的选项打回 ccv，避免用户每次都得跳到 ccv 标签去点。
+  // 走 launcher 后端 /answer-ask（再用短连 WS 发到 ccv 的 ws-hook 桥）。
+  // 乐观更新：先把 inst 标记成 answered，让 ✓ 横条立刻出现；失败时撤销并退回到打开 ccv。
+  function answerAsk(inst, askId, idx, label, btn) {
+    if (btn) btn.disabled = true;
+    _state.answered[inst.pid] = { askId: askId, label: label, at: Date.now() };
+    renderAskAlert(); renderTabStrip(); renderFocus();
+    api('/api/launcher/instances/' + inst.pid + '/answer-ask', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ askId: askId, choiceIndex: idx, choiceLabel: label }),
+    }).catch(function() {
+      delete _state.answered[inst.pid];
+      renderAskAlert(); renderTabStrip(); renderFocus();
+      openCcv(inst);
     });
   }
 
@@ -2458,6 +2496,9 @@ export const HTML_PAGE = `<!doctype html>
     });
   }
   function loadDir(path) {
+    // Defense in depth: even if a caller accidentally passes the click Event
+    // (addEventListener forwards it as arg[0]), don't let it land in /new-cwd.
+    if (typeof path !== 'string') path = '';
     var qs = path ? ('?path=' + encodeURIComponent(path)) : '';
     api('/api/launcher/browse-dir' + qs).then(function(d) {
       // Backend shape: { current, parent, dirs: [{ name, path, hasGit }] }
