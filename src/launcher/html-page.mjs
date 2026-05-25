@@ -1982,26 +1982,16 @@ export const HTML_PAGE = `<!doctype html>
     });
   }
 
-  // status -> 排序优先级（小=靠前）：等回答 > 进行中 > 等待 > 空闲 > error
-  var STATUS_RANK = {
-    waiting_ask: 0,
-    thinking: 1, tool_running: 1,
-    waiting_tool: 2, waiting_input: 2,
-    idle: 3, no_session: 3,
-    error: 4,
-  };
+  // 纯按 lastEventAt 倒序：最近活动的会话靠前。等回答状态已在卡片角标
+  // 和顶部 alert 上有强提示，不再让它强制顶置而打乱时间感。
   function instanceSortKey(it) {
     var act = _state.activityByPid[it.pid] || {};
-    var rank = STATUS_RANK[act.status];
-    if (rank == null) rank = 3;
-    var ts = Date.parse(act.lastEventAt) || 0;
-    return { rank: rank, ts: ts };
+    return Date.parse(act.lastEventAt) || 0;
   }
   function sortInstances(list) {
     return list.slice().sort(function(a, b) {
-      var ka = instanceSortKey(a), kb = instanceSortKey(b);
-      if (ka.rank !== kb.rank) return ka.rank - kb.rank;
-      if (ka.ts !== kb.ts) return kb.ts - ka.ts; // 最近优先
+      var ta = instanceSortKey(a), tb = instanceSortKey(b);
+      if (ta !== tb) return tb - ta;
       return (a.pid || 0) - (b.pid || 0);
     });
   }
