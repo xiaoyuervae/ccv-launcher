@@ -19,7 +19,7 @@ import {
   RUNTIME_DIR, instances, setSelfBinding, safeJson, pidAlive, renderTemplate, buildPublicUrl, buildLanUrl, loadRuntimeFile, rescanRuntime, BACKFILL_TTL_MS, PROBE_TIMEOUT_MS, probeCcv, listListeningNodePids, readPidCwd, readPidStartedMs, backfillExternalCcvs, LOCAL_CC_CACHE_TTL_MS, decodeProjectDirName, readJsonlCwd, readJsonlLastTimestamp, readPidLstart, listLocalCcSessions, spawnCcvInTerminal, killClaudePid, startWatcher, serializeSpawn, nextFreePort, findRunningByCwd, waitForChildRuntime, _pidWorktrees, WORKTREE_NAME_RE, BRANCH_NAME_RE, isInsideDir, gitInCwd, detectBaseRef, createWorktree, removeWorktree, worktreeForPid, MD_FILE_MAX_BYTES, MD_PREVIEW_BYTES, MD_BACKUP_KEEP, HOME_CLAUDE_DIR, safeRealpath, isAllowedMdPath, safeReadPreview, pushMdFile, scanClaudeMd, backupMdBeforeWrite, doSpawn, LAUNCHER_LOG_DIR, ccvLogPath,
 } from './runtime.mjs';
 import {
-  USAGE_CACHE_FILE, USAGE_CACHE_TTL_MS, loadPricing, loadModels, getModelInfo, computeContextUsage, priceForModel, emptyTokenBucket, computeCostForEntry, costFromUsage, usageFromEntries, readJsonlEntries, rangeStartMs, listSessionJsonlPaths, aggregateUsage, loadUsageCacheFromDisk, saveUsageCacheToDisk, refreshUsageInBackground, getCachedUsage, readInstanceUsage, encodeCwdToProjectDir, resolveNativeJsonl, countSessionsForCwd, listSessionsForCwd, listShellHistoryProjects, CCLINE_CACHE_FILE, CLAUDE_CREDS_FILE, QUOTA_5H_MEM_TTL_MS, QUOTA_5H_DISK_TTL_MS, PLAN_THRESHOLDS, readCclineCache, readClaudeOauthToken, fetchOauthUsage, blocksFromTurns, detectPlan, p90, gatherTurnsForBlocks, computeFiveHourBlock, loadQuota5hFromDisk, saveQuota5hToDisk, buildQuota5h, refreshQuota5hInBackground, getCachedQuota5h, COMPACT_COOLDOWN_MS, injectPromptToCcv, checkCompactThresholds, readJsonlEntriesIndexed, truncateLabel, classifyEntry, JSONL_SCAN_TTL_MS, RUN_SUMMARY_MAX_EVENTS, ERROR_SAMPLES_PER_GROUP, scanJsonlAll, computeRunSummary, computeRecentEdits, computeErrors,
+  USAGE_CACHE_FILE, USAGE_CACHE_TTL_MS, loadPricing, loadModels, getModelInfo, computeContextUsage, priceForModel, emptyTokenBucket, computeCostForEntry, costFromUsage, usageFromEntries, readJsonlEntries, rangeStartMs, listSessionJsonlPaths, aggregateUsage, loadUsageCacheFromDisk, saveUsageCacheToDisk, refreshUsageInBackground, getCachedUsage, readInstanceUsage, encodeCwdToProjectDir, resolveNativeJsonl, countSessionsForCwd, newestJsonlMtimeMsForCwd, listSessionsForCwd, listShellHistoryProjects, CCLINE_CACHE_FILE, CLAUDE_CREDS_FILE, QUOTA_5H_MEM_TTL_MS, QUOTA_5H_DISK_TTL_MS, PLAN_THRESHOLDS, readCclineCache, readClaudeOauthToken, fetchOauthUsage, blocksFromTurns, detectPlan, p90, gatherTurnsForBlocks, computeFiveHourBlock, loadQuota5hFromDisk, saveQuota5hToDisk, buildQuota5h, refreshQuota5hInBackground, getCachedQuota5h, COMPACT_COOLDOWN_MS, injectPromptToCcv, checkCompactThresholds, readJsonlEntriesIndexed, truncateLabel, classifyEntry, JSONL_SCAN_TTL_MS, RUN_SUMMARY_MAX_EVENTS, ERROR_SAMPLES_PER_GROUP, scanJsonlAll, computeRunSummary, computeRecentEdits, computeErrors,
 } from './usage.mjs';
 import {
   ccvProjectName, findActiveLogFile, parseJsonlFilenameTime, pickInstanceLogs, findActiveLogFileForInstance, tailJsonlEntries, truncate, lastUserPrompt, lastUserPromptAcrossEntries, firstUserPrompt, stripUserPromptFraming, readFirstUserPrompt, inspectToolFlow, summarizeToolInput, summarizeEntry, ageString, fetchPendingAsks, deriveStatus, findRecentAssistantTextTs, isAssistantTextEnd,
@@ -567,11 +567,23 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
       ccuseProfile: getCcuseProfile(i.cwd),
       worktree: worktreeForPid(i.pid),
     }));
-    const enrichedIdle = idle.map(i => ({
-      ...i,
-      alias: getAlias(i.cwd),
-      sessionCount: countSessionsForCwd(i.cwd),
-    }));
+    // workspace-registry's `lastUsed` only updates when a workspace is opened
+    // *through* ccv (registerWorkspace), so a project worked on via bare claude
+    // or via `ccv` without re-registering stays frozen at its old timestamp
+    // and the rail sorts it incorrectly. Override with max(registry, newest
+    // jsonl mtime in ~/.claude/projects/<encoded>/) so the age + sort reflect
+    // actual session activity.
+    const enrichedIdle = idle.map(i => {
+      const jsonlMs = newestJsonlMtimeMsForCwd(i.cwd);
+      const registryMs = i.lastUsed ? Date.parse(i.lastUsed) : 0;
+      const bestMs = Math.max(jsonlMs || 0, registryMs || 0);
+      return {
+        ...i,
+        alias: getAlias(i.cwd),
+        sessionCount: countSessionsForCwd(i.cwd),
+        lastUsed: bestMs ? new Date(bestMs).toISOString() : i.lastUsed,
+      };
+    });
     // Running instances also benefit from session count (so the focus pane
     // could later show "this cwd has N past sessions"). Cheap, runs once.
     const enrichedRunningWithSessions = enrichedRunning.map(i => ({

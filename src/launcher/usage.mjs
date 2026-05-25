@@ -471,6 +471,24 @@ export function countSessionsForCwd(cwd) {
   return n;
 }
 
+// Newest jsonl mtime under a cwd's encoded project dir, in ms. Returns 0 when
+// the dir doesn't exist or has no jsonls. Lets callers override workspace
+// registry's `lastUsed` (which only updates on ccv-open) with actual session
+// activity time.
+export function newestJsonlMtimeMsForCwd(cwd) {
+  if (!cwd) return 0;
+  const dir = join(PROJECTS_DIR, encodeCwdToProjectDir(cwd));
+  if (!existsSync(dir)) return 0;
+  let files; try { files = readdirSync(dir); } catch { return 0; }
+  let best = 0;
+  for (const f of files) {
+    if (!f.endsWith('.jsonl')) continue;
+    let st; try { st = statSync(join(dir, f)); } catch { continue; }
+    if (st.mtimeMs > best) best = st.mtimeMs;
+  }
+  return best;
+}
+
 // Strip system/command/skill wrappers that frequently lead the first user
 // message in a session jsonl (system reminders, /command invocations, attached
 // skill listings). We want the human-readable prompt, not the harness chatter.
