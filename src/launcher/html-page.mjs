@@ -1153,9 +1153,10 @@ export const HTML_PAGE = `<!doctype html>
     filter: '',
     caps: { shell: true }, // optimistic default; replaced on first probe
     history: [],            // idle workspaces (cwd seen before, no ccv now)
+    shellHistory: [],       // cwds with bare-CLI jsonls but never opened in ccv
     localCcSessions: [],    // bare claude processes not under ccv
     prefs: null,            // { availableProfiles: [], defaultCcuseProfile, ... }
-    railOpen: { hist: false, untracked: false },
+    railOpen: { hist: false, untracked: false, shellHist: false },
     histOpen: {},           // cwd -> true when that history card is expanded
     sessionsByCwd: {},      // cwd -> { fetchedAt, items } or { loading: true }
     openCcvs: [],           // pids of ccv iframes currently mounted in overlay
@@ -1171,6 +1172,7 @@ export const HTML_PAGE = `<!doctype html>
       if (p.railOpen && typeof p.railOpen === 'object') {
         _state.railOpen.hist = !!p.railOpen.hist;
         _state.railOpen.untracked = !!p.railOpen.untracked;
+        _state.railOpen.shellHist = !!p.railOpen.shellHist;
       }
     }
   } catch (e) {}
@@ -1424,6 +1426,39 @@ export const HTML_PAGE = `<!doctype html>
       html += '</div></div>';
     }
 
+    // ---- shell 历史 (有 jsonl 但没经过 ccv 的 cwd) ----
+    // Same card shape as 历史项目 so the existing .rail-hist-card click
+    // handler (expand sessions / +-fresh) just works.
+    var shellHist = filteredShellHistory();
+    if (shellHist.length) {
+      var openSH = _state.railOpen.shellHist;
+      html += '<div class="rail-section' + (openSH ? ' open' : '') + '" data-sec="shellHist">';
+      html += '<div class="sec-hd"><span class="caret">▸</span><span>shell 历史</span><span class="count">' + shellHist.length + '</span></div>';
+      html += '<div class="sec-body">';
+      var shMax = openSH ? shellHist.length : 0;
+      for (var sh = 0; sh < shMax; sh++) {
+        var sHist = shellHist[sh];
+        var shName = sHist.projectName || (sHist.cwd || '').split('/').pop() || '?';
+        var shSub = (sHist.cwd || '').replace(/^\\/Users\\/[^/]+/, '~');
+        var shCount = +sHist.sessionCount || 0;
+        var shExpanded = !!_state.histOpen[sHist.cwd];
+        html += '<div class="rail-hist-card' + (shExpanded ? ' open' : '') + '" data-cwd="' + escape(sHist.cwd) + '" title="' + escape(sHist.cwd) + '">';
+        html += '<div class="row1">';
+        if (shCount > 0) html += '<span class="caret">▸</span>';
+        html += '<span class="name">' + escape(shName) + '</span>';
+        if (shCount > 0) html += '<span class="sess-count" title="历史会话数">' + shCount + '</span>';
+        html += '<span class="age">' + escape(fmtAge(sHist.lastUsed)) + '</span>';
+        if (shCount > 0) html += '<button class="spawn-fresh" data-cwd="' + escape(sHist.cwd) + '" title="此目录新启一个 session">+</button>';
+        html += '</div>';
+        html += '<div class="meta"><span>' + escape(shSub) + '</span></div>';
+        html += '</div>';
+        if (shExpanded) {
+          html += renderSessionsBlock(sHist.cwd);
+        }
+      }
+      html += '</div></div>';
+    }
+
     // ---- 未托管 claude (bare CLI) ----
     var loc = _state.localCcSessions || [];
     if (loc.length) {
@@ -1470,7 +1505,10 @@ export const HTML_PAGE = `<!doctype html>
         }
         var cwd = card.getAttribute('data-cwd');
         if (!cwd) return;
-        var hItem = (_state.history || []).find(function(x) { return x.cwd === cwd; });
+        // The same .rail-hist-card class is used by both 历史项目 and shell 历史
+        // sections; look in both state lists when computing sessionCount.
+        var hItem = (_state.history || []).find(function(x) { return x.cwd === cwd; })
+                 || (_state.shellHistory || []).find(function(x) { return x.cwd === cwd; });
         var hasSessions = hItem && +hItem.sessionCount > 0;
         if (!hasSessions) { openNew(cwd); return; }
         toggleHistExpand(cwd);
@@ -1565,6 +1603,14 @@ export const HTML_PAGE = `<!doctype html>
     if (!q) return _state.history;
     return _state.history.filter(function(h) {
       return ((h.alias || '') + ' ' + (h.projectName || '') + ' ' + (h.cwd || '')).toLowerCase().indexOf(q) >= 0;
+    });
+  }
+
+  function filteredShellHistory() {
+    var q = (_state.filter || '').trim().toLowerCase();
+    if (!q) return _state.shellHistory;
+    return _state.shellHistory.filter(function(h) {
+      return ((h.projectName || '') + ' ' + (h.cwd || '')).toLowerCase().indexOf(q) >= 0;
     });
   }
 
@@ -2502,6 +2548,7 @@ export const HTML_PAGE = `<!doctype html>
       _state.history = (d.history || []).slice().sort(function(a, b) {
         return (Date.parse(b.lastUsed) || 0) - (Date.parse(a.lastUsed) || 0);
       });
+      _state.shellHistory = (d.shellHistory || []).slice();
       _state.localCcSessions = (d.localCcSessions || []).slice();
       // pick active pid if missing
       if (!_state.activePid || !_state.instances.find(function(x) { return x.pid === _state.activePid; })) {

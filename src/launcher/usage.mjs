@@ -565,6 +565,94 @@ export async function listSessionsForCwd(cwd) {
   return items;
 }
 
+// Read just enough of a jsonl to extract the session's `cwd` field. claude
+// writes the absolute cwd into the first few entries; we scan up to 20 lines
+// to be safe but normally hit it on line 1. Used by listShellHistoryProjects
+// to avoid the lossy reverse-decode of project dir names (`-Users-foo-bar-baz`
+// is ambiguous when the basename itself contains `-`).
+async function readJsonlFirstCwd(path) {
+  const stream = createReadStream(path, { encoding: 'utf-8' });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+  let cwd = '';
+  let n = 0;
+  try {
+    for await (const line of rl) {
+      n++;
+      if (n > 20) break;
+      if (!line) continue;
+      let obj; try { obj = JSON.parse(line); } catch { continue; }
+      if (typeof obj.cwd === 'string' && obj.cwd) { cwd = obj.cwd; break; }
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+  return cwd;
+}
+
+// Lossy fallback decoder that matches what `encodeCwdToProjectDir` does for
+// the typical `/abs/path` case. Used only when the jsonl is unreadable.
+function decodeProjectDirNameFallback(name) {
+  if (!name || typeof name !== 'string') return '';
+  return name.replace(/-/g, '/');
+}
+
+// Per-call cache of shell-history listing. ~/.claude/projects/ is scanned on
+// each /api/launcher/list call so it costs O(N) jsonl head reads — cache by
+// PROJECTS_DIR mtime + 30s TTL keeps the polling overhead near-zero.
+let _shellHistCache = { dirMtimeMs: 0, fetchedAt: 0, items: [] };
+const SHELL_HIST_TTL_MS = 30_000;
+
+// List cwds that have a Claude Code session history on disk
+// (`~/.claude/projects/<encoded>/*.jsonl`). Caller passes excludeCwds so we
+// can hide cwds already shown elsewhere in the UI (running ccvs, ccv-registered
+// workspaces). Returns newest-first.
+export async function listShellHistoryProjects(opts = {}) {
+  if (!existsSync(PROJECTS_DIR)) return [];
+  let dirSt; try { dirSt = statSync(PROJECTS_DIR); } catch { return []; }
+  const now = Date.now();
+  const exclude = opts.excludeCwds instanceof Set ? opts.excludeCwds : new Set();
+  if (_shellHistCache.dirMtimeMs === dirSt.mtimeMs && (now - _shellHistCache.fetchedAt) < SHELL_HIST_TTL_MS) {
+    return _shellHistCache.items.filter(p => !exclude.has(p.cwd));
+  }
+  let names; try { names = readdirSync(PROJECTS_DIR); } catch { return []; }
+  const items = [];
+  for (const name of names) {
+    const projDir = join(PROJECTS_DIR, name);
+    let pst; try { pst = statSync(projDir); } catch { continue; }
+    if (!pst.isDirectory()) continue;
+    let files; try { files = readdirSync(projDir); } catch { continue; }
+    let sessionCount = 0;
+    let lastMtimeMs = 0;
+    let newestPath = '';
+    for (const f of files) {
+      if (!f.endsWith('.jsonl')) continue;
+      const fp = join(projDir, f);
+      let fst; try { fst = statSync(fp); } catch { continue; }
+      if (!fst.isFile()) continue;
+      sessionCount++;
+      if (fst.mtimeMs > lastMtimeMs) { lastMtimeMs = fst.mtimeMs; newestPath = fp; }
+    }
+    if (sessionCount === 0) continue;
+    let cwd = '';
+    if (newestPath) { try { cwd = await readJsonlFirstCwd(newestPath); } catch { /* fall through */ } }
+    if (!cwd) cwd = decodeProjectDirNameFallback(name);
+    if (!cwd) continue;
+    items.push({
+      cwd,
+      projectName: basename(cwd) || name,
+      sessionCount,
+      lastUsedMs: lastMtimeMs,
+      // ISO mirror of lastUsedMs so the rail can pass it straight to fmtAge,
+      // matching the shape of workspace-registry's `lastUsed` field.
+      lastUsed: lastMtimeMs ? new Date(lastMtimeMs).toISOString() : '',
+    });
+  }
+  items.sort((a, b) => b.lastUsedMs - a.lastUsedMs);
+  _shellHistCache = { dirMtimeMs: dirSt.mtimeMs, fetchedAt: now, items };
+  return items.filter(p => !exclude.has(p.cwd));
+}
+
 // Map an instance to its native Claude Code session jsonl. External claude
 // processes carry the resolved path on the instance (parsed from `ps`); for
 // ccv-managed instances we fall back to the most recently-touched jsonl in

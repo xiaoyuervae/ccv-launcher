@@ -19,7 +19,7 @@ import {
   RUNTIME_DIR, instances, setSelfBinding, safeJson, pidAlive, renderTemplate, buildPublicUrl, buildLanUrl, loadRuntimeFile, rescanRuntime, BACKFILL_TTL_MS, PROBE_TIMEOUT_MS, probeCcv, listListeningNodePids, readPidCwd, readPidStartedMs, backfillExternalCcvs, LOCAL_CC_CACHE_TTL_MS, decodeProjectDirName, readJsonlCwd, readJsonlLastTimestamp, readPidLstart, listLocalCcSessions, spawnCcvInTerminal, killClaudePid, startWatcher, serializeSpawn, nextFreePort, findRunningByCwd, waitForChildRuntime, _pidWorktrees, WORKTREE_NAME_RE, BRANCH_NAME_RE, isInsideDir, gitInCwd, detectBaseRef, createWorktree, removeWorktree, worktreeForPid, MD_FILE_MAX_BYTES, MD_PREVIEW_BYTES, MD_BACKUP_KEEP, HOME_CLAUDE_DIR, safeRealpath, isAllowedMdPath, safeReadPreview, pushMdFile, scanClaudeMd, backupMdBeforeWrite, doSpawn, LAUNCHER_LOG_DIR, ccvLogPath,
 } from './runtime.mjs';
 import {
-  USAGE_CACHE_FILE, USAGE_CACHE_TTL_MS, loadPricing, loadModels, getModelInfo, computeContextUsage, priceForModel, emptyTokenBucket, computeCostForEntry, costFromUsage, usageFromEntries, readJsonlEntries, rangeStartMs, listSessionJsonlPaths, aggregateUsage, loadUsageCacheFromDisk, saveUsageCacheToDisk, refreshUsageInBackground, getCachedUsage, readInstanceUsage, encodeCwdToProjectDir, resolveNativeJsonl, countSessionsForCwd, listSessionsForCwd, CCLINE_CACHE_FILE, CLAUDE_CREDS_FILE, QUOTA_5H_MEM_TTL_MS, QUOTA_5H_DISK_TTL_MS, PLAN_THRESHOLDS, readCclineCache, readClaudeOauthToken, fetchOauthUsage, blocksFromTurns, detectPlan, p90, gatherTurnsForBlocks, computeFiveHourBlock, loadQuota5hFromDisk, saveQuota5hToDisk, buildQuota5h, refreshQuota5hInBackground, getCachedQuota5h, COMPACT_COOLDOWN_MS, injectPromptToCcv, checkCompactThresholds, readJsonlEntriesIndexed, truncateLabel, classifyEntry, JSONL_SCAN_TTL_MS, RUN_SUMMARY_MAX_EVENTS, ERROR_SAMPLES_PER_GROUP, scanJsonlAll, computeRunSummary, computeRecentEdits, computeErrors,
+  USAGE_CACHE_FILE, USAGE_CACHE_TTL_MS, loadPricing, loadModels, getModelInfo, computeContextUsage, priceForModel, emptyTokenBucket, computeCostForEntry, costFromUsage, usageFromEntries, readJsonlEntries, rangeStartMs, listSessionJsonlPaths, aggregateUsage, loadUsageCacheFromDisk, saveUsageCacheToDisk, refreshUsageInBackground, getCachedUsage, readInstanceUsage, encodeCwdToProjectDir, resolveNativeJsonl, countSessionsForCwd, listSessionsForCwd, listShellHistoryProjects, CCLINE_CACHE_FILE, CLAUDE_CREDS_FILE, QUOTA_5H_MEM_TTL_MS, QUOTA_5H_DISK_TTL_MS, PLAN_THRESHOLDS, readCclineCache, readClaudeOauthToken, fetchOauthUsage, blocksFromTurns, detectPlan, p90, gatherTurnsForBlocks, computeFiveHourBlock, loadQuota5hFromDisk, saveQuota5hToDisk, buildQuota5h, refreshQuota5hInBackground, getCachedQuota5h, COMPACT_COOLDOWN_MS, injectPromptToCcv, checkCompactThresholds, readJsonlEntriesIndexed, truncateLabel, classifyEntry, JSONL_SCAN_TTL_MS, RUN_SUMMARY_MAX_EVENTS, ERROR_SAMPLES_PER_GROUP, scanJsonlAll, computeRunSummary, computeRecentEdits, computeErrors,
 } from './usage.mjs';
 import {
   ccvProjectName, findActiveLogFile, parseJsonlFilenameTime, pickInstanceLogs, findActiveLogFileForInstance, tailJsonlEntries, truncate, lastUserPrompt, lastUserPromptAcrossEntries, firstUserPrompt, stripUserPromptFraming, readFirstUserPrompt, inspectToolFlow, summarizeToolInput, summarizeEntry, ageString, fetchPendingAsks, deriveStatus, findRecentAssistantTextTs, isAssistantTextEnd,
@@ -562,7 +562,22 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
       ...i,
       sessionCount: i.cwd ? countSessionsForCwd(i.cwd) : 0,
     }));
-    sendJson(res, 200, { instances: enrichedRunningWithSessions, history: enrichedIdle, localCcSessions: listLocalCcSessions() });
+    // shell-only history: cwds with on-disk jsonls that are NOT currently
+    // running and NOT in ccv's workspace registry. These are projects that
+    // were only ever used via bare `claude` CLI, never opened through ccv.
+    const workspaceCwds = new Set(idle.map(w => w.cwd).filter(Boolean));
+    let shellHistory = [];
+    try {
+      shellHistory = await listShellHistoryProjects({
+        excludeCwds: new Set([...runningCwds, ...workspaceCwds]),
+      });
+    } catch (e) { log('listShellHistoryProjects error:', e.message); }
+    sendJson(res, 200, {
+      instances: enrichedRunningWithSessions,
+      history: enrichedIdle,
+      shellHistory,
+      localCcSessions: listLocalCcSessions(),
+    });
     return;
   }
 
