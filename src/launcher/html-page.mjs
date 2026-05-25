@@ -1277,10 +1277,12 @@ export const HTML_PAGE = `<!doctype html>
       list.push({
         id: a.id,
         question: q.question || q.header || 'AskUserQuestion',
+        rawQuestion: q.question || '',
         header: q.header || '',
         context: a.context || a.summary || '',
         choices: choices,
         multiSelect: !!q.multiSelect,
+        questionCount: Array.isArray(a.questions) ? a.questions.length : 0,
         createdAt: a.createdAt || null,
       });
     }
@@ -1761,20 +1763,25 @@ export const HTML_PAGE = `<!doctype html>
     if (asks.length > 0 && !answered) {
       var a = asks[0];
       // multi-select 没法用单按钮回，回退到跳 ccv 的旧行为
+      // multi-question (a.questions.length > 1)：launcher inline 只展示 q[0]，
+      // 直接答会丢 q[1..N] —— 后端 answers map 残缺导致 ccv 那侧渲染错乱，
+      // 同样退回到跳 ccv。
       var multi = !!a.multiSelect;
+      var multiQ = (a.questionCount || 0) > 1;
+      var inlineAnswerable = !multi && !multiQ;
       html += '<div class="focus-card ask">';
       html += '<div class="card-hd">⏳ ccv 在等你回答</div>';
       html += '<div class="ask-q">' + escape(a.question) + '</div>';
       if (a.context) html += '<div class="ask-ctx">' + escape(a.context) + '</div>';
       html += '<div class="ask-choices">';
-      if (a.choices.length && !multi) {
+      if (a.choices.length && inlineAnswerable) {
         for (var i = 0; i < a.choices.length; i++) {
           var c = a.choices[i];
-          html += '<button class="ask-btn' + (i === 0 ? ' primary' : '') + '" data-act="answer-ask" data-ask="' + escape(a.id || '') + '" data-idx="' + i + '" data-label="' + escape(c.label) + '"' + (c.description ? ' title="' + escape(c.description) + '"' : '') + '>' + escape(c.label) + '</button>';
+          html += '<button class="ask-btn' + (i === 0 ? ' primary' : '') + '" data-act="answer-ask" data-ask="' + escape(a.id || '') + '" data-idx="' + i + '" data-label="' + escape(c.label) + '" data-qtext="' + escape(a.rawQuestion || '') + '"' + (c.description ? ' title="' + escape(c.description) + '"' : '') + '>' + escape(c.label) + '</button>';
         }
         html += '<button class="ask-btn" data-act="open-ccv" title="在 ccv 内查看完整上下文 / 选 Other">↗</button>';
-      } else if (a.choices.length && multi) {
-        // multi-select：保留跳 ccv 的入口（直接答需要多选 UI）
+      } else if (a.choices.length) {
+        // multi-select 或 multi-question：保留跳 ccv 的入口（直接答需要更复杂的 UI）
         for (var j = 0; j < a.choices.length; j++) {
           var cc = a.choices[j];
           html += '<button class="ask-btn' + (j === 0 ? ' primary' : '') + '" data-act="open-ccv"' + (cc.description ? ' title="' + escape(cc.description) + '"' : '') + '>' + escape(cc.label) + ' ↗</button>';
@@ -1785,6 +1792,8 @@ export const HTML_PAGE = `<!doctype html>
       html += '</div>';
       if (multi) {
         html += '<div class="ask-ctx" style="margin-top:8px;margin-bottom:0">多选题，跳到 ccv 页面勾选</div>';
+      } else if (multiQ) {
+        html += '<div class="ask-ctx" style="margin-top:8px;margin-bottom:0">本次问了 ' + (a.questionCount || 0) + ' 个问题，跳到 ccv 页面一起回答</div>';
       }
       html += '</div>';
     } else if (answered) {
@@ -1914,7 +1923,8 @@ export const HTML_PAGE = `<!doctype html>
         var askId = btn.getAttribute('data-ask');
         var idx = +btn.getAttribute('data-idx');
         var label = btn.getAttribute('data-label');
-        answerAsk(inst, askId, idx, label, btn);
+        var qtext = btn.getAttribute('data-qtext') || '';
+        answerAsk(inst, askId, idx, label, qtext, btn);
       });
     });
     [].forEach.call(el.querySelectorAll('[data-act="copy-cwd"]'), function(btn) {
@@ -1944,14 +1954,14 @@ export const HTML_PAGE = `<!doctype html>
   // 把 launcher 上选中的选项打回 ccv，避免用户每次都得跳到 ccv 标签去点。
   // 走 launcher 后端 /answer-ask（再用短连 WS 发到 ccv 的 ws-hook 桥）。
   // 乐观更新：先把 inst 标记成 answered，让 ✓ 横条立刻出现；失败时撤销并退回到打开 ccv。
-  function answerAsk(inst, askId, idx, label, btn) {
+  function answerAsk(inst, askId, idx, label, questionText, btn) {
     if (btn) btn.disabled = true;
     _state.answered[inst.pid] = { askId: askId, label: label, at: Date.now() };
     renderAskAlert(); renderTabStrip(); renderFocus();
     api('/api/launcher/instances/' + inst.pid + '/answer-ask', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ askId: askId, choiceIndex: idx, choiceLabel: label }),
+      body: JSON.stringify({ askId: askId, choiceIndex: idx, choiceLabel: label, questionText: questionText || '' }),
     }).catch(function() {
       delete _state.answered[inst.pid];
       renderAskAlert(); renderTabStrip(); renderFocus();

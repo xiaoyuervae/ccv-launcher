@@ -1473,19 +1473,34 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
       const body = JSON.parse(raw || '{}');
       const askId = body.askId;
       const choiceLabel = body.choiceLabel;
+      const feQuestionText = typeof body.questionText === 'string' ? body.questionText : '';
       if (!askId || choiceLabel == null) { sendJson(res, 400, { error: 'askId + choiceLabel required' }); return; }
-      // Resolve the question text from the live pendingAsks (single source of
-      // truth for which questions are in flight). Falls back to the choice
-      // label keyed under an empty string — ccv tolerates it but the bridge
-      // hook may not match, so we log a warning if so.
-      const asks = await fetchPendingAsks(inst);
-      const target = asks.find(a => a.id === askId);
-      let questionText = '';
-      if (target && Array.isArray(target.questions) && target.questions[0]) {
-        questionText = target.questions[0].question || target.questions[0].header || '';
+      // Trust the question text from the FE when present — it was extracted from
+      // the same pendingAsks payload the user clicked on, so it can't drift from
+      // the question they answered. Fall back to a probe of /api/pending-asks
+      // only when FE didn't send it (older client). Refuse to answer if the
+      // ask actually has multiple questions: launcher only shows q[0]'s
+      // choices, so a single choiceLabel can't satisfy q[1..N] and claude
+      // would render a corrupted answer in ccv.
+      let questionText = feQuestionText;
+      if (!questionText) {
+        const asks = await fetchPendingAsks(inst);
+        const target = asks.find(a => a.id === askId);
+        if (target && Array.isArray(target.questions)) {
+          if (target.questions.length > 1) {
+            sendJson(res, 409, { error: 'ask has multiple questions; answer it in ccv' });
+            return;
+          }
+          if (target.questions[0]) questionText = target.questions[0].question || '';
+        }
       }
       if (!questionText) {
+        // Empty key would produce `answers: { "": label }`, which claude can't
+        // match against `questions[i].question` and silently corrupts the
+        // assistant message. Refuse rather than send garbage.
         jlog('answer-ask-no-question-text', { pid, askId });
+        sendJson(res, 422, { error: 'cannot resolve question text for this ask; answer it in ccv' });
+        return;
       }
       const result = await sendAnswerOverWs(inst, askId, { [questionText]: choiceLabel });
       sendJson(res, 200, { ok: true, ack: result });
