@@ -824,8 +824,18 @@ export function backupMdBeforeWrite(absPath) {
   return backupPath;
 }
 
-export async function doSpawn(targetCwd, { force = false, ccuseProfile = '', useWorktree = false, branchName = '' } = {}) {
+export async function doSpawn(targetCwd, { force = false, ccuseProfile = '', useWorktree = false, branchName = '', resumeSessionId = '' } = {}) {
   if (!targetCwd || typeof targetCwd !== 'string') throw new Error('cwd required');
+  // Resuming pins a specific past session (-r <sid> passed through to claude).
+  // Validate the format here so invalid input never makes it into the spawned
+  // shell command. Resume implies force-spawn (we never dedup against an
+  // already-running ccv at the same cwd — that's a different live session).
+  if (resumeSessionId) {
+    if (typeof resumeSessionId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(resumeSessionId)) {
+      throw new Error('resumeSessionId must be a UUID');
+    }
+    force = true;
+  }
   // useWorktree: create a dedicated git worktree under
   // <targetCwd>/.claude/worktrees/<auto-name>/ on a new branch, then spawn the
   // child rooted in the worktree path so its writes don't collide with other
@@ -882,7 +892,10 @@ export async function doSpawn(targetCwd, { force = false, ccuseProfile = '', use
       closeSync(logFd);
       throw new Error(`ccuse profile "${profile}" contains invalid characters`);
     }
-    const shellCmd = `ccuse ${safeProfile} && exec ${JSON.stringify(process.execPath)} ${JSON.stringify(cliPath)} --d --no-open`;
+    // resumeSessionId is UUID-validated above so it's safe to splice into the
+    // zsh command string.
+    const resumeFrag = resumeSessionId ? ` -r ${resumeSessionId}` : '';
+    const shellCmd = `ccuse ${safeProfile} && exec ${JSON.stringify(process.execPath)} ${JSON.stringify(cliPath)} --d --no-open${resumeFrag}`;
     child = spawn('/bin/zsh', ['-i', '-c', shellCmd], {
       cwd: targetCwd,
       detached: true,
@@ -890,7 +903,9 @@ export async function doSpawn(targetCwd, { force = false, ccuseProfile = '', use
       env,
     });
   } else {
-    child = spawn(process.execPath, [cliPath, '--d', '--no-open'], {
+    const ccvArgs = [cliPath, '--d', '--no-open'];
+    if (resumeSessionId) ccvArgs.push('-r', resumeSessionId);
+    child = spawn(process.execPath, ccvArgs, {
       cwd: targetCwd,
       detached: true,
       stdio: childStdio,

@@ -260,6 +260,60 @@ export const HTML_PAGE = `<!doctype html>
   .rail-untracked-card .name::before {
     content: '◐ '; color: var(--warn);
   }
+  /* expandable history card */
+  .rail-hist-card .row1 {
+    display: flex; align-items: center; gap: 5px;
+  }
+  .rail-hist-card .row1 .caret {
+    width: 8px; font-size: 9px; color: var(--mute);
+    transition: transform .12s;
+  }
+  .rail-hist-card.open .row1 .caret { transform: rotate(90deg); }
+  .rail-hist-card .row1 .name { flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rail-hist-card .row1 .sess-count {
+    font-size: 9px; color: var(--mute); font-family: var(--mono);
+    background: var(--bg2); border-radius: 8px; padding: 0 5px;
+  }
+  .rail-hist-card .row1 .age {
+    color: var(--mute); font-size: 9px; font-family: var(--mono);
+  }
+  .rail-hist-card .row1 .spawn-fresh {
+    background: transparent; border: 1px solid var(--line);
+    color: var(--mute); font-size: 9px; padding: 0 5px; line-height: 14px;
+    border-radius: 3px; cursor: pointer;
+  }
+  .rail-hist-card .row1 .spawn-fresh:hover {
+    border-color: var(--accent); color: var(--accent);
+  }
+  .rail-sess-list {
+    display: flex; flex-direction: column; gap: 2px;
+    margin: 4px 0 2px 12px; padding-left: 6px;
+    border-left: 1px solid var(--line);
+  }
+  .rail-sess-card {
+    background: var(--bg); border: 1px solid var(--line);
+    border-radius: 3px; padding: 4px 6px; cursor: pointer;
+    display: flex; flex-direction: column; gap: 1px;
+  }
+  .rail-sess-card:hover { border-color: var(--accent); background: var(--bg2); }
+  .rail-sess-card .preview {
+    font-size: 10.5px; color: var(--fg); line-height: 1.3;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .rail-sess-card .preview.empty { color: var(--mute); font-style: italic; }
+  .rail-sess-card .meta {
+    color: var(--mute); font-size: 9px; font-family: var(--mono);
+    display: flex; gap: 6px;
+  }
+  .rail-sess-card .meta .sid { opacity: .7; }
+  .rail-sess-card .meta .age { margin-left: auto; }
+  .rail-sess-empty {
+    color: var(--mute); font-size: 9.5px; padding: 4px 6px;
+  }
+  .rail-sess-loading {
+    color: var(--mute); font-size: 9.5px; padding: 4px 6px; font-style: italic;
+  }
 
   /* ---------- focus column ---------- */
   #focus-col { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
@@ -1062,6 +1116,8 @@ export const HTML_PAGE = `<!doctype html>
     localCcSessions: [],    // bare claude processes not under ccv
     prefs: null,            // { availableProfiles: [], defaultCcuseProfile, ... }
     railOpen: { hist: false, untracked: false },
+    histOpen: {},           // cwd -> true when that history card is expanded
+    sessionsByCwd: {},      // cwd -> { fetchedAt, items } or { loading: true }
     openCcvs: [],           // pids of ccv iframes currently mounted in overlay
     activeOverlayPid: null, // which pid is visible in #ccv-overlay
   };
@@ -1309,10 +1365,21 @@ export const HTML_PAGE = `<!doctype html>
         var h = hist[j];
         var hname = h.alias || h.projectName || (h.cwd || '').split('/').pop() || '?';
         var hsub = (h.cwd || '').replace(/^\\/Users\\/[^/]+/, '~');
-        html += '<div class="rail-hist-card" data-cwd="' + escape(h.cwd) + '" title="' + escape(h.cwd) + '">';
-        html += '<div class="name">' + escape(hname) + '</div>';
-        html += '<div class="meta"><span>' + escape(hsub) + '</span><span style="margin-left:auto">' + escape(fmtAge(h.lastUsed)) + '</span></div>';
+        var sCount = +h.sessionCount || 0;
+        var expanded = !!_state.histOpen[h.cwd];
+        html += '<div class="rail-hist-card' + (expanded ? ' open' : '') + '" data-cwd="' + escape(h.cwd) + '" title="' + escape(h.cwd) + '">';
+        html += '<div class="row1">';
+        if (sCount > 0) html += '<span class="caret">▸</span>';
+        html += '<span class="name">' + escape(hname) + '</span>';
+        if (sCount > 0) html += '<span class="sess-count" title="历史会话数">' + sCount + '</span>';
+        html += '<span class="age">' + escape(fmtAge(h.lastUsed)) + '</span>';
+        if (sCount > 0) html += '<button class="spawn-fresh" data-cwd="' + escape(h.cwd) + '" title="此目录新启一个 session">+</button>';
         html += '</div>';
+        html += '<div class="meta"><span>' + escape(hsub) + '</span></div>';
+        html += '</div>';
+        if (expanded) {
+          html += renderSessionsBlock(h.cwd);
+        }
       }
       html += '</div></div>';
     }
@@ -1353,15 +1420,103 @@ export const HTML_PAGE = `<!doctype html>
       });
     });
     [].forEach.call(el.querySelectorAll('.rail-hist-card'), function(card) {
+      card.addEventListener('click', function(ev) {
+        // "+" 按钮显式新启动，跳过展开逻辑
+        if (ev.target && ev.target.classList.contains('spawn-fresh')) {
+          ev.stopPropagation();
+          var fcwd = ev.target.getAttribute('data-cwd');
+          if (fcwd) openNew(fcwd);
+          return;
+        }
+        var cwd = card.getAttribute('data-cwd');
+        if (!cwd) return;
+        var hItem = (_state.history || []).find(function(x) { return x.cwd === cwd; });
+        var hasSessions = hItem && +hItem.sessionCount > 0;
+        if (!hasSessions) { openNew(cwd); return; }
+        toggleHistExpand(cwd);
+      });
+    });
+    [].forEach.call(el.querySelectorAll('.rail-sess-card'), function(card) {
       card.addEventListener('click', function() {
         var cwd = card.getAttribute('data-cwd');
-        if (cwd) openNew(cwd);
+        var sid = card.getAttribute('data-sid');
+        if (cwd && sid) resumeSession(cwd, sid);
       });
     });
     [].forEach.call(el.querySelectorAll('.rail-untracked-card'), function(card) {
       card.addEventListener('click', function() {
         takeoverLocal(+card.getAttribute('data-pid'), card.getAttribute('data-sid'), card.getAttribute('data-cwd'));
       });
+    });
+  }
+
+  // 渲染单个 history 卡片展开后的会话子列表。状态：loading / empty / list。
+  function renderSessionsBlock(cwd) {
+    var entry = _state.sessionsByCwd[cwd];
+    var html = '<div class="rail-sess-list" data-cwd="' + escape(cwd) + '">';
+    if (!entry || entry.loading) {
+      html += '<div class="rail-sess-loading">载入中…</div>';
+    } else if (!entry.items || !entry.items.length) {
+      html += '<div class="rail-sess-empty">无历史会话</div>';
+    } else {
+      for (var i = 0; i < entry.items.length; i++) {
+        var s = entry.items[i];
+        var preview = (s.firstUser || '').slice(0, 80);
+        var sidShort = (s.sessionId || '').slice(0, 8);
+        var ageStr = fmtAge(new Date(s.mtimeMs).toISOString());
+        html += '<div class="rail-sess-card" data-cwd="' + escape(cwd) + '" data-sid="' + escape(s.sessionId) + '" title="resume session ' + escape(s.sessionId) + '">';
+        html += '<div class="preview' + (preview ? '' : ' empty') + '">' + escape(preview || '(无 user 消息)') + '</div>';
+        html += '<div class="meta"><span class="sid">' + escape(sidShort) + '</span>';
+        if (s.gitBranch) html += '<span>' + escape(s.gitBranch) + '</span>';
+        html += '<span class="age">' + escape(ageStr) + '</span></div>';
+        html += '</div>';
+      }
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function toggleHistExpand(cwd) {
+    if (_state.histOpen[cwd]) {
+      delete _state.histOpen[cwd];
+      renderRail();
+      return;
+    }
+    _state.histOpen[cwd] = true;
+    var cur = _state.sessionsByCwd[cwd];
+    if (!cur || (!cur.loading && (Date.now() - (cur.fetchedAt || 0) > 30000))) {
+      fetchSessionsForCwd(cwd);
+    }
+    renderRail();
+  }
+
+  function fetchSessionsForCwd(cwd) {
+    _state.sessionsByCwd[cwd] = { loading: true };
+    api('/api/launcher/sessions?cwd=' + encodeURIComponent(cwd)).then(function(res) {
+      _state.sessionsByCwd[cwd] = {
+        items: (res && res.sessions) || [],
+        fetchedAt: Date.now(),
+      };
+      // 只重渲展开中的卡片，避免抖动其他东西
+      if (_state.histOpen[cwd]) renderRail();
+    }).catch(function(err) {
+      _state.sessionsByCwd[cwd] = { items: [], fetchedAt: Date.now(), error: err.message };
+      if (_state.histOpen[cwd]) renderRail();
+    });
+  }
+
+  // 用一个新的受 launcher 管控的 ccv 子进程接管历史会话（claude -r <sid>）。
+  function resumeSession(cwd, sessionId) {
+    if (!cwd || !sessionId) return;
+    api('/api/launcher/spawn', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cwd: cwd, resumeSessionId: sessionId }),
+    }).then(function(res) {
+      if (res && res.instance && res.instance.pid) _state.activePid = res.instance.pid;
+      else if (res && res.pid) _state.activePid = res.pid;
+      refreshList();
+    }).catch(function(err) {
+      alert('resume 失败: ' + (err && err.message || err));
     });
   }
 
@@ -1414,8 +1569,15 @@ export const HTML_PAGE = `<!doctype html>
         html +=   '<span class="lbl">ccuse</span><span class="val">' + escape(curProf || 'default') + '</span><span class="caret">▾</span>';
         html += '</button>';
       }
+      if (inst.cwd) {
+        html += '<button class="action-chip" data-act="new-session" title="在同一目录再起一个 ccv (force spawn)">';
+        html +=   '<span class="lbl">同目录</span><span class="val">+ 新 session</span>';
+        html += '</button>';
+      }
+      html += '<button class="action-chip danger" data-act="kill" title="SIGTERM 这个 ccv 进程">';
+      html +=   '<span class="lbl">此 session</span><span class="val">⏹ 停止</span>';
+      html += '</button>';
       html += '<span style="flex:1"></span>';
-      html += '<button class="action-chip danger" data-act="kill" title="SIGTERM 这个 ccv 进程">🗑 关闭</button>';
       html += '</div>';
     }
     if (act.title) {
@@ -1564,18 +1726,47 @@ export const HTML_PAGE = `<!doctype html>
     [].forEach.call(el.querySelectorAll('[data-act="kill"]'), function(btn) {
       btn.addEventListener('click', function() { killCcv(inst); });
     });
+    [].forEach.call(el.querySelectorAll('[data-act="new-session"]'), function(btn) {
+      btn.addEventListener('click', function() { spawnNewSessionAt(inst, btn); });
+    });
     [].forEach.call(el.querySelectorAll('.focus-hd .topic'), function(t) {
       t.addEventListener('click', function() { t.classList.toggle('expanded'); });
     });
   }
 
+  // status -> 排序优先级（小=靠前）：等回答 > 进行中 > 等待 > 空闲 > error
+  var STATUS_RANK = {
+    waiting_ask: 0,
+    thinking: 1, tool_running: 1,
+    waiting_tool: 2, waiting_input: 2,
+    idle: 3, no_session: 3,
+    error: 4,
+  };
+  function instanceSortKey(it) {
+    var act = _state.activityByPid[it.pid] || {};
+    var rank = STATUS_RANK[act.status];
+    if (rank == null) rank = 3;
+    var ts = Date.parse(act.lastEventAt) || 0;
+    return { rank: rank, ts: ts };
+  }
+  function sortInstances(list) {
+    return list.slice().sort(function(a, b) {
+      var ka = instanceSortKey(a), kb = instanceSortKey(b);
+      if (ka.rank !== kb.rank) return ka.rank - kb.rank;
+      if (ka.ts !== kb.ts) return kb.ts - ka.ts; // 最近优先
+      return (a.pid || 0) - (b.pid || 0);
+    });
+  }
   function filteredInstances() {
     var q = (_state.filter || '').trim().toLowerCase();
-    if (!q) return _state.instances;
-    return _state.instances.filter(function(it) {
-      var hay = [it.displayName, it.projectName, it.alias, it.cwd, (it.tags || []).join(' ')].join(' ').toLowerCase();
-      return q.split(/\\s+/).every(function(t) { return hay.indexOf(t) >= 0; });
-    });
+    var base = _state.instances;
+    if (q) {
+      base = base.filter(function(it) {
+        var hay = [it.displayName, it.projectName, it.alias, it.cwd, (it.tags || []).join(' ')].join(' ').toLowerCase();
+        return q.split(/\\s+/).every(function(t) { return hay.indexOf(t) >= 0; });
+      });
+    }
+    return sortInstances(base);
   }
 
   function setActive(pid) {
@@ -1639,6 +1830,33 @@ export const HTML_PAGE = `<!doctype html>
       renderTabStrip(); renderRail(); renderFocus();
     }).catch(function(err) {
       alert('设置别名失败: ' + (err && err.message || err));
+    });
+  }
+
+  function spawnNewSessionAt(inst, btn) {
+    if (!inst || !inst.cwd) return;
+    var origLabel = btn ? btn.innerHTML : '';
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="lbl">同目录</span><span class="val">Launching…</span>';
+    }
+    var newPid = null;
+    api('/api/launcher/spawn', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        cwd: inst.cwd,
+        force: true,
+        ccuseProfile: inst.ccuseProfile || '',
+      }),
+    }).then(function(res) {
+      newPid = (res && res.instance && res.instance.pid) || (res && res.pid) || null;
+      return refreshList();
+    }).then(function() {
+      if (newPid) setActive(newPid);
+    }).catch(function(err) {
+      alert('新建 session 失败: ' + (err && err.message || err));
+    }).finally(function() {
+      if (btn) { btn.disabled = false; btn.innerHTML = origLabel; }
     });
   }
 
@@ -2141,7 +2359,7 @@ export const HTML_PAGE = `<!doctype html>
     btn.disabled = true; btn.textContent = 'Launching…';
     api('/api/launcher/spawn', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ cwd: cwd, ccuseProfile: ccuseProfile }),
+      body: JSON.stringify({ cwd: cwd, force: true, ccuseProfile: ccuseProfile }),
     }).then(function(res) {
       try { localStorage.setItem('ccvNewLastDir', cwd); } catch (e) {}
       document.getElementById('dlg').close();

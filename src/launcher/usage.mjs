@@ -455,6 +455,113 @@ export function encodeCwdToProjectDir(cwd) {
   return cwd.replace(/\//g, '-');
 }
 
+// Cheap count of native session jsonls under a cwd. Used by /api/launcher/list
+// to surface "this project has N past sessions" on each history card without
+// reading any file contents.
+export function countSessionsForCwd(cwd) {
+  if (!cwd) return 0;
+  const dir = join(PROJECTS_DIR, encodeCwdToProjectDir(cwd));
+  if (!existsSync(dir)) return 0;
+  let files; try { files = readdirSync(dir); } catch { return 0; }
+  let n = 0;
+  for (const f of files) if (f.endsWith('.jsonl')) n++;
+  return n;
+}
+
+// Strip system/command/skill wrappers that frequently lead the first user
+// message in a session jsonl (system reminders, /command invocations, attached
+// skill listings). We want the human-readable prompt, not the harness chatter.
+function cleanFirstUserText(s) {
+  if (!s) return '';
+  let t = String(s);
+  // Drop common wrapper tags entirely
+  t = t.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '');
+  t = t.replace(/<command-(?:name|message|args)>[\s\S]*?<\/command-(?:name|message|args)>/gi, '');
+  t = t.replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/gi, '');
+  t = t.replace(/<\/?[a-zA-Z][^>]*>/g, ''); // any other inline tags
+  t = t.replace(/\s+/g, ' ').trim();
+  return t;
+}
+
+// Read only enough of a jsonl to find the first real user message and the
+// session's gitBranch (when present). Bails out after the first match or 500
+// lines to keep the scan O(KB) regardless of session length.
+async function readSessionHeadMeta(path) {
+  const stream = createReadStream(path, { encoding: 'utf-8' });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+  let firstUser = '';
+  let gitBranch = '';
+  let n = 0;
+  try {
+    for await (const line of rl) {
+      n++;
+      if (n > 500) break;
+      if (!line) continue;
+      let obj; try { obj = JSON.parse(line); } catch { continue; }
+      if (!gitBranch && obj.gitBranch) gitBranch = String(obj.gitBranch);
+      if (firstUser) { if (gitBranch) break; else continue; }
+      if (obj.type !== 'user') continue;
+      const msg = obj.message; if (!msg) continue;
+      let text = '';
+      if (typeof msg.content === 'string') text = msg.content;
+      else if (Array.isArray(msg.content)) {
+        for (const p of msg.content) {
+          if (p && p.type === 'text' && typeof p.text === 'string') { text = p.text; break; }
+        }
+      }
+      const cleaned = cleanFirstUserText(text);
+      if (cleaned) firstUser = cleaned;
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+  return { firstUser, gitBranch };
+}
+
+// Per-cwd cache for session listings — expanding/collapsing a history card
+// shouldn't re-scan jsonl heads each time. Invalidated by directory mtime so
+// new sessions still surface immediately.
+const _sessionListCache = new Map(); // cwd -> { dirMtimeMs, items, fetchedAt }
+const SESSION_LIST_TTL_MS = 30_000;
+
+export async function listSessionsForCwd(cwd) {
+  if (!cwd) return [];
+  const dir = join(PROJECTS_DIR, encodeCwdToProjectDir(cwd));
+  if (!existsSync(dir)) return [];
+  let dirSt; try { dirSt = statSync(dir); } catch { return []; }
+  const cached = _sessionListCache.get(cwd);
+  const now = Date.now();
+  if (cached && cached.dirMtimeMs === dirSt.mtimeMs && (now - cached.fetchedAt) < SESSION_LIST_TTL_MS) {
+    return cached.items;
+  }
+  let files; try { files = readdirSync(dir); } catch { return []; }
+  const raw = [];
+  for (const f of files) {
+    if (!f.endsWith('.jsonl')) continue;
+    const p = join(dir, f);
+    let st; try { st = statSync(p); } catch { continue; }
+    if (!st.isFile()) continue;
+    raw.push({ sessionId: f.replace(/\.jsonl$/, ''), path: p, mtimeMs: st.mtimeMs, size: st.size });
+  }
+  // Newest first.
+  raw.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const items = [];
+  for (const r of raw) {
+    let meta = { firstUser: '', gitBranch: '' };
+    try { meta = await readSessionHeadMeta(r.path); } catch { /* skip head read on error */ }
+    items.push({
+      sessionId: r.sessionId,
+      mtimeMs: r.mtimeMs,
+      size: r.size,
+      firstUser: meta.firstUser,
+      gitBranch: meta.gitBranch,
+    });
+  }
+  _sessionListCache.set(cwd, { dirMtimeMs: dirSt.mtimeMs, items, fetchedAt: now });
+  return items;
+}
+
 // Map an instance to its native Claude Code session jsonl. External claude
 // processes carry the resolved path on the instance (parsed from `ps`); for
 // ccv-managed instances we fall back to the most recently-touched jsonl in

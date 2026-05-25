@@ -19,7 +19,7 @@ import {
   RUNTIME_DIR, instances, setSelfBinding, safeJson, pidAlive, renderTemplate, buildPublicUrl, buildLanUrl, loadRuntimeFile, rescanRuntime, BACKFILL_TTL_MS, PROBE_TIMEOUT_MS, probeCcv, listListeningNodePids, readPidCwd, readPidStartedMs, backfillExternalCcvs, LOCAL_CC_CACHE_TTL_MS, decodeProjectDirName, readJsonlCwd, readJsonlLastTimestamp, readPidLstart, listLocalCcSessions, spawnCcvInTerminal, killClaudePid, startWatcher, serializeSpawn, nextFreePort, findRunningByCwd, waitForChildRuntime, _pidWorktrees, WORKTREE_NAME_RE, BRANCH_NAME_RE, isInsideDir, gitInCwd, detectBaseRef, createWorktree, removeWorktree, worktreeForPid, MD_FILE_MAX_BYTES, MD_PREVIEW_BYTES, MD_BACKUP_KEEP, HOME_CLAUDE_DIR, safeRealpath, isAllowedMdPath, safeReadPreview, pushMdFile, scanClaudeMd, backupMdBeforeWrite, doSpawn, LAUNCHER_LOG_DIR, ccvLogPath,
 } from './runtime.mjs';
 import {
-  USAGE_CACHE_FILE, USAGE_CACHE_TTL_MS, loadPricing, loadModels, getModelInfo, computeContextUsage, priceForModel, emptyTokenBucket, computeCostForEntry, costFromUsage, usageFromEntries, readJsonlEntries, rangeStartMs, listSessionJsonlPaths, aggregateUsage, loadUsageCacheFromDisk, saveUsageCacheToDisk, refreshUsageInBackground, getCachedUsage, readInstanceUsage, encodeCwdToProjectDir, resolveNativeJsonl, CCLINE_CACHE_FILE, CLAUDE_CREDS_FILE, QUOTA_5H_MEM_TTL_MS, QUOTA_5H_DISK_TTL_MS, PLAN_THRESHOLDS, readCclineCache, readClaudeOauthToken, fetchOauthUsage, blocksFromTurns, detectPlan, p90, gatherTurnsForBlocks, computeFiveHourBlock, loadQuota5hFromDisk, saveQuota5hToDisk, buildQuota5h, refreshQuota5hInBackground, getCachedQuota5h, COMPACT_COOLDOWN_MS, injectPromptToCcv, checkCompactThresholds, readJsonlEntriesIndexed, truncateLabel, classifyEntry, JSONL_SCAN_TTL_MS, RUN_SUMMARY_MAX_EVENTS, ERROR_SAMPLES_PER_GROUP, scanJsonlAll, computeRunSummary, computeRecentEdits, computeErrors,
+  USAGE_CACHE_FILE, USAGE_CACHE_TTL_MS, loadPricing, loadModels, getModelInfo, computeContextUsage, priceForModel, emptyTokenBucket, computeCostForEntry, costFromUsage, usageFromEntries, readJsonlEntries, rangeStartMs, listSessionJsonlPaths, aggregateUsage, loadUsageCacheFromDisk, saveUsageCacheToDisk, refreshUsageInBackground, getCachedUsage, readInstanceUsage, encodeCwdToProjectDir, resolveNativeJsonl, countSessionsForCwd, listSessionsForCwd, CCLINE_CACHE_FILE, CLAUDE_CREDS_FILE, QUOTA_5H_MEM_TTL_MS, QUOTA_5H_DISK_TTL_MS, PLAN_THRESHOLDS, readCclineCache, readClaudeOauthToken, fetchOauthUsage, blocksFromTurns, detectPlan, p90, gatherTurnsForBlocks, computeFiveHourBlock, loadQuota5hFromDisk, saveQuota5hToDisk, buildQuota5h, refreshQuota5hInBackground, getCachedQuota5h, COMPACT_COOLDOWN_MS, injectPromptToCcv, checkCompactThresholds, readJsonlEntriesIndexed, truncateLabel, classifyEntry, JSONL_SCAN_TTL_MS, RUN_SUMMARY_MAX_EVENTS, ERROR_SAMPLES_PER_GROUP, scanJsonlAll, computeRunSummary, computeRecentEdits, computeErrors,
 } from './usage.mjs';
 import {
   ccvProjectName, findActiveLogFile, parseJsonlFilenameTime, pickInstanceLogs, findActiveLogFileForInstance, tailJsonlEntries, truncate, lastUserPrompt, lastUserPromptAcrossEntries, firstUserPrompt, stripUserPromptFraming, readFirstUserPrompt, inspectToolFlow, summarizeToolInput, summarizeEntry, ageString, fetchPendingAsks, deriveStatus, findRecentAssistantTextTs, isAssistantTextEnd,
@@ -554,8 +554,33 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
     const enrichedIdle = idle.map(i => ({
       ...i,
       alias: getAlias(i.cwd),
+      sessionCount: countSessionsForCwd(i.cwd),
     }));
-    sendJson(res, 200, { instances: enrichedRunning, history: enrichedIdle, localCcSessions: listLocalCcSessions() });
+    // Running instances also benefit from session count (so the focus pane
+    // could later show "this cwd has N past sessions"). Cheap, runs once.
+    const enrichedRunningWithSessions = enrichedRunning.map(i => ({
+      ...i,
+      sessionCount: i.cwd ? countSessionsForCwd(i.cwd) : 0,
+    }));
+    sendJson(res, 200, { instances: enrichedRunningWithSessions, history: enrichedIdle, localCcSessions: listLocalCcSessions() });
+    return;
+  }
+
+  // List native Claude Code sessions for a given cwd. One entry per
+  // ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl, newest first, with
+  // a cleaned first-user-message preview so the rail can render meaningful
+  // labels. Backed by a 30s cache keyed on dir mtime.
+  if (url.startsWith('/api/launcher/sessions') && method === 'GET') {
+    const u = new URL(url, 'http://localhost');
+    const cwd = (u.searchParams.get('cwd') || '').trim();
+    if (!cwd) { sendJson(res, 400, { error: 'cwd required' }); return; }
+    try {
+      const items = await listSessionsForCwd(cwd);
+      sendJson(res, 200, { cwd, sessions: items });
+    } catch (err) {
+      log('sessions error:', err.message);
+      sendJson(res, 500, { error: err.message });
+    }
     return;
   }
 
@@ -669,7 +694,7 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
   if (url === '/api/launcher/spawn' && method === 'POST') {
     try {
       const raw = await readBody(req);
-      const { cwd, force, ccuseProfile, useWorktree, branchName } = JSON.parse(raw || '{}');
+      const { cwd, force, ccuseProfile, useWorktree, branchName, resumeSessionId } = JSON.parse(raw || '{}');
       // If client passes a profile, persist it as this cwd's preferred profile
       // so future spawns default to it without explicit selection.
       if (typeof ccuseProfile === 'string' && cwd) {
@@ -680,6 +705,7 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
         ccuseProfile: ccuseProfile || '',
         useWorktree: !!useWorktree,
         branchName: typeof branchName === 'string' ? branchName : '',
+        resumeSessionId: typeof resumeSessionId === 'string' ? resumeSessionId : '',
       }));
       sendJson(res, 200, { ok: true, instance: entry, worktree: entry && entry.pid ? worktreeForPid(entry.pid) : null });
     } catch (err) {
