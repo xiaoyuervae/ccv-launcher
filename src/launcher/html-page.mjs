@@ -1077,9 +1077,15 @@ export const HTML_PAGE = `<!doctype html>
     return path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
   }
   function api(path, init) {
-    return fetch(withTok(path), init).then(function(r) {
-      if (!r.ok) throw new Error('http ' + r.status);
-      return r.json();
+    return fetch(withTok(path), init).then(async function(r) {
+      var text = await r.text();
+      var data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (e) { /* not json */ }
+      if (!r.ok) {
+        var msg = (data && data.error) || text || ('http ' + r.status);
+        throw new Error(msg);
+      }
+      return data;
     });
   }
   function isMobileViewport() {

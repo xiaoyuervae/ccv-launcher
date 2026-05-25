@@ -43,7 +43,12 @@ const PUBLIC_TEMPLATE = process.env.CCV_PUBLIC_URL_TEMPLATE || '';
 // via its own dedicated subdomain, so children don't collide with it.
 const HUB_PORT_FLOOR = parseInt(process.env.CCV_CHILD_PORT_FLOOR || '7008', 10);
 const HUB_PORT_CEIL = parseInt(process.env.CCV_CHILD_PORT_CEIL || '7099', 10);
-const SPAWN_TIMEOUT_MS = 15000;
+// Generous because the zsh-wrapped path (`zsh -i -c 'ccuse … && exec node …'`)
+// has to source the user's full .zshrc — oh-my-zsh + plugins + conda init can
+// push cold start past 20s on real machines. 15s was tight enough that the hub
+// would 400 before the child ever announced its runtime, leaving the just-born
+// ccv as an orphan listening on the assigned port.
+const SPAWN_TIMEOUT_MS = 45000;
 
 export const instances = new Map();
 let _selfPort = null;
@@ -929,7 +934,12 @@ export async function doSpawn(targetCwd, { force = false, ccuseProfile = '', use
     }
     return entry;
   } catch (err) {
-    try { process.kill(child.pid, 'SIGTERM'); } catch { /* ignore */ }
+    // detached:true puts the child in its own process group, so child.pid is
+    // the pgid. Negating the pid signals the whole group — important for the
+    // zsh-wrapped path, where SIGTERM on the zsh pid leaves the node ccv
+    // grandchild alive (orphan listener on the assigned port). ESRCH means the
+    // group is already gone, which is fine.
+    try { process.kill(-child.pid, 'SIGTERM'); } catch { /* ignore */ }
     // Spawn failed after worktree creation: leave the worktree on disk so the
     // user can inspect what went wrong. Cleanup endpoint can reap it later.
     throw err;
