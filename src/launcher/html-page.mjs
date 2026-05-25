@@ -1962,10 +1962,23 @@ export const HTML_PAGE = `<!doctype html>
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ askId: askId, choiceIndex: idx, choiceLabel: label, questionText: questionText || '' }),
-    }).catch(function() {
-      delete _state.answered[inst.pid];
+    }).catch(function(err) {
+      // Don't auto-open ccv on failure: most "failures" here are bookkeeping
+      // (WS ack didn't arrive in time) while the answer actually landed at
+      // ccv. The 3s activity poll is the source of truth — if the ask is
+      // still pending after a beat, we drop the optimistic ✓ and let the
+      // user click again. If it cleared, we leave the ✓ alone.
+      _state.answered[inst.pid] = Object.assign({}, _state.answered[inst.pid], { error: (err && err.message) || 'send failed' });
       renderAskAlert(); renderTabStrip(); renderFocus();
-      openCcv(inst);
+      setTimeout(function() {
+        var act = _state.activityByPid[inst.pid] || {};
+        var still = (act.pendingAsks || []).some(function(a) { return a.id === askId; });
+        if (still) {
+          delete _state.answered[inst.pid];
+          renderAskAlert(); renderTabStrip(); renderFocus();
+        }
+        if (btn) btn.disabled = false;
+      }, 3500);
     });
   }
 

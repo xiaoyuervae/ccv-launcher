@@ -55,49 +55,65 @@ let _shellWssGetter = () => _shellWss;
 let _ptyManagerGetter = () => _ptyManager;
 
 // Open a short-lived WebSocket to ccv's main /ws endpoint and deliver an
-// ask answer. Times out after 4s — first-write-wins, so if the answer is
-// rejected because another client already answered, we still return 200
-// with `ack.alreadyAnswered: true` so the UI can recover gracefully.
+// ask answer. ccv's protocol does NOT send a positive ack to the answering
+// WS — it broadcasts `ask-hook-resolved` only to *other* clients (c !== ws)
+// and responds 200 to the ask-bridge HTTP long-poll. The only typed messages
+// it sends back to the sender are negative: `ask-hook-already-answered`
+// (first-write-wins race lost) and `ask-hook-cancelled` (entry gone). Both
+// are terminal-success from the launcher's UX perspective — the question is
+// no longer pending either way. So: send, then wait a short grace window for
+// any negative-ack, then close + resolve as success.
 function sendAnswerOverWs(inst, askId, answers) {
   return new Promise((resolve, reject) => {
     if (typeof WebSocket === 'undefined') return reject(new Error('WebSocket not available in this Node runtime'));
     const url = 'ws://127.0.0.1:' + inst.port + '/ws?token=' + encodeURIComponent(inst.token);
     let settled = false;
+    let graceTimer = null;
     const ws = new WebSocket(url);
-    const t = setTimeout(() => {
+    const settle = (fn) => {
       if (settled) return;
       settled = true;
+      if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+      clearTimeout(t);
       try { ws.close(); } catch {}
-      reject(new Error('timeout waiting for ccv ack'));
-    }, 4000);
+      fn();
+    };
+    // Hard ceiling: if `open` never fires (port wrong, ccv hung) we still
+    // need to bail. 4s is plenty for a local WS handshake.
+    const t = setTimeout(() => settle(() => reject(new Error('timeout waiting for ccv ack'))), 4000);
     ws.addEventListener('open', () => {
       try {
         ws.send(JSON.stringify({ type: 'ask-hook-answer', id: askId, answers }));
       } catch (err) {
-        if (settled) return; settled = true; clearTimeout(t); reject(err);
+        settle(() => reject(err));
+        return;
       }
+      // Grace window for negative-ack. ccv server processes ask-hook-answer
+      // synchronously and emits any negative-ack on the same tick, so 400ms
+      // is comfortably enough on localhost.
+      graceTimer = setTimeout(() => settle(() => resolve({ delivered: true, message: null })), 400);
     });
     ws.addEventListener('message', (ev) => {
       let msg;
       try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data.toString()); } catch { return; }
-      // ccv broadcasts ask-hook-resolved / ask-hook-answered / ack on success.
-      // first-write-wins: if our send loses the race, server still acks.
-      if (msg && (msg.type === 'ask-hook-resolved' || msg.type === 'ask-hook-answered' || msg.type === 'ask-hook-ack')) {
-        if (settled) return; settled = true; clearTimeout(t);
-        try { ws.close(); } catch {}
-        resolve({ delivered: true, message: msg });
+      // Treat both positive-broadcast (in case future ccv sends it to self)
+      // and negative-acks as terminal success: the question is gone from
+      // ccv's pending queue regardless of which path won.
+      if (msg && (
+        msg.type === 'ask-hook-resolved' ||
+        msg.type === 'ask-hook-answered' ||
+        msg.type === 'ask-hook-ack' ||
+        msg.type === 'ask-hook-already-answered' ||
+        msg.type === 'ask-hook-cancelled'
+      )) {
+        settle(() => resolve({ delivered: true, message: msg }));
       }
     });
     ws.addEventListener('close', () => {
-      if (settled) return; settled = true; clearTimeout(t);
-      // We sent the answer but never got a typed ack — treat as best-effort
-      // success; the launcher's next 3s activity poll confirms if the ask
-      // cleared.
-      resolve({ delivered: true, message: null, note: 'no typed ack; assuming send succeeded' });
+      settle(() => resolve({ delivered: true, message: null, note: 'ws closed before ack' }));
     });
     ws.addEventListener('error', (err) => {
-      if (settled) return; settled = true; clearTimeout(t);
-      reject(new Error('ws error: ' + (err && err.message || 'unknown')));
+      settle(() => reject(new Error('ws error: ' + (err && err.message || 'unknown'))));
     });
   });
 }
