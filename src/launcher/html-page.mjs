@@ -316,9 +316,16 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   /* ---------- focus column ---------- */
+  /* #focus is content-driven (scrolls internally if too tall); term-panel
+     grows to absorb whatever vertical space focus didn't use, with a 280px
+     floor. Sparse focus → big terminal; busy focus → terminal shrinks to
+     its minimum. No more dead background gap. */
   #focus-col { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
-  #focus { flex: 1 1 0; min-height: 0; min-width: 0; overflow: auto; }
+  #focus { flex: 0 1 auto; min-height: 120px; min-width: 0; overflow: auto; }
   .focus-inner { padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  /* timeline card stays content-driven; if events exceed ~14, cap height and
+     let internal list scroll so it doesn't push other cards off-screen. */
+  .focus-card.timeline-card .timeline { max-height: 56vh; overflow: auto; }
   .focus-hd { display: flex; flex-direction: column; gap: 3px; }
   .focus-hd .row1 { display: flex; align-items: center; gap: 8px; }
   .focus-hd h1 { font-size: 17px; font-weight: 600; letter-spacing: -.3px; margin: 0; }
@@ -490,13 +497,40 @@ export const HTML_PAGE = `<!doctype html>
   }
   .edit-n { color: var(--mute); font-size: 10px; }
 
+  .timeline { display: flex; flex-direction: column; }
+  .tl-row {
+    display: flex; gap: 10px; align-items: baseline;
+    padding: 7px 0; border-top: 1px solid var(--line);
+  }
+  .tl-row:first-child { border-top: none; padding-top: 2px; }
+  .tl-time {
+    color: var(--mute); font-family: var(--mono); font-size: 10.5px;
+    min-width: 38px; text-align: right;
+  }
+  .tl-body { flex: 1; min-width: 0; }
+  .tl-tool {
+    color: var(--warn); font-family: var(--mono); font-size: 11.5px;
+    font-weight: 600; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; display: block;
+  }
+  .tl-text {
+    color: #a5d6ff; font-size: 12px; line-height: 1.4;
+    margin-top: 3px; word-break: break-word;
+  }
+  .tl-user { color: var(--fg); }
+  .tl-dur {
+    color: var(--mute); font-family: var(--mono); font-size: 10px;
+    min-width: 38px; text-align: right;
+  }
+
   /* ---------- bottom terminal panel ---------- */
+  /* Grow to absorb leftover column space (≥280px). Collapsed → fixed 32px. */
   #term-panel {
     border-top: 1px solid var(--line); background: var(--term);
-    flex-shrink: 0; display: flex; flex-direction: column;
-    height: 280px; transition: height .15s;
+    display: flex; flex-direction: column;
+    flex: 1 1 0; min-height: 280px; transition: min-height .15s, flex-basis .15s;
   }
-  #term-panel.collapsed { height: 32px; }
+  #term-panel.collapsed { flex: 0 0 32px; min-height: 32px; }
   #term-handle {
     height: 4px; cursor: ns-resize;
     background: linear-gradient(180deg, var(--bg2), transparent);
@@ -1067,6 +1101,12 @@ export const HTML_PAGE = `<!doctype html>
     var h = Math.floor(m / 60);
     if (h < 48) return h + 'h';
     return Math.floor(h / 24) + 'd';
+  }
+  function fmtDur(ms) {
+    if (ms == null || !isFinite(ms) || ms < 0) return '';
+    if (ms < 1000) return ms + 'ms';
+    if (ms < 60000) return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + 's';
+    return Math.round(ms / 60000) + 'm';
   }
   function fmtTokensK(n) {
     if (n == null || !isFinite(n)) return '—';
@@ -1700,6 +1740,37 @@ export const HTML_PAGE = `<!doctype html>
       for (var rb = 0; rb < bashRows.length; rb++) {
         var be = bashRows[rb];
         html += '<div class="edit-row"><span class="edit-tool">Bash</span><span class="edit-path">' + escape(be.path || be.command || '') + '</span><span class="edit-n">×' + (be.count || 1) + '</span></div>';
+      }
+      html += '</div></div>';
+    }
+
+    // recent activity timeline (from activity payload's recentEvents).
+    // Marked .timeline-card so it grows to fill leftover #focus height and
+    // scrolls internally — keeps focus pane visually full even when other
+    // sections are sparse (e.g. fresh session, no edits, no worktree).
+    var events = act.recentEvents || [];
+    if (events.length) {
+      html += '<div class="focus-card timeline-card">';
+      html += '<div class="card-hd">最近活动 (' + events.length + ')</div>';
+      html += '<div class="timeline">';
+      for (var ev = 0; ev < events.length; ev++) {
+        var it = events[ev];
+        var ago = fmtAge(it.ts);
+        var dur = it.inProgress ? '…' : fmtDur(it.durationMs);
+        html += '<div class="tl-row">';
+        html += '<span class="tl-time">' + escape(ago) + '</span>';
+        html += '<div class="tl-body">';
+        if (it.toolUse) {
+          html += '<span class="tl-tool" title="' + escape(it.toolUse) + '">' + escape(it.toolUse) + '</span>';
+        }
+        if (it.assistantText) {
+          html += '<div class="tl-text">' + escape(it.assistantText) + '</div>';
+        } else if (it.userPrompt) {
+          html += '<div class="tl-text tl-user">' + escape(it.userPrompt) + '</div>';
+        }
+        html += '</div>';
+        html += '<span class="tl-dur">' + escape(dur) + '</span>';
+        html += '</div>';
       }
       html += '</div></div>';
     }

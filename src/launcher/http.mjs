@@ -262,7 +262,7 @@ async function getInstanceActivity(instance) {
   // still helps the user remember what the session was about.
   const userText = lastUserPromptAcrossEntries(entries);
   const preview = userText ? `user: ${truncate(userText, 120)}` : '';
-  const recent = entries.slice(-5).map(summarizeEntry).reverse();
+  const recent = entries.slice(-20).map(summarizeEntry).reverse();
 
   // sessionUsage: per-instance tokens + USD from Claude Code's native session
   // jsonl. Hubs don't run user sessions so we skip them. Failures are silent —
@@ -571,8 +571,8 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
   // a cleaned first-user-message preview so the rail can render meaningful
   // labels. Backed by a 30s cache keyed on dir mtime.
   if (url.startsWith('/api/launcher/sessions') && method === 'GET') {
-    const u = new URL(url, 'http://localhost');
-    const cwd = (u.searchParams.get('cwd') || '').trim();
+    // url is parsedUrl.pathname (no query); use parsedUrl.searchParams directly.
+    const cwd = (parsedUrl.searchParams.get('cwd') || '').trim();
     if (!cwd) { sendJson(res, 400, { error: 'cwd required' }); return; }
     try {
       const items = await listSessionsForCwd(cwd);

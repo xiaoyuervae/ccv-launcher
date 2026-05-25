@@ -451,8 +451,11 @@ export async function readInstanceUsage(jsonlPath) {
 }
 
 export function encodeCwdToProjectDir(cwd) {
-  // Inverse of decodeProjectDirName: Claude Code flattens "/" → "-".
-  return cwd.replace(/\//g, '-');
+  // Claude Code replaces every non-[A-Za-z0-9_-] codepoint with "-" — that
+  // includes "/", spaces, dots, CJK, emoji, etc. The previous version only
+  // flattened "/" which broke usage/context/edits for any cwd containing
+  // spaces or non-ASCII (e.g. "Obsidian Vault/会员业务/fbi报表").
+  return cwd.replace(/[^A-Za-z0-9_-]/g, '-');
 }
 
 // Cheap count of native session jsonls under a cwd. Used by /api/launcher/list
