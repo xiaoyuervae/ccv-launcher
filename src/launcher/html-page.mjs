@@ -316,16 +316,13 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   /* ---------- focus column ---------- */
-  /* #focus is content-driven (scrolls internally if too tall); term-panel
-     grows to absorb whatever vertical space focus didn't use, with a 280px
-     floor. Sparse focus → big terminal; busy focus → terminal shrinks to
-     its minimum. No more dead background gap. */
+  /* #focus 占主体, 内部 overflow 滚; term-panel 固定 280px (用户可拖大). 这是
+     0cd30b5 之前的经典布局: busy focus 不会把 console 挤到只剩 1 行。
+     timeline 卡内部限高滚动, 避免单卡撑爆整列。 */
   #focus-col { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
-  #focus { flex: 0 1 auto; min-height: 120px; min-width: 0; overflow: auto; }
+  #focus { flex: 1 1 0; min-height: 0; min-width: 0; overflow: auto; }
   .focus-inner { padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-  /* timeline card stays content-driven; if events exceed ~14, cap height and
-     let internal list scroll so it doesn't push other cards off-screen. */
-  .focus-card.timeline-card .timeline { max-height: 56vh; overflow: auto; }
+  .focus-card.timeline-card .timeline { max-height: 38vh; overflow: auto; }
   .focus-hd { display: flex; flex-direction: column; gap: 3px; }
   .focus-hd .row1 { display: flex; align-items: center; gap: 8px; }
   .focus-hd h1 { font-size: 17px; font-weight: 600; letter-spacing: -.3px; margin: 0; }
@@ -524,13 +521,13 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   /* ---------- bottom terminal panel ---------- */
-  /* Grow to absorb leftover column space (≥280px). Collapsed → fixed 32px. */
+  /* 固定 280px (用户拖 #term-handle 可覆盖到接近窗口高度). Collapsed → 32px. */
   #term-panel {
     border-top: 1px solid var(--line); background: var(--term);
     display: flex; flex-direction: column;
-    flex: 1 1 0; min-height: 280px; transition: min-height .15s, flex-basis .15s;
+    flex: 0 0 280px; min-height: 0; transition: flex-basis .15s;
   }
-  #term-panel.collapsed { flex: 0 0 32px; min-height: 32px; }
+  #term-panel.collapsed { flex: 0 0 32px; }
   #term-handle {
     height: 4px; cursor: ns-resize;
     background: linear-gradient(180deg, var(--bg2), transparent);
@@ -1174,7 +1171,7 @@ export const HTML_PAGE = `<!doctype html>
       if (p.activePid) _state.activePid = +p.activePid || null;
       if (p.termTab) _state.termTab = p.termTab;
       if (typeof p.termOpen === 'boolean') _state.termOpen = p.termOpen;
-      if (p.termHeight && p.termHeight >= 80 && p.termHeight <= 600) _state.termHeight = p.termHeight;
+      if (p.termHeight && p.termHeight >= 80 && p.termHeight <= 2000) _state.termHeight = p.termHeight;
       if (p.railOpen && typeof p.railOpen === 'object') {
         _state.railOpen.hist = !!p.railOpen.hist;
         _state.railOpen.untracked = !!p.railOpen.untracked;
@@ -2243,7 +2240,11 @@ export const HTML_PAGE = `<!doctype html>
     if (!force && tab === _state.termTab && _state.termOpen) return;
     _state.termTab = tab; _state.termOpen = true; persistState();
     var panel = document.getElementById('term-panel');
-    if (panel) panel.classList.remove('collapsed');
+    if (panel) {
+      panel.classList.remove('collapsed');
+      // 切 tab 时若之前是 collapsed (inline flex 已清), restore 用户自定高度
+      if (_state.termHeight) applyTermSize(_state.termHeight);
+    }
     var tabs = document.querySelectorAll('#term-tabs .term-tab');
     [].forEach.call(tabs, function(t) {
       t.classList.toggle('active', t.getAttribute('data-tab') === tab);
@@ -2265,8 +2266,14 @@ export const HTML_PAGE = `<!doctype html>
     _state.termOpen = open; persistState();
     document.getElementById('term-toggle').textContent = open ? '▾' : '▴';
     if (open) {
+      // 展开时 restore 用户拖过的高度; inline flex 之前可能被清掉
+      if (_state.termHeight) applyTermSize(_state.termHeight);
       // remount xterm because hidden during collapsed
       setTermTab(_state.termTab, true);
+    } else {
+      // 折叠时清 inline flex/min-height, 让 .collapsed CSS class 生效
+      panel.style.flex = '';
+      panel.style.minHeight = '';
     }
   }
 
@@ -2596,11 +2603,21 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   // ---------- term panel drag-resize ----------
+  // 0cd30b5 改成 flex: 1 1 0 + min-height: 280px (auto-absorb leftover space).
+  // 在 flex 布局里 inline height 会被 flex-basis 算法忽略, 所以这里改成
+  // 调整 flex-basis + 关掉 min-height, 让 drag 能真正生效, 并放开上限
+  // 到窗口高度 - 100px, 用户能把 term 往上拉覆盖几乎整个 focus。
+  function applyTermSize(h) {
+    var panel = document.getElementById('term-panel');
+    if (!panel) return;
+    panel.style.flex = '0 0 ' + h + 'px';
+    panel.style.minHeight = '0';
+  }
   function wireTermHandle() {
     var handle = document.getElementById('term-handle');
     var panel = document.getElementById('term-panel');
     if (!handle || !panel) return;
-    if (_state.termHeight) panel.style.height = _state.termHeight + 'px';
+    if (_state.termHeight) applyTermSize(_state.termHeight);
     var dragging = false, startY = 0, startH = 0;
     handle.addEventListener('mousedown', function(e) {
       if (panel.classList.contains('collapsed')) return;
@@ -2611,14 +2628,15 @@ export const HTML_PAGE = `<!doctype html>
     document.addEventListener('mousemove', function(e) {
       if (!dragging) return;
       var dy = startY - e.clientY;
-      var h = Math.max(80, Math.min(600, startH + dy));
-      panel.style.height = h + 'px';
+      var maxH = Math.max(200, window.innerHeight - 100);
+      var h = Math.max(80, Math.min(maxH, startH + dy));
+      applyTermSize(h);
     });
     document.addEventListener('mouseup', function() {
       if (!dragging) return;
       dragging = false;
       document.body.style.userSelect = '';
-      _state.termHeight = panel.getBoundingClientRect().height;
+      _state.termHeight = document.getElementById('term-panel').getBoundingClientRect().height;
       persistState();
     });
   }
