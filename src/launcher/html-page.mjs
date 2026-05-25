@@ -14,6 +14,7 @@ export const HTML_PAGE = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>ccv launcher</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2358a6ff'/%3E%3Ctext x='32' y='42' font-family='Inter,Arial,sans-serif' font-size='32' font-weight='700' text-anchor='middle' fill='%230d1117'%3Ecc%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
 <script>
   // Lazy-load xterm only on viewports that show the docked terminal (>640px).
@@ -797,6 +798,9 @@ export const HTML_PAGE = `<!doctype html>
       padding: 9px 14px; font-size: 13px; font-weight: 700;
       min-height: 36px;
     }
+    #app-bar #btn-notif {
+      width: 36px; height: 36px; font-size: 16px;
+    }
 
     /* Tab strip: horizontal scroll, no scrollbar, sticky under app bar */
     #tab-strip {
@@ -955,6 +959,44 @@ export const HTML_PAGE = `<!doctype html>
       cursor: pointer; min-height: 44px;
     }
   }
+
+  /* ---------- notification settings ---------- */
+  #app-bar .icon-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 28px;
+    background: transparent; border: 1px solid var(--line);
+    border-radius: 5px; color: var(--fg);
+    font-size: 14px; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  #app-bar .icon-btn:hover { background: var(--bg3); }
+  #app-bar .icon-btn[data-on="1"] { border-color: var(--accent); color: var(--accent); }
+  dialog#notif-dlg {
+    background: var(--bg2); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 16px 18px; min-width: 360px; max-width: 480px;
+    font-size: 13px;
+  }
+  dialog#notif-dlg::backdrop { background: rgba(0,0,0,.4); }
+  dialog#notif-dlg h2 { font-size: 15px; font-weight: 600; margin: 0 0 12px; }
+  dialog#notif-dlg .row-flex { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+  dialog#notif-dlg label { cursor: pointer; }
+  dialog#notif-dlg .perm-badge {
+    font-family: var(--mono); font-size: 11px;
+    padding: 2px 8px; border-radius: 4px;
+  }
+  dialog#notif-dlg .perm-badge.granted { background:#1a3a1f; color:#56d364; }
+  dialog#notif-dlg .perm-badge.denied  { background:#3a1a1a; color:#f85149; }
+  dialog#notif-dlg .perm-badge.default { background:#2a2a2a; color:#a0a0a0; }
+  dialog#notif-dlg .perm-badge.unsupported { background:#2a2a2a; color:#a0a0a0; }
+  dialog#notif-dlg button {
+    background: var(--bg3); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 5px;
+    padding: 4px 10px; font-size: 12px; cursor: pointer;
+  }
+  dialog#notif-dlg button:hover { background: var(--bg); }
+  dialog#notif-dlg .hint { color: var(--mute); font-size: 11px; margin: 8px 0 0; }
+  dialog#notif-dlg .actions { margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end; }
 </style>
 </head>
 <body>
@@ -974,6 +1016,7 @@ export const HTML_PAGE = `<!doctype html>
     <div class="bar"><div class="fill" id="quota-fill" style="width:0"></div></div>
   </div>
   <input type="text" id="filter" placeholder="filter  /" spellcheck="false" autocomplete="off">
+  <button id="btn-notif" class="icon-btn" type="button" title="通知设置" aria-label="通知设置">🔔</button>
   <button id="btn-new">+ New</button>
 </header>
 
@@ -1060,6 +1103,24 @@ export const HTML_PAGE = `<!doctype html>
   <div class="row">
     <button id="new-cancel">Cancel</button>
     <button id="new-launch" class="primary">Launch</button>
+  </div>
+</dialog>
+
+<dialog id="notif-dlg" aria-label="通知设置">
+  <h2>通知设置</h2>
+  <div class="row-flex">
+    <label><input type="checkbox" id="notif-enabled"> 启用桌面通知</label>
+    <span id="notif-perm" class="perm-badge default">default</span>
+    <button id="notif-req-perm" type="button">请求权限</button>
+  </div>
+  <div class="row-flex">
+    <label><input type="checkbox" id="notif-sound" checked> 启用声音蜂鸣</label>
+    <button id="notif-test" type="button">试发通知</button>
+  </div>
+  <p class="hint">触发场景：等待回答 / 工具等待授权 / 完成一轮 / 出错。同一事件 5 分钟内只提醒一次。</p>
+  <p class="hint" id="notif-caps"></p>
+  <div class="actions">
+    <button id="notif-close" type="button">关闭</button>
   </div>
 </dialog>
 
@@ -1164,6 +1225,12 @@ export const HTML_PAGE = `<!doctype html>
     sessionsByCwd: {},      // cwd -> { fetchedAt, items } or { loading: true }
     openCcvs: [],           // pids of ccv iframes currently mounted in overlay
     activeOverlayPid: null, // which pid is visible in #ccv-overlay
+    lastStatusByPid: {},    // pid -> last seen status (transition detection baseline)
+    notifPrefs: { enabled: false, soundEnabled: true },
+    notifRecentTags: {},    // tag -> ts (cross-tab dedup window)
+    notifThrottle: {},      // 'pid-status' -> last notify ts (5-min throttle)
+    notifSkipNextDetect: false,
+    audioCtx: null,
   };
   try {
     var p = JSON.parse(localStorage.getItem('ccvMcState') || '{}');
@@ -2581,7 +2648,12 @@ export const HTML_PAGE = `<!doctype html>
   var _visible = !document.hidden;
   document.addEventListener('visibilitychange', function() {
     _visible = !document.hidden;
-    if (_visible) { refreshList(); refreshActivity(); refreshStats(); }
+    if (_visible) {
+      // Skip the first detect after returning visible so accumulated background
+      // transitions don't all fire as a burst of notifications.
+      _state.notifSkipNextDetect = true;
+      refreshList(); refreshActivity(); refreshStats();
+    }
   });
 
   function loadPrefs(force) {
@@ -2632,6 +2704,9 @@ export const HTML_PAGE = `<!doctype html>
         var asks = extractAsks(act);
         if (!asks.length) delete _state.answered[pid];
       });
+      // Detect runs before render so notifications fire on the same tick as UI
+      // updates, but a notification bug must never block rendering — hence the guard.
+      try { detectStatusTransitions(map); } catch (e) { console.warn('[NotifMgr] detect failed:', e && e.message); }
       renderTabStrip(); renderRail(); renderFocus(); renderAskAlert();
       refreshActivePidExtras();
     }).catch(function() {});
@@ -2726,8 +2801,378 @@ export const HTML_PAGE = `<!doctype html>
     }
   });
 
+  // ---------- notification manager ----------
+  var NOTIF_FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2358a6ff'/%3E%3Ctext x='32' y='42' font-family='Inter,Arial,sans-serif' font-size='32' font-weight='700' text-anchor='middle' fill='%230d1117'%3Ecc%3C/text%3E%3C/svg%3E";
+  var NOTIF_CLAIM_WINDOW_MS = 4000;
+  var NOTIF_CLEANUP_INTERVAL_MS = 5000;
+  var NOTIF_THROTTLE_MS = 5 * 60 * 1000;
+  var NOTIF_INTEREST = {
+    waiting_ask:   { title: '需要回答', body: '%name 提了一个问题' },
+    waiting_tool:  { title: '等待授权', body: '%name 的工具调用等待批准' },
+    waiting_input: { title: '完成一轮', body: '%name 等待你的下一步指令' },
+    error:         { title: '出错',     body: '%name 出现异常' },
+  };
+  var _notifChannel = null;
+  var _notifCleanupTimer = null;
+
+  function instanceDisplayName(inst) {
+    if (!inst) return '实例';
+    return inst.alias || inst.displayName || inst.projectName
+      || (inst.cwd ? String(inst.cwd).split('/').pop() : '')
+      || ('PID ' + inst.pid);
+  }
+
+  function loadNotifPrefs() {
+    try {
+      var stored = JSON.parse(localStorage.getItem('ccvNotifPrefs') || '{}');
+      _state.notifPrefs = {
+        enabled: !!stored.enabled,
+        soundEnabled: stored.soundEnabled !== false,
+      };
+    } catch (e) {
+      _state.notifPrefs = { enabled: false, soundEnabled: true };
+    }
+  }
+
+  function saveNotifPrefs(broadcast) {
+    try {
+      localStorage.setItem('ccvNotifPrefs', JSON.stringify({
+        enabled: !!_state.notifPrefs.enabled,
+        soundEnabled: !!_state.notifPrefs.soundEnabled,
+        _v: 1,
+      }));
+    } catch (e) {}
+    refreshNotifIndicator();
+    if (broadcast) {
+      var ch = getNotifChannel();
+      if (ch) {
+        try { ch.postMessage({ type: 'prefs', prefs: _state.notifPrefs, ts: Date.now() }); } catch (e) {}
+      }
+    }
+  }
+
+  function getNotifChannel() {
+    if (_notifChannel) return _notifChannel;
+    if (typeof BroadcastChannel === 'undefined') return null;
+    try {
+      _notifChannel = new BroadcastChannel('ccv-notif');
+      _notifChannel.onmessage = function(ev) {
+        var d = ev && ev.data;
+        if (!d || typeof d !== 'object') return;
+        if (d.type === 'claim' && d.tag) {
+          _state.notifRecentTags[d.tag] = d.ts || Date.now();
+        } else if (d.type === 'prefs' && d.prefs) {
+          _state.notifPrefs = {
+            enabled: !!d.prefs.enabled,
+            soundEnabled: d.prefs.soundEnabled !== false,
+          };
+          renderNotifPanel();
+          refreshNotifIndicator();
+        }
+      };
+      if (_notifCleanupTimer) clearInterval(_notifCleanupTimer);
+      _notifCleanupTimer = setInterval(function() {
+        var now = Date.now();
+        var keys = Object.keys(_state.notifRecentTags);
+        for (var i = 0; i < keys.length; i++) {
+          if (now - _state.notifRecentTags[keys[i]] > NOTIF_CLEANUP_INTERVAL_MS) {
+            delete _state.notifRecentTags[keys[i]];
+          }
+        }
+        var tkeys = Object.keys(_state.notifThrottle);
+        for (var j = 0; j < tkeys.length; j++) {
+          if (now - _state.notifThrottle[tkeys[j]] > NOTIF_THROTTLE_MS * 2) {
+            delete _state.notifThrottle[tkeys[j]];
+          }
+        }
+      }, NOTIF_CLEANUP_INTERVAL_MS);
+    } catch (e) {
+      _notifChannel = null;
+    }
+    return _notifChannel;
+  }
+
+  function notifPermission() {
+    if (typeof Notification === 'undefined') return 'unsupported';
+    return Notification.permission || 'default';
+  }
+
+  function requestNotifPermission() {
+    if (typeof Notification === 'undefined') return Promise.resolve('unsupported');
+    if (Notification.permission === 'granted') return Promise.resolve('granted');
+    try {
+      var r = Notification.requestPermission();
+      if (r && typeof r.then === 'function') return r;
+      return Promise.resolve(Notification.permission);
+    } catch (e) {
+      return Promise.resolve(Notification.permission || 'denied');
+    }
+  }
+
+  function ensureAudioCtx() {
+    if (_state.audioCtx) return _state.audioCtx;
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try {
+      _state.audioCtx = new AC();
+    } catch (e) {
+      console.warn('[NotifMgr] AudioContext init failed:', e && e.message);
+      _state.audioCtx = null;
+    }
+    return _state.audioCtx;
+  }
+
+  function playBeep() {
+    if (!_state.notifPrefs.soundEnabled) return;
+    var ctx = ensureAudioCtx();
+    if (!ctx) return;
+    try {
+      if (ctx.state === 'suspended') { try { ctx.resume(); } catch (e) {} }
+      var now = ctx.currentTime;
+      var osc = ctx.createOscillator();
+      var gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.18, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.34);
+    } catch (e) {
+      console.warn('[NotifMgr] playBeep failed:', e && e.message);
+    }
+  }
+
+  // Tag identifies a (pid, state, event) triple. Second-level stamp keeps the tag
+  // stable across the 3s poll window so the OS dedups repeats; lastEventAt may be
+  // null on probe errors → fall back to 0 (subsequent error entries on same pid
+  // stay deduped, which is the desired behavior).
+  function buildNotifTag(pid, status, lastEventAt) {
+    var stamp = 0;
+    if (lastEventAt) {
+      var t = Date.parse(lastEventAt);
+      if (!isNaN(t)) stamp = Math.floor(t / 1000);
+    }
+    return 'ccv-' + pid + '-' + status + '-' + stamp;
+  }
+
+  function showNotif(title, body, tag, pid, status) {
+    if (!_state.notifPrefs.enabled) return;
+    if (typeof Notification === 'undefined') return;
+    if (Notification.permission !== 'granted') return;
+    var claimedAt = _state.notifRecentTags[tag];
+    if (claimedAt && Date.now() - claimedAt < NOTIF_CLAIM_WINDOW_MS) return;
+    _state.notifRecentTags[tag] = Date.now();
+    var ch = getNotifChannel();
+    if (ch) {
+      try { ch.postMessage({ type: 'claim', tag: tag, ts: Date.now() }); } catch (e) {}
+    }
+    try {
+      var n = new Notification(title, { body: body, tag: tag, icon: NOTIF_FAVICON });
+      n.onclick = function() {
+        try { window.focus(); } catch (e) {}
+        if (pid != null) {
+          try { setActive(pid); } catch (e) { _state.activePid = pid; }
+        }
+        try { n.close(); } catch (e) {}
+      };
+    } catch (e) {
+      console.warn('[NotifMgr] Notification failed:', e && e.message);
+    }
+  }
+
+  function detectStatusTransitions(map) {
+    if (!_state.notifPrefs.enabled || _state.notifSkipNextDetect) {
+      // Refresh baseline without notifying.
+      var snap = {};
+      for (var k = 0; k < _state.instances.length; k++) {
+        var p = _state.instances[k].pid;
+        snap[p] = map[p] && map[p].status || 'no_session';
+      }
+      _state.lastStatusByPid = snap;
+      _state.notifSkipNextDetect = false;
+      return;
+    }
+    for (var i = 0; i < _state.instances.length; i++) {
+      var inst = _state.instances[i];
+      var pid = inst.pid;
+      var act = map[pid];
+      var curr = (act && act.status) || 'no_session';
+      var prev = _state.lastStatusByPid[pid];
+      // First time we see this pid: just set baseline. Notifying here would fire
+      // on every page reload (when the in-memory snapshot is empty but the server
+      // already shows the instance in waiting_ask/error/etc.), which is noise.
+      if (prev === undefined) {
+        _state.lastStatusByPid[pid] = curr;
+        continue;
+      }
+      if (curr === prev) continue;
+      var meta = NOTIF_INTEREST[curr];
+      if (!meta) {
+        _state.lastStatusByPid[pid] = curr;
+        continue;
+      }
+      // waiting_ask: skip if already answered or no real ask payload
+      if (curr === 'waiting_ask') {
+        var asks = extractAsks(act);
+        if (!asks.length || _state.answered[pid]) {
+          _state.lastStatusByPid[pid] = curr;
+          continue;
+        }
+      }
+      // Throttle key includes lastEventAt so distinct events (e.g. ask A → answer →
+      // ask B within 5 min) are still allowed; only the same event reentering the
+      // same state within 5 min is suppressed (e.g. idle↔error flapping).
+      var tkey = buildNotifTag(pid, curr, act && act.lastEventAt);
+      var lastAt = _state.notifThrottle[tkey] || 0;
+      if (Date.now() - lastAt < NOTIF_THROTTLE_MS) {
+        _state.lastStatusByPid[pid] = curr;
+        continue;
+      }
+      _state.notifThrottle[tkey] = Date.now();
+      var name = instanceDisplayName(inst);
+      showNotif(meta.title, meta.body.replace('%name', name),
+                buildNotifTag(pid, curr, act && act.lastEventAt), pid, curr);
+      playBeep();
+      _state.lastStatusByPid[pid] = curr;
+    }
+  }
+
+  function refreshNotifIndicator() {
+    var btn = document.getElementById('btn-notif');
+    if (!btn) return;
+    btn.setAttribute('data-on', _state.notifPrefs.enabled && notifPermission() === 'granted' ? '1' : '0');
+  }
+
+  function renderNotifPanel() {
+    var dlg = document.getElementById('notif-dlg');
+    if (!dlg) return;
+    var cbE = document.getElementById('notif-enabled');
+    var cbS = document.getElementById('notif-sound');
+    var perm = document.getElementById('notif-perm');
+    var caps = document.getElementById('notif-caps');
+    if (cbE) cbE.checked = !!_state.notifPrefs.enabled;
+    if (cbS) cbS.checked = !!_state.notifPrefs.soundEnabled;
+    var permState = notifPermission();
+    if (perm) {
+      perm.textContent = permState;
+      perm.className = 'perm-badge ' + permState;
+    }
+    if (caps) {
+      var msgs = [];
+      if (permState === 'unsupported') msgs.push('此浏览器不支持桌面通知');
+      if (permState === 'denied') msgs.push('权限被拒绝，需在浏览器地址栏设置中重新允许');
+      if (typeof BroadcastChannel === 'undefined') msgs.push('当前浏览器不支持跨标签同步');
+      if (!(window.AudioContext || window.webkitAudioContext)) msgs.push('当前浏览器不支持 Web Audio，蜂鸣不可用');
+      caps.textContent = msgs.join(' · ');
+      caps.hidden = !msgs.length;
+    }
+  }
+
+  function openNotifDlg() {
+    renderNotifPanel();
+    var dlg = document.getElementById('notif-dlg');
+    if (dlg && typeof dlg.showModal === 'function') {
+      try { dlg.showModal(); } catch (e) {}
+    }
+  }
+
+  function bindNotifUI() {
+    var btn = document.getElementById('btn-notif');
+    if (btn) btn.addEventListener('click', openNotifDlg);
+    var dlg = document.getElementById('notif-dlg');
+    var cbE = document.getElementById('notif-enabled');
+    var cbS = document.getElementById('notif-sound');
+    var reqBtn = document.getElementById('notif-req-perm');
+    var testBtn = document.getElementById('notif-test');
+    var closeBtn = document.getElementById('notif-close');
+    if (cbE) {
+      cbE.addEventListener('change', function() {
+        if (cbE.checked) {
+          var perm = notifPermission();
+          if (perm === 'unsupported') {
+            cbE.checked = false;
+            renderNotifPanel();
+            return;
+          }
+          if (perm === 'default') {
+            requestNotifPermission().then(function(r) {
+              if (r !== 'granted') {
+                cbE.checked = false;
+              }
+              _state.notifPrefs.enabled = cbE.checked;
+              saveNotifPrefs(true);
+              renderNotifPanel();
+            });
+            return;
+          }
+          if (perm === 'denied') {
+            cbE.checked = false;
+            renderNotifPanel();
+            return;
+          }
+        }
+        _state.notifPrefs.enabled = cbE.checked;
+        // Pre-warm AudioContext on this user gesture so future beeps are unlocked.
+        if (cbE.checked) { ensureAudioCtx(); var c = _state.audioCtx; if (c && c.state === 'suspended') { try { c.resume(); } catch (e) {} } }
+        saveNotifPrefs(true);
+        renderNotifPanel();
+      });
+    }
+    if (cbS) {
+      cbS.addEventListener('change', function() {
+        _state.notifPrefs.soundEnabled = cbS.checked;
+        if (cbS.checked) { ensureAudioCtx(); var c = _state.audioCtx; if (c && c.state === 'suspended') { try { c.resume(); } catch (e) {} } }
+        saveNotifPrefs(true);
+      });
+    }
+    if (reqBtn) {
+      reqBtn.addEventListener('click', function() {
+        requestNotifPermission().then(function() { renderNotifPanel(); });
+      });
+    }
+    if (testBtn) {
+      testBtn.addEventListener('click', function() {
+        // Force send a one-off test notification, ignoring throttle.
+        var name = '试发';
+        var tag = 'ccv-test-' + Date.now();
+        playBeep();
+        if (notifPermission() !== 'granted') {
+          requestNotifPermission().then(function(p) {
+            if (p === 'granted') {
+              _state.notifPrefs.enabled = true;
+              saveNotifPrefs(true);
+              showNotif('ccv launcher', '测试通知 · ' + name, tag, null, null);
+              renderNotifPanel();
+            }
+          });
+          return;
+        }
+        var was = _state.notifPrefs.enabled;
+        _state.notifPrefs.enabled = true;
+        showNotif('ccv launcher', '测试通知 · ' + name, tag, null, null);
+        _state.notifPrefs.enabled = was;
+      });
+    }
+    if (closeBtn && dlg) closeBtn.addEventListener('click', function() { try { dlg.close(); } catch (e) {} });
+  }
+
+  window.addEventListener('beforeunload', function() {
+    try { if (_notifChannel) _notifChannel.close(); } catch (e) {}
+    try { if (_state.audioCtx) _state.audioCtx.close(); } catch (e) {}
+  });
+
   // ---------- boot ----------
   function init() {
+    // Notification settings (load prefs + wire UI before first activity poll
+    // so detect logic has its baseline ready).
+    loadNotifPrefs();
+    getNotifChannel();
+    bindNotifUI();
+    refreshNotifIndicator();
+
     // Wire static interactions
     document.getElementById('btn-new').addEventListener('click', openNew);
     document.getElementById('new-cancel').addEventListener('click', function() { document.getElementById('dlg').close(); });
