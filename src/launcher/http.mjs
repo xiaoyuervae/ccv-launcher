@@ -246,7 +246,7 @@ const _activityCache = new Map(); // pid -> { at, signature, payload }
 // ---------- ccusage + 5h quota + run summary ----------
 // Module lives in src/launcher/usage.mjs; entry just imports.
 
-async function getInstanceActivity(instance) {
+export async function getInstanceActivity(instance) {
   const cached = _activityCache.get(instance.pid);
   const now = Date.now();
   if (cached && now - cached.at < ACTIVITY_CACHE_TTL_MS) return cached.payload;

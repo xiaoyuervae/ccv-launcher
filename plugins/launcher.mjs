@@ -90,6 +90,8 @@ let _ptyManager = null;
 // src/launcher/http.mjs. Entry retains installRequestMultiplexer +
 // installShellWebSocket because both wire into ctx.httpServer.
 import { isLauncherPath, dispatchLauncherRoute, wireEntryBindings } from '../src/launcher/http.mjs';
+import { startPoller, stopPoller } from '../src/launcher/push/poller.mjs';
+import { preloadVapid } from '../src/launcher/push/vapid.mjs';
 
 // Plug entry-owned refs (ccv workspace registry + WS shell server) into the
 // dispatcher. /healthz uses the WS counts; the workspace endpoints use the
@@ -359,9 +361,26 @@ export default {
         }
         log(`hub ready on port ${port}, watching ${RUNTIME_DIR}`);
         log(`open http://127.0.0.1:${port}/launcher (no token required on hub)`);
+        // Pre-generate/load VAPID keypair so the first /push/subscribe
+        // request doesn't pay the keygen latency (~30ms).
+        try { preloadVapid(); } catch (err) { log('vapid preload error:', err.message); }
+        // Start backend status-transition poller for Web Push delivery to
+        // iOS PWA / Chrome / etc. Disabled via CCV_PUSH_POLL_MS=0 if needed.
+        const pollMs = parseInt(process.env.CCV_PUSH_POLL_MS ?? '5000', 10);
+        if (pollMs > 0) startPoller({ intervalMs: pollMs });
       } catch (err) {
         log('serverStarted error:', err.message);
       }
     },
+    serverStopping: async () => {
+      try { stopPoller(); } catch {}
+    },
   },
 };
+
+// Belt-and-braces: cc-viewer's serverStopping isn't guaranteed to fire on
+// every termination path (kill -9 obviously not, but also SIGTERM races).
+// Stop the poller on signals too — it's idempotent.
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  try { process.on(sig, () => { try { stopPoller(); } catch {} }); } catch {}
+}
