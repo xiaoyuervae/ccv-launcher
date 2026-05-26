@@ -1127,6 +1127,7 @@ export const HTML_PAGE = `<!doctype html>
     <span id="push-status" class="perm-badge default">未启用</span>
     <button id="push-subscribe" type="button">订阅</button>
     <button id="push-unsubscribe" type="button">取消订阅</button>
+    <button id="push-test" type="button">发测试推送</button>
   </div>
   <p class="hint">iOS 用户：先把 launcher「添加到主屏幕」，再从主屏图标打开后再来订阅。</p>
   <p class="hint" id="push-caps"></p>
@@ -3249,6 +3250,8 @@ export const HTML_PAGE = `<!doctype html>
     }
     if (subBtn) subBtn.disabled = !p.supported || p.subscribed || p.status !== 'idle';
     if (unsubBtn) unsubBtn.disabled = !p.supported || !p.subscribed || p.status !== 'idle';
+    var testBtn = document.getElementById('push-test');
+    if (testBtn) testBtn.disabled = !p.supported || !p.subscribed || p.status !== 'idle';
     if (caps) {
       var msgs = [];
       if (!p.supported) msgs.push('当前浏览器不支持 Web Push（iOS 必须 ≥ 16.4 且从主屏图标启动）');
@@ -3260,8 +3263,25 @@ export const HTML_PAGE = `<!doctype html>
   function bindPushUI() {
     var sub = document.getElementById('push-subscribe');
     var unsub = document.getElementById('push-unsubscribe');
+    var test = document.getElementById('push-test');
     if (sub) sub.addEventListener('click', function() { pushSubscribe(); });
     if (unsub) unsub.addEventListener('click', function() { pushUnsubscribe(); });
+    if (test) test.addEventListener('click', function() {
+      api('/api/launcher/push/test', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ message: '测试推送 · ' + new Date().toLocaleTimeString() }),
+      }).then(function(r) {
+        _state.push.error = '';
+        if (!r || r.sent === 0) {
+          _state.push.error = '后端没把推送送出去: ' + JSON.stringify(r && r.results && r.results[0] || r);
+        }
+        refreshPushPanel();
+      }).catch(function(err) {
+        _state.push.error = (err && err.message) || 'test failed';
+        refreshPushPanel();
+      });
+    });
   }
   function wireSWMessages() {
     if (!('serviceWorker' in navigator)) return;

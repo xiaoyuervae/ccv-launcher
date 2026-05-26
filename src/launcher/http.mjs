@@ -22,6 +22,8 @@ import { HTML_PAGE } from './html-page.mjs';
 import { getPublicKeyB64u, preloadVapid } from './push/vapid.mjs';
 import { sendPush } from './push/send.mjs';
 import { addSubscription, removeByEndpoint, findByEndpoint, getAll as getAllSubs, getBySubject } from './push/subs.mjs';
+import { sendToSubject } from './push/orchestrator.mjs';
+import { getPollerStats } from './push/poller.mjs';
 import {
   RUNTIME_DIR, instances, setSelfBinding, safeJson, pidAlive, renderTemplate, buildPublicUrl, buildLanUrl, loadRuntimeFile, rescanRuntime, BACKFILL_TTL_MS, PROBE_TIMEOUT_MS, probeCcv, listListeningNodePids, readPidCwd, readPidStartedMs, backfillExternalCcvs, LOCAL_CC_CACHE_TTL_MS, decodeProjectDirName, readJsonlCwd, readJsonlLastTimestamp, readPidLstart, listLocalCcSessions, spawnCcvInTerminal, killClaudePid, startWatcher, serializeSpawn, nextFreePort, findRunningByCwd, waitForChildRuntime, _pidWorktrees, WORKTREE_NAME_RE, BRANCH_NAME_RE, isInsideDir, gitInCwd, detectBaseRef, createWorktree, removeWorktree, worktreeForPid, MD_FILE_MAX_BYTES, MD_PREVIEW_BYTES, MD_BACKUP_KEEP, HOME_CLAUDE_DIR, safeRealpath, isAllowedMdPath, safeReadPreview, pushMdFile, scanClaudeMd, backupMdBeforeWrite, doSpawn, LAUNCHER_LOG_DIR, ccvLogPath,
 } from './runtime.mjs';
@@ -629,6 +631,46 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
       const entry = findByEndpoint(ep);
       sendJson(res, 200, { known: !!entry, subjectMatches: entry ? entry.subjectId === subjectIdFor(req) : false });
     } catch (err) { sendJson(res, 500, { error: 'check failed: ' + err.message }); }
+    return;
+  }
+  // Self-diagnostic: send a one-off push to ONLY the calling subject's
+  // current sub(s). Used to verify the VAPID/encrypt/POST chain end-to-end
+  // from the same device the user is sitting in front of.
+  if (url === '/api/launcher/push/test' && method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      const body = raw ? JSON.parse(raw) : {};
+      const subjectId = subjectIdFor(req);
+      const r = await sendToSubject(subjectId, {
+        title: 'ccv launcher',
+        body: body?.message || ('测试推送 · ' + new Date().toLocaleTimeString()),
+        data: { tag: 'ccv:test:' + Date.now(), kind: 'test' },
+      });
+      sendJson(res, 200, r);
+    } catch (err) {
+      jlog('push-test-error', { error: err.message });
+      sendJson(res, 500, { error: 'test push failed: ' + err.message });
+    }
+    return;
+  }
+  // Debug: list subs (redacted endpoint so the full URL doesn't end up in
+  // chat logs). Cookie-gated by isAuthenticated above.
+  if (url === '/api/launcher/push/subscriptions' && method === 'GET') {
+    try {
+      const subs = getAllSubs().map(s => ({
+        subjectId: s.subjectId,
+        endpointHost: (() => { try { return new URL(s.endpoint).host; } catch { return '?'; } })(),
+        endpointTail: s.endpoint.slice(-12),
+        addedAt: s.addedAt,
+        updatedAt: s.updatedAt,
+        lastOkAt: s.lastOkAt,
+        lastFailAt: s.lastFailAt,
+        lastFailStatus: s.lastFailStatus,
+        userAgent: s.userAgent,
+        mine: s.subjectId === subjectIdFor(req),
+      }));
+      sendJson(res, 200, { subs, count: subs.length, poller: getPollerStats() });
+    } catch (err) { sendJson(res, 500, { error: 'list failed: ' + err.message }); }
     return;
   }
 
