@@ -33,6 +33,15 @@ export const RUNTIME_DIR = join(homedir(), '.claude', 'cc-viewer', 'runtime');
 // separate ws subscription. Files are truncated on each spawn.
 export const LAUNCHER_LOG_DIR = join(homedir(), '.claude', 'cc-viewer', 'launcher-logs');
 export function ccvLogPath(port) { return join(LAUNCHER_LOG_DIR, `ccv-${port}.log`); }
+// Launcher-only persistent state (VAPID keypair, web push subscriptions, …).
+// Sibling of runtime/ + launcher-logs/ so a user can `rm -rf` the whole
+// ~/.claude/cc-viewer dir to reset launcher state without touching ccv's own
+// data. Created lazily by ensureLauncherDataDir() on first read/write.
+export const LAUNCHER_DATA_DIR = join(homedir(), '.claude', 'cc-viewer', 'launcher');
+export function ensureLauncherDataDir() {
+  if (!existsSync(LAUNCHER_DATA_DIR)) mkdirSync(LAUNCHER_DATA_DIR, { recursive: true, mode: 0o700 });
+  return LAUNCHER_DATA_DIR;
+}
 // Public URL template for child instances exposed via a reverse proxy.
 // When unset, buildPublicUrl returns '' and the UI shows only the LAN URL.
 // Placeholders: {port} {token} {host}.
