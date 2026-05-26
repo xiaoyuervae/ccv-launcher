@@ -1,0 +1,17 @@
+{
+  "name": "ccv launcher",
+  "short_name": "ccv",
+  "start_url": "/launcher",
+  "scope": "/launcher/",
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "icons": [
+    {
+      "src": "/launcher/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

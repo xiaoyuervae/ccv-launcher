@@ -15,6 +15,10 @@ export const HTML_PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>ccv launcher</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2358a6ff'/%3E%3Ctext x='32' y='42' font-family='Inter,Arial,sans-serif' font-size='32' font-weight='700' text-anchor='middle' fill='%230d1117'%3Ecc%3C/text%3E%3C/svg%3E">
+<link rel="manifest" href="/launcher/manifest.webmanifest">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0d1117">
 <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
 <script>
   // Lazy-load xterm only on viewports that show the docked terminal (>640px).
@@ -1117,6 +1121,15 @@ export const HTML_PAGE = `<!doctype html>
     <label><input type="checkbox" id="notif-sound" checked> 启用声音蜂鸣</label>
     <button id="notif-test" type="button">试发通知</button>
   </div>
+  <hr style="border:none;border-top:1px solid var(--line);margin:10px 0">
+  <h2 style="font-size:13px">手机推送 (PWA / Web Push)</h2>
+  <div class="row-flex">
+    <span id="push-status" class="perm-badge default">未启用</span>
+    <button id="push-subscribe" type="button">订阅</button>
+    <button id="push-unsubscribe" type="button">取消订阅</button>
+  </div>
+  <p class="hint">iOS 用户：先把 launcher「添加到主屏幕」，再从主屏图标打开后再来订阅。</p>
+  <p class="hint" id="push-caps"></p>
   <p class="hint">触发场景：等待回答 / 工具等待授权 / 完成一轮 / 出错。同一事件 5 分钟内只提醒一次。</p>
   <p class="hint" id="notif-caps"></p>
   <div class="actions">
@@ -1231,6 +1244,7 @@ export const HTML_PAGE = `<!doctype html>
     notifThrottle: {},      // 'pid-status' -> last notify ts (5-min throttle)
     notifSkipNextDetect: false,
     audioCtx: null,
+    push: { supported: false, subscribed: false, endpoint: null, status: 'idle', error: '' },
   };
   try {
     var p = JSON.parse(localStorage.getItem('ccvMcState') || '{}');
@@ -2975,6 +2989,11 @@ export const HTML_PAGE = `<!doctype html>
     if (!_state.notifPrefs.enabled) return;
     if (typeof Notification === 'undefined') return;
     if (Notification.permission !== 'granted') return;
+    // When Web Push is subscribed and the page is hidden, let the server's
+    // push (delivered via SW) be the sole channel — otherwise iOS would
+    // fire nothing AND Chrome would fire both (in-window + SW push). Tags
+    // match so OS-level dedup catches the overlap if it still occurs.
+    if (_state.push && _state.push.subscribed && document && document.visibilityState === 'hidden') return;
     var claimedAt = _state.notifRecentTags[tag];
     if (claimedAt && Date.now() - claimedAt < NOTIF_CLAIM_WINDOW_MS) return;
     _state.notifRecentTags[tag] = Date.now();
@@ -3082,6 +3101,7 @@ export const HTML_PAGE = `<!doctype html>
       caps.textContent = msgs.join(' · ');
       caps.hidden = !msgs.length;
     }
+    refreshPushPanel();
   }
 
   function openNotifDlg() {
@@ -3090,6 +3110,168 @@ export const HTML_PAGE = `<!doctype html>
     if (dlg && typeof dlg.showModal === 'function') {
       try { dlg.showModal(); } catch (e) {}
     }
+  }
+
+  // ---------- web push (PWA / iOS) ----------
+  // SW + pushManager.subscribe + reconcile with server. Distinct from the
+  // in-window Notification path: those go through new Notification() and
+  // only work while the page is alive. Web Push goes through APNs / FCM
+  // and survives PWA suspension on iOS.
+  function pushSupported() {
+    return typeof window !== 'undefined'
+      && 'serviceWorker' in navigator
+      && 'PushManager' in window
+      && 'Notification' in window;
+  }
+  function b64urlToUint8Array(s) {
+    var pad = '='.repeat((4 - s.length % 4) % 4);
+    var b64 = (s + pad).replace(/-/g, '+').replace(/_/g, '/');
+    var raw = atob(b64);
+    var arr = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+    return arr;
+  }
+  function registerSW() {
+    if (!pushSupported()) return Promise.reject(new Error('unsupported'));
+    return navigator.serviceWorker.register('/launcher/sw.js', { scope: '/launcher/' });
+  }
+  function getExistingSubscription() {
+    if (!pushSupported()) return Promise.resolve(null);
+    return navigator.serviceWorker.ready.then(function(reg) { return reg.pushManager.getSubscription(); });
+  }
+  // Reconcile on boot: browser may still hold a sub from a previous session
+  // while the server's push-subs.json is gone (launcher restart cleared it).
+  // We silently re-POST so the user doesn't lose pushes after a hub bounce.
+  function pushReconcile() {
+    if (!pushSupported()) {
+      _state.push.supported = false;
+      refreshPushPanel();
+      return;
+    }
+    _state.push.supported = true;
+    getExistingSubscription().then(function(sub) {
+      if (!sub) { _state.push.subscribed = false; _state.push.endpoint = null; refreshPushPanel(); return; }
+      _state.push.subscribed = true;
+      _state.push.endpoint = sub.endpoint;
+      refreshPushPanel();
+      var qs = 'endpoint=' + encodeURIComponent(sub.endpoint);
+      api('/api/launcher/push/check?' + qs).then(function(r) {
+        if (r && r.known === false) {
+          // Server forgot us — re-POST without re-prompting.
+          var subJson = sub.toJSON();
+          api('/api/launcher/push/subscribe', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ endpoint: subJson.endpoint, keys: subJson.keys }),
+          }).catch(function(e) { console.warn('[push] reconcile re-subscribe failed:', e && e.message); });
+        }
+      }).catch(function() { /* offline or auth missing — ignore */ });
+    });
+  }
+  function pushSubscribe() {
+    if (!pushSupported()) return Promise.reject(new Error('unsupported'));
+    _state.push.status = 'subscribing'; _state.push.error = ''; refreshPushPanel();
+    return Promise.resolve()
+      .then(function() {
+        if (Notification.permission === 'granted') return 'granted';
+        return Notification.requestPermission();
+      })
+      .then(function(perm) {
+        if (perm !== 'granted') throw new Error('notification permission ' + perm);
+        return api('/api/launcher/push/vapid-public-key');
+      })
+      .then(function(r) {
+        if (!r || !r.publicKey) throw new Error('vapid public key unavailable');
+        return navigator.serviceWorker.ready.then(function(reg) {
+          return reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: b64urlToUint8Array(r.publicKey),
+          });
+        });
+      })
+      .then(function(sub) {
+        var sj = sub.toJSON();
+        return api('/api/launcher/push/subscribe', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ endpoint: sj.endpoint, keys: sj.keys }),
+        }).then(function() { return sub; });
+      })
+      .then(function(sub) {
+        _state.push.subscribed = true;
+        _state.push.endpoint = sub.endpoint;
+        _state.push.status = 'idle';
+        refreshPushPanel();
+      })
+      .catch(function(err) {
+        _state.push.status = 'idle';
+        _state.push.error = (err && err.message) || 'subscribe failed';
+        refreshPushPanel();
+        console.warn('[push] subscribe failed:', err);
+      });
+  }
+  function pushUnsubscribe() {
+    if (!pushSupported()) return Promise.resolve();
+    _state.push.status = 'unsubscribing'; refreshPushPanel();
+    return getExistingSubscription().then(function(sub) {
+      if (!sub) {
+        _state.push.subscribed = false; _state.push.endpoint = null;
+        _state.push.status = 'idle'; refreshPushPanel();
+        return;
+      }
+      var endpoint = sub.endpoint;
+      return sub.unsubscribe()
+        .then(function() {
+          return api('/api/launcher/push/unsubscribe', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ endpoint: endpoint }),
+          }).catch(function() { /* server-side cleanup is best-effort */ });
+        })
+        .then(function() {
+          _state.push.subscribed = false; _state.push.endpoint = null;
+          _state.push.status = 'idle'; refreshPushPanel();
+        });
+    });
+  }
+  function refreshPushPanel() {
+    var badge = document.getElementById('push-status');
+    var subBtn = document.getElementById('push-subscribe');
+    var unsubBtn = document.getElementById('push-unsubscribe');
+    var caps = document.getElementById('push-caps');
+    var p = _state.push;
+    if (badge) {
+      if (!p.supported) { badge.textContent = '不支持'; badge.className = 'perm-badge unsupported'; }
+      else if (p.status === 'subscribing') { badge.textContent = '订阅中…'; badge.className = 'perm-badge default'; }
+      else if (p.status === 'unsubscribing') { badge.textContent = '取消中…'; badge.className = 'perm-badge default'; }
+      else if (p.subscribed) { badge.textContent = '已订阅'; badge.className = 'perm-badge granted'; }
+      else { badge.textContent = '未启用'; badge.className = 'perm-badge default'; }
+    }
+    if (subBtn) subBtn.disabled = !p.supported || p.subscribed || p.status !== 'idle';
+    if (unsubBtn) unsubBtn.disabled = !p.supported || !p.subscribed || p.status !== 'idle';
+    if (caps) {
+      var msgs = [];
+      if (!p.supported) msgs.push('当前浏览器不支持 Web Push（iOS 必须 ≥ 16.4 且从主屏图标启动）');
+      if (p.error) msgs.push('最近错误: ' + p.error);
+      caps.textContent = msgs.join(' · ');
+      caps.hidden = !msgs.length;
+    }
+  }
+  function bindPushUI() {
+    var sub = document.getElementById('push-subscribe');
+    var unsub = document.getElementById('push-unsubscribe');
+    if (sub) sub.addEventListener('click', function() { pushSubscribe(); });
+    if (unsub) unsub.addEventListener('click', function() { pushUnsubscribe(); });
+  }
+  function wireSWMessages() {
+    if (!('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.addEventListener('message', function(ev) {
+      var d = ev && ev.data;
+      if (!d || typeof d !== 'object') return;
+      if (d.type === 'notification:navigate' && d.pid != null) {
+        try { setActive(+d.pid); } catch (e) { _state.activePid = +d.pid; }
+      }
+    });
   }
 
   function bindNotifUI() {
@@ -3184,7 +3366,18 @@ export const HTML_PAGE = `<!doctype html>
     loadNotifPrefs();
     getNotifChannel();
     bindNotifUI();
+    bindPushUI();
     refreshNotifIndicator();
+    // SW + push: don't block init on registration. Errors are non-fatal —
+    // the UI just stays in "未启用" / "不支持" until the user can act.
+    if (pushSupported()) {
+      registerSW().then(function() {
+        wireSWMessages();
+        pushReconcile();
+      }).catch(function(err) { console.warn('[push] sw register failed:', err && err.message); refreshPushPanel(); });
+    } else {
+      refreshPushPanel();
+    }
 
     // Wire static interactions
     document.getElementById('btn-new').addEventListener('click', openNew);

@@ -12,9 +12,16 @@ import { existsSync, statSync, readFileSync, writeFileSync, mkdirSync, copyFileS
 import { dirname, join, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
+const _HTTP_DIR = dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = join(_HTTP_DIR, 'public');
 
 import { log, jlog } from './log.mjs';
 import { HTML_PAGE } from './html-page.mjs';
+import { getPublicKeyB64u, preloadVapid } from './push/vapid.mjs';
+import { sendPush } from './push/send.mjs';
+import { addSubscription, removeByEndpoint, findByEndpoint, getAll as getAllSubs, getBySubject } from './push/subs.mjs';
 import {
   RUNTIME_DIR, instances, setSelfBinding, safeJson, pidAlive, renderTemplate, buildPublicUrl, buildLanUrl, loadRuntimeFile, rescanRuntime, BACKFILL_TTL_MS, PROBE_TIMEOUT_MS, probeCcv, listListeningNodePids, readPidCwd, readPidStartedMs, backfillExternalCcvs, LOCAL_CC_CACHE_TTL_MS, decodeProjectDirName, readJsonlCwd, readJsonlLastTimestamp, readPidLstart, listLocalCcSessions, spawnCcvInTerminal, killClaudePid, startWatcher, serializeSpawn, nextFreePort, findRunningByCwd, waitForChildRuntime, _pidWorktrees, WORKTREE_NAME_RE, BRANCH_NAME_RE, isInsideDir, gitInCwd, detectBaseRef, createWorktree, removeWorktree, worktreeForPid, MD_FILE_MAX_BYTES, MD_PREVIEW_BYTES, MD_BACKUP_KEEP, HOME_CLAUDE_DIR, safeRealpath, isAllowedMdPath, safeReadPreview, pushMdFile, scanClaudeMd, backupMdBeforeWrite, doSpawn, LAUNCHER_LOG_DIR, ccvLogPath,
 } from './runtime.mjs';
@@ -359,9 +366,14 @@ export function isLauncherPath(pathname) {
   return pathname === '/launcher' || pathname.startsWith('/launcher/') || pathname.startsWith('/api/launcher/') || pathname === '/healthz';
 }
 
-// Paths that don't require session auth (pair flow itself + healthz for monitors)
+// Paths that don't require session auth (pair flow itself + healthz for monitors).
+// SW + manifest + icon also need to be reachable BEFORE the user has paired —
+// iOS fetches them during PWA install, well before any cookie exists.
 function isPairPath(pathname) {
-  return pathname === '/launcher/pair' || pathname === '/launcher/pair/complete' || pathname.startsWith('/api/launcher/pair-') || pathname === '/healthz';
+  return pathname === '/launcher/pair' || pathname === '/launcher/pair/complete'
+    || pathname.startsWith('/api/launcher/pair-') || pathname === '/healthz'
+    || pathname === '/launcher/sw.js' || pathname === '/launcher/manifest.webmanifest'
+    || pathname === '/launcher/icon.svg';
 }
 
 export async function dispatchLauncherRoute(req, res, parsedUrl) {
@@ -521,6 +533,102 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
   if (url === '/launcher' && method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(HTML_PAGE);
+    return;
+  }
+
+  // PWA / Service Worker statics. Served from src/launcher/public/ (resolved
+  // via import.meta.url so deploy via symlinked plugins works without a copy
+  // step). sw.js needs Service-Worker-Allowed so the registration is allowed
+  // to claim the full `/launcher/` scope even though the script lives there.
+  if (url === '/launcher/sw.js' && method === 'GET') {
+    try {
+      const buf = readFileSync(join(PUBLIC_DIR, 'sw.js'));
+      res.writeHead(200, {
+        'Content-Type': 'application/javascript; charset=utf-8',
+        'Service-Worker-Allowed': '/launcher/',
+        'Cache-Control': 'no-cache',
+      });
+      res.end(buf);
+    } catch (err) { sendJson(res, 500, { error: 'sw.js read failed: ' + err.message }); }
+    return;
+  }
+  if (url === '/launcher/manifest.webmanifest' && method === 'GET') {
+    try {
+      const buf = readFileSync(join(PUBLIC_DIR, 'manifest.webmanifest'));
+      res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8', 'Cache-Control': 'no-cache' });
+      res.end(buf);
+    } catch (err) { sendJson(res, 500, { error: 'manifest read failed: ' + err.message }); }
+    return;
+  }
+  if (url === '/launcher/icon.svg' && method === 'GET') {
+    try {
+      const buf = readFileSync(join(PUBLIC_DIR, 'icon.svg'));
+      res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' });
+      res.end(buf);
+    } catch (err) { sendJson(res, 500, { error: 'icon read failed: ' + err.message }); }
+    return;
+  }
+
+  // ---- Web Push: VAPID + subscription management ----
+  // VAPID public key. Required before pushManager.subscribe.
+  if (url === '/api/launcher/push/vapid-public-key' && method === 'GET') {
+    try { sendJson(res, 200, { publicKey: getPublicKeyB64u() }); }
+    catch (err) { sendJson(res, 500, { error: 'vapid key unavailable: ' + err.message }); }
+    return;
+  }
+  // Client POSTs the PushSubscription it got from the browser. We store it
+  // keyed by subjectId so a later /push/test can target a single device.
+  // Welcome push is fire-and-forget — we don't block the 200 on APNs.
+  if (url === '/api/launcher/push/subscribe' && method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      const body = JSON.parse(raw || '{}');
+      const { endpoint, keys } = body || {};
+      if (!endpoint || !keys?.p256dh || !keys?.auth) { sendJson(res, 400, { error: 'endpoint + keys required' }); return; }
+      const subjectId = subjectIdFor(req);
+      const ua = req.headers['user-agent'] || '';
+      const entry = addSubscription(subjectId, { endpoint, keys }, { userAgent: ua });
+      sendJson(res, 200, { ok: true, addedAt: entry.addedAt });
+      // Welcome push: confirms the whole VAPID + encrypt + POST chain works.
+      // 不阻塞响应，错误打日志即可。
+      setImmediate(async () => {
+        try {
+          const r = await sendPush({ endpoint, keys }, {
+            title: 'ccv launcher',
+            body: '推送已开通',
+            data: { tag: 'ccv:welcome', kind: 'welcome' },
+          }, { urgency: 'normal' });
+          jlog('push-welcome', { status: r.statusCode, subjectId });
+          if (r.statusCode === 410 || r.statusCode === 404) removeByEndpoint(endpoint, `welcome-${r.statusCode}`);
+        } catch (err) {
+          log(`[push:send] welcome failed: ${err.message}`);
+        }
+      });
+    } catch (err) { sendJson(res, 500, { error: 'subscribe failed: ' + err.message }); }
+    return;
+  }
+  if (url === '/api/launcher/push/unsubscribe' && method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      const body = JSON.parse(raw || '{}');
+      const ep = body?.endpoint;
+      if (!ep) { sendJson(res, 400, { error: 'endpoint required' }); return; }
+      const removed = removeByEndpoint(ep, 'client-unsubscribe');
+      sendJson(res, 200, { ok: true, removed });
+    } catch (err) { sendJson(res, 500, { error: 'unsubscribe failed: ' + err.message }); }
+    return;
+  }
+  // Reconcile helper: client boots, finds it has a browser-side subscription
+  // but doesn't know if the server still has the matching row (e.g. after
+  // a launcher restart that lost push-subs.json). Returns {known: bool} so
+  // the client can re-POST /subscribe without re-prompting the user.
+  if (url.startsWith('/api/launcher/push/check') && method === 'GET') {
+    try {
+      const ep = parsedUrl.searchParams.get('endpoint') || '';
+      if (!ep) { sendJson(res, 400, { error: 'endpoint query param required' }); return; }
+      const entry = findByEndpoint(ep);
+      sendJson(res, 200, { known: !!entry, subjectMatches: entry ? entry.subjectId === subjectIdFor(req) : false });
+    } catch (err) { sendJson(res, 500, { error: 'check failed: ' + err.message }); }
     return;
   }
 
