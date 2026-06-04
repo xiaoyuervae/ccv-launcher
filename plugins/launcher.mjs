@@ -91,6 +91,7 @@ let _ptyManager = null;
 // installShellWebSocket because both wire into ctx.httpServer.
 import { isLauncherPath, dispatchLauncherRoute, wireEntryBindings } from '../src/launcher/http.mjs';
 import { startPoller, stopPoller } from '../src/launcher/push/poller.mjs';
+import { startReaper, stopReaper } from '../src/launcher/reaper.mjs';
 import { preloadVapid } from '../src/launcher/push/vapid.mjs';
 
 // Plug entry-owned refs (ccv workspace registry + WS shell server) into the
@@ -368,12 +369,18 @@ export default {
         // iOS PWA / Chrome / etc. Disabled via CCV_PUSH_POLL_MS=0 if needed.
         const pollMs = parseInt(process.env.CCV_PUSH_POLL_MS ?? '5000', 10);
         if (pollMs > 0) startPoller({ intervalMs: pollMs });
+        // Auto-reap hub-spawned ccv children idle beyond CCV_IDLE_REAP_HOURS
+        // (default 6h; set 0 to disable). Stops idle viewers from piling up and
+        // dragging the machine down — they're resumable, so this is safe.
+        const reapHours = parseFloat(process.env.CCV_IDLE_REAP_HOURS ?? '6');
+        if (reapHours > 0) startReaper({ idleReapMs: reapHours * 3600_000 });
       } catch (err) {
         log('serverStarted error:', err.message);
       }
     },
     serverStopping: async () => {
       try { stopPoller(); } catch {}
+      try { stopReaper(); } catch {}
     },
   },
 };
@@ -382,5 +389,5 @@ export default {
 // every termination path (kill -9 obviously not, but also SIGTERM races).
 // Stop the poller on signals too — it's idempotent.
 for (const sig of ['SIGINT', 'SIGTERM']) {
-  try { process.on(sig, () => { try { stopPoller(); } catch {} }); } catch {}
+  try { process.on(sig, () => { try { stopPoller(); } catch {} try { stopReaper(); } catch {} }); } catch {}
 }

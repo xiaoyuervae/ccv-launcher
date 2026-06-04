@@ -2337,6 +2337,11 @@ export const HTML_PAGE = `<!doctype html>
     var pid = inst.pid;
     var host = document.getElementById('host-logs');
     function tick() {
+      // Skip the round-trip entirely when the tab is backgrounded or the user
+      // navigated away from this instance's Logs tab. The .then guard below only
+      // drops the *response* — without this the request still fired every 3s per
+      // hidden browser tab.
+      if (document.hidden || _state.activePid !== pid || _state.termTab !== 'logs') return;
       api('/api/launcher/instances/' + pid + '/ccv-log?tail=200').then(function(data) {
         if (_state.activePid !== pid || _state.termTab !== 'logs') return;
         if (!host) return;
