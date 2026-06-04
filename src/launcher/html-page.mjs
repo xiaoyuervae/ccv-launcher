@@ -85,7 +85,7 @@ export const HTML_PAGE = `<!doctype html>
   }
   #app-bar .stat-quota .lbl { color: var(--mute); }
   #app-bar .stat-quota .val { color: var(--fg); font-weight: 600; font-family: var(--mono); }
-  #app-bar .stat-quota .bar { width: 48px; height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; }
+  #app-bar .stat-quota .bar { width: 84px; height: 5px; background: var(--line); border-radius: 3px; overflow: hidden; }
   #app-bar .stat-quota .fill { height: 100%; background: var(--ok); transition: width .25s; }
   #app-bar .stat-quota .fill.warn { background: var(--warn); }
   #app-bar .stat-quota .fill.bad { background: var(--bad); }
@@ -138,6 +138,27 @@ export const HTML_PAGE = `<!doctype html>
     border-bottom: 1px solid var(--bg2);
   }
   .tab.active.needs-ask { border-top-color: var(--ask); }
+  /* 注意力指引：等回答的会话整卡淡染 + dot 脉冲，扫一眼即可定位 */
+  .tab.needs-ask { background: rgba(248,81,73,.12); color: var(--fg); }
+  .tab.needs-ask .dot { animation: dot-pulse 1.4s ease-in-out infinite; }
+  .rail-card.needs-ask { background: rgba(248,81,73,.10); }
+  .rail-card.needs-ask .ask-pill { animation: dot-pulse 1.4s ease-in-out infinite; }
+  .tab.waiting-input { background: rgba(163,113,247,.10); }
+  .rail-card.waiting-input { background: rgba(163,113,247,.08); }
+  @keyframes dot-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(248,81,73,.55); } 50% { box-shadow: 0 0 0 4px rgba(248,81,73,0); } }
+  @media (prefers-reduced-motion: reduce) {
+    .tab.needs-ask .dot, .rail-card.needs-ask .ask-pill { animation: none; }
+  }
+  /* app-bar 等回答计数徽标 */
+  #ask-count {
+    background: var(--ask); color: #fff; border: none; font-weight: 700;
+    font-size: 11px; min-width: 0; padding: 3px 9px; border-radius: 999px;
+    animation: dot-pulse 1.4s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) { #ask-count { animation: none; } }
+  /* active 实例被 filter 筛掉时仍钉住显示，弱化以示"不在当前筛选结果内" */
+  .tab.filtered-pinned { opacity: .55; outline: 1px dashed var(--line); outline-offset: -2px; }
+  .rail-card.filtered-pinned { opacity: .6; }
   .tab .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--mute); }
   .tab .hub-tag {
     font-size: 9px; color: var(--accent); background: rgba(88,166,255,.14);
@@ -200,7 +221,19 @@ export const HTML_PAGE = `<!doctype html>
   #rail .rail-hd {
     color: var(--mute); font-size: 9px; text-transform: uppercase;
     letter-spacing: .5px; padding: 0 4px 4px;
+    display: flex; align-items: center; gap: 5px;
   }
+  .rail-ctl {
+    background: var(--bg3); color: var(--mute); border: 1px solid var(--line);
+    border-radius: 4px; font-size: 10px; padding: 1px 4px; cursor: pointer; text-transform: none;
+  }
+  .rail-ctl:hover { color: var(--fg); }
+  #rail-group.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .rail-group-hd {
+    color: var(--mute); font-size: 9px; text-transform: uppercase; letter-spacing: .5px;
+    padding: 8px 4px 3px; display: flex; align-items: center; gap: 6px;
+  }
+  .rail-group-hd .gc { background: var(--bg3); border-radius: 8px; padding: 0 6px; font-size: 9px; }
   .rail-card {
     background: var(--bg2);
     border: 1px solid var(--line);
@@ -950,6 +983,9 @@ export const HTML_PAGE = `<!doctype html>
       border-top: 1px solid var(--line);
       z-index: 40;
     }
+    /* lift toasts above the sticky mobile action bar (body-prefixed so this beats
+       the later base #toast-host rule, which has equal specificity + later source order) */
+    body #toast-host { bottom: calc(82px + env(safe-area-inset-bottom, 0)); }
     #mobile-bar .primary {
       flex: 1.4; background: var(--accent); color: var(--bg); border: 0;
       padding: 12px 14px; border-radius: 10px;
@@ -1001,6 +1037,119 @@ export const HTML_PAGE = `<!doctype html>
   dialog#notif-dlg button:hover { background: var(--bg); }
   dialog#notif-dlg .hint { color: var(--mute); font-size: 11px; margin: 8px 0 0; }
   dialog#notif-dlg .actions { margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end; }
+
+  /* ---- toast ---- */
+  #toast-host {
+    position: fixed; right: 14px; bottom: 14px; z-index: 9000;
+    display: flex; flex-direction: column; gap: 8px; align-items: flex-end;
+    pointer-events: none;
+    padding-bottom: env(safe-area-inset-bottom, 0);
+  }
+  .toast {
+    pointer-events: auto; min-width: 180px; max-width: 360px;
+    background: var(--bg2); color: var(--fg);
+    border: 1px solid var(--line); border-left: 3px solid var(--mute);
+    border-radius: 7px; padding: 9px 12px; font-size: 12.5px; line-height: 1.4;
+    box-shadow: 0 6px 24px rgba(0,0,0,.4);
+    display: flex; align-items: flex-start; gap: 8px;
+    animation: toast-in .16s ease;
+  }
+  .toast.ok   { border-left-color: var(--ok); }
+  .toast.warn { border-left-color: var(--warn); }
+  .toast.bad  { border-left-color: var(--bad); }
+  .toast .ic { font-weight: 700; }
+  .toast.ok .ic { color: var(--ok); }
+  .toast.warn .ic { color: var(--warn); }
+  .toast.bad .ic { color: var(--bad); }
+  .toast .msg { flex: 1; word-break: break-word; }
+  .toast .n { color: var(--mute); font-family: var(--mono); font-size: 11px; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .toast.leaving { opacity: 0; transform: translateY(6px); transition: opacity .18s, transform .18s; }
+
+  /* ---- confirm dialog ---- */
+  dialog#confirm-dlg {
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--bg2); color: var(--fg); padding: 0; max-width: 420px; width: calc(100vw - 32px);
+  }
+  dialog#confirm-dlg::backdrop { background: rgba(0,0,0,.5); }
+  dialog#confirm-dlg .body { padding: 18px 18px 0; }
+  dialog#confirm-dlg h3 { margin: 0 0 8px; font-size: 14px; }
+  dialog#confirm-dlg .txt { font-size: 12.5px; color: var(--mute); line-height: 1.5; white-space: pre-wrap; }
+  dialog#confirm-dlg .actions { display: flex; gap: 8px; justify-content: flex-end; padding: 16px 18px 18px; }
+  dialog#confirm-dlg button {
+    background: var(--bg3); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 14px; font-size: 12.5px; cursor: pointer;
+  }
+  dialog#confirm-dlg button:hover { background: var(--bg); }
+  dialog#confirm-dlg button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
+  dialog#confirm-dlg button.danger  { background: var(--bad); color: #fff; border-color: var(--bad); font-weight: 600; }
+
+  /* ---- help overlay ---- */
+  #help-overlay {
+    position: fixed; inset: 0; z-index: 8500; display: none;
+    align-items: center; justify-content: center; background: rgba(0,0,0,.55);
+  }
+  #help-overlay.open { display: flex; }
+  #help-overlay .panel {
+    background: var(--bg2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px 20px; max-width: 440px; width: calc(100vw - 32px);
+    max-height: 80vh; overflow: auto;
+  }
+  #help-overlay h3 { margin: 0 0 12px; font-size: 14px; }
+  #help-overlay .krow { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 12.5px; }
+  #help-overlay .krow kbd {
+    font-family: var(--mono); background: var(--bg3); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 7px; font-size: 11px; min-width: 22px; text-align: center;
+  }
+  #help-overlay .krow .desc { color: var(--mute); }
+
+  /* ---- command palette ---- */
+  #cmd-palette {
+    position: fixed; inset: 0; z-index: 8800; display: none;
+    align-items: flex-start; justify-content: center; background: rgba(0,0,0,.5);
+    padding-top: 12vh;
+  }
+  #cmd-palette.open { display: flex; }
+  #cmd-palette .box {
+    width: 560px; max-width: calc(100vw - 24px); max-height: 64vh;
+    background: var(--bg2); border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 16px 48px rgba(0,0,0,.5); display: flex; flex-direction: column; overflow: hidden;
+  }
+  #cmd-palette input {
+    background: var(--bg); color: var(--fg); border: none; border-bottom: 1px solid var(--line);
+    padding: 12px 14px; font-size: 14px; outline: none;
+  }
+  #cmd-palette .results { overflow: auto; padding: 6px; }
+  #cmd-palette .pi {
+    display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+    border-radius: 6px; cursor: pointer; font-size: 13px;
+  }
+  #cmd-palette .pi.sel { background: var(--bg3); }
+  #cmd-palette .pi .pi-label { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #cmd-palette .pi .pi-sub { color: var(--mute); font-size: 11px; font-family: var(--mono); }
+  #cmd-palette .pi-empty { padding: 14px; color: var(--mute); font-size: 12.5px; text-align: center; }
+
+  /* ---- ops panel ---- */
+  dialog#ops-dlg {
+    border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); color: var(--fg);
+    padding: 0; width: calc(100vw - 32px);
+  }
+  dialog#ops-dlg::backdrop { background: rgba(0,0,0,.5); }
+  dialog#ops-dlg h3 { margin: 0 0 12px; font-size: 14px; }
+  dialog#ops-dlg .ops-sec { margin: 0 0 14px; }
+  dialog#ops-dlg .ops-sec .hd { font-size: 11px; color: var(--mute); text-transform: uppercase; letter-spacing: .04em; margin: 0 0 6px; }
+  dialog#ops-dlg .ops-row { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; padding: 3px 0; }
+  dialog#ops-dlg .ops-row .v { font-family: var(--mono); color: var(--fg); }
+  dialog#ops-dlg .ops-row .v.ok { color: var(--ok); }
+  dialog#ops-dlg .ops-row .v.warn { color: var(--warn); }
+  dialog#ops-dlg .ops-row .v.bad { color: var(--bad); }
+  dialog#ops-dlg .ops-mini { font-size: 11px; color: var(--mute); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  dialog#ops-dlg button {
+    background: var(--bg3); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 14px; font-size: 12.5px; cursor: pointer;
+  }
+  dialog#ops-dlg button:hover { background: var(--bg); }
+  dialog#ops-dlg button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -1020,6 +1169,7 @@ export const HTML_PAGE = `<!doctype html>
     <div class="bar"><div class="fill" id="quota-fill" style="width:0"></div></div>
   </div>
   <input type="text" id="filter" placeholder="filter  /" spellcheck="false" autocomplete="off">
+  <button id="ask-count" class="icon-btn" type="button" hidden title="跳到下一个等回答的会话 (J)" aria-label="等回答会话数"></button>
   <button id="btn-notif" class="icon-btn" type="button" title="通知设置" aria-label="通知设置">🔔</button>
   <button id="btn-new">+ New</button>
 </header>
@@ -1051,7 +1201,7 @@ export const HTML_PAGE = `<!doctype html>
       <div id="term-body">
         <div class="term-pane active" data-tab="console"><div class="term-xterm-host" id="host-console"></div></div>
         <div class="term-pane" data-tab="shell"><div class="term-xterm-host" id="host-shell"></div></div>
-        <div class="term-pane" data-tab="logs"><div class="term-logs-host" id="host-logs"><div class="empty">no logs yet</div></div></div>
+        <div class="term-pane" data-tab="logs"><div class="term-logs-host" id="host-logs"><div class="empty">ccv 启动后日志会在这里流式显示</div></div></div>
       </div>
     </div>
   </section>
@@ -1138,6 +1288,49 @@ export const HTML_PAGE = `<!doctype html>
   </div>
 </dialog>
 
+<div id="toast-host" role="status" aria-live="polite"></div>
+
+<dialog id="confirm-dlg" aria-modal="true">
+  <div class="body">
+    <h3 id="confirm-title">确认</h3>
+    <div class="txt" id="confirm-text"></div>
+  </div>
+  <div class="actions">
+    <button type="button" id="confirm-cancel">取消</button>
+    <button type="button" id="confirm-ok" class="primary">确定</button>
+  </div>
+</dialog>
+
+<div id="cmd-palette" role="dialog" aria-modal="true" aria-label="命令面板">
+  <div class="box">
+    <input type="text" id="cmd-input" placeholder="跳转会话或执行操作…" spellcheck="false" autocomplete="off" role="combobox" aria-expanded="true" aria-controls="cmd-results">
+    <div class="results" id="cmd-results" role="listbox"></div>
+  </div>
+</div>
+
+<dialog id="ops-dlg" aria-label="运维面板">
+  <div class="body" id="ops-body" style="padding:18px 18px 0;min-width:340px;max-width:480px"></div>
+  <div class="actions" style="display:flex;gap:8px;justify-content:flex-end;padding:16px 18px 18px">
+    <button type="button" id="ops-refresh">刷新</button>
+    <button type="button" id="ops-close" class="primary">关闭</button>
+  </div>
+</dialog>
+
+<div id="help-overlay" role="dialog" aria-modal="true" aria-label="键盘快捷键">
+  <div class="panel">
+    <h3>键盘快捷键</h3>
+    <div class="krow"><kbd>/</kbd><span class="desc">聚焦筛选框</span></div>
+    <div class="krow"><kbd>1</kbd>–<kbd>9</kbd><span class="desc">切换到第 N 个会话</span></div>
+    <div class="krow"><kbd>j</kbd><span class="desc">跳到下一个等回答的会话</span></div>
+    <div class="krow"><kbd>c</kbd><span class="desc">新建会话</span></div>
+    <div class="krow"><kbd>w</kbd><span class="desc">关闭当前会话</span></div>
+    <div class="krow"><kbd>r</kbd><span class="desc">重命名当前会话（别名）</span></div>
+    <div class="krow"><kbd>⌘/Ctrl</kbd>+<kbd>k</kbd><span class="desc">命令面板</span></div>
+    <div class="krow"><kbd>?</kbd><span class="desc">显示/隐藏本帮助</span></div>
+    <div class="krow"><kbd>Esc</kbd><span class="desc">关闭浮层 / 面板</span></div>
+  </div>
+</div>
+
 <script>
 (function() {
   'use strict';
@@ -1166,6 +1359,77 @@ export const HTML_PAGE = `<!doctype html>
   function escape(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
       return ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c];
+    });
+  }
+
+  // ---------- toast ----------
+  // 非阻塞反馈，替代原生 alert。相同 (msg,kind) 在 600ms 内合并计数，防抖动刷屏。
+  var _toastSeen = {}; // key -> { node, countEl, n, timer }
+  var TOAST_ICON = { ok: '✓', warn: '!', bad: '✕' };
+  function toast(msg, kind) {
+    kind = kind || 'ok';
+    var host = document.getElementById('toast-host');
+    if (!host) return;
+    var key = kind + '|' + msg;
+    var prev = _toastSeen[key];
+    if (prev) {
+      prev.n++;
+      prev.countEl.textContent = '×' + prev.n;
+      prev.countEl.style.display = '';
+      clearTimeout(prev.timer);
+      prev.timer = setTimeout(function() { _dismissToast(key); }, 3000);
+      return;
+    }
+    var node = document.createElement('div');
+    node.className = 'toast ' + kind;
+    node.setAttribute('role', kind === 'bad' ? 'alert' : 'status');
+    node.innerHTML = '<span class="ic">' + (TOAST_ICON[kind] || '') + '</span><span class="msg"></span><span class="n" style="display:none"></span>';
+    node.querySelector('.msg').textContent = msg;
+    host.appendChild(node);
+    var rec = { node: node, countEl: node.querySelector('.n'), n: 1, timer: null };
+    rec.timer = setTimeout(function() { _dismissToast(key); }, 3000);
+    _toastSeen[key] = rec;
+  }
+  function _dismissToast(key) {
+    var rec = _toastSeen[key];
+    if (!rec) return;
+    delete _toastSeen[key];
+    rec.node.classList.add('leaving');
+    setTimeout(function() { if (rec.node.parentNode) rec.node.parentNode.removeChild(rec.node); }, 200);
+  }
+
+  // ---------- confirm dialog ----------
+  // 受控确认弹窗，替代原生 confirm。返回 Promise<bool>；Esc/取消=false，确定=true。
+  // 焦点陷阱由 <dialog> 原生提供；关闭后焦点回到触发元素。
+  function confirmDialog(opts) {
+    opts = opts || {};
+    var dlg = document.getElementById('confirm-dlg');
+    if (!dlg || !dlg.showModal) return Promise.resolve(window.confirm((opts.title || '') + '\\n' + (opts.body || '')));
+    var trigger = document.activeElement;
+    document.getElementById('confirm-title').textContent = opts.title || '确认';
+    document.getElementById('confirm-text').textContent = opts.body || '';
+    var okBtn = document.getElementById('confirm-ok');
+    okBtn.textContent = opts.okLabel || '确定';
+    okBtn.className = opts.danger ? 'danger' : 'primary';
+    return new Promise(function(resolve) {
+      var done = function(val) {
+        okBtn.removeEventListener('click', onOk);
+        document.getElementById('confirm-cancel').removeEventListener('click', onCancel);
+        dlg.removeEventListener('cancel', onCancel);
+        dlg.removeEventListener('close', onClose);
+        try { dlg.close(); } catch (e) {}
+        if (trigger && trigger.focus) { try { trigger.focus(); } catch (e) {} }
+        resolve(val);
+      };
+      var onOk = function() { done(true); };
+      var onCancel = function(e) { if (e) e.preventDefault(); done(false); };
+      var onClose = function() { done(false); };
+      okBtn.addEventListener('click', onOk);
+      document.getElementById('confirm-cancel').addEventListener('click', onCancel);
+      dlg.addEventListener('cancel', onCancel); // Esc
+      dlg.addEventListener('close', onClose);
+      dlg.showModal();
+      okBtn.focus();
     });
   }
   function fmtAge(iso) {
@@ -1215,6 +1479,53 @@ export const HTML_PAGE = `<!doctype html>
   };
   function statusView(s) { return STATUS_VIEW[s] || STATUS_VIEW.idle; }
 
+  // ---------- keyed DOM reconcile ----------
+  // 按 data-key 复用现有子节点，只在签名变化时改 class/innerHTML/属性，
+  // 不命中则新建、多余则删除、按序复位。配合事件委托（监听器挂在容器上、
+  // 永不解绑），消除"每次轮询整块 innerHTML 重建 + 重新 addEventListener"
+  // 带来的闪烁与滚动跳动。opts: {tag?, keyOf, classOf, innerOf, attrsOf?, sigOf?}
+  function _setAttrs(node, attrs) {
+    if (!attrs) return;
+    for (var k in attrs) { if (attrs[k] == null) node.removeAttribute(k); else node.setAttribute(k, attrs[k]); }
+  }
+  function reconcileRows(container, items, opts) {
+    // 只管理元素子节点：先清掉初始 "loading…" 之类的文本/注释节点
+    [].slice.call(container.childNodes).forEach(function(n) { if (n.nodeType !== 1) container.removeChild(n); });
+    var byKey = {};
+    [].slice.call(container.children).forEach(function(node) {
+      var k = node.getAttribute('data-key');
+      if (k != null) byKey[k] = node; else container.removeChild(node);
+    });
+    var used = {};
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var key = String(opts.keyOf(item));
+      used[key] = true;
+      var sig = opts.sigOf ? String(opts.sigOf(item)) : null;
+      var node = byKey[key];
+      if (!node) {
+        node = document.createElement(opts.tag || 'div');
+        node.setAttribute('data-key', key);
+        byKey[key] = node;
+        node.className = opts.classOf(item);
+        node.innerHTML = opts.innerOf(item);
+        _setAttrs(node, opts.attrsOf ? opts.attrsOf(item) : null);
+        if (sig != null) node.setAttribute('data-sig', sig);
+      } else if (sig == null || node.getAttribute('data-sig') !== sig) {
+        node.className = opts.classOf(item);
+        node.innerHTML = opts.innerOf(item);
+        _setAttrs(node, opts.attrsOf ? opts.attrsOf(item) : null);
+        if (sig != null) node.setAttribute('data-sig', sig);
+      }
+      var ref = container.children[i];
+      if (ref !== node) container.insertBefore(node, ref || null);
+    }
+    [].slice.call(container.children).forEach(function(node) {
+      var k = node.getAttribute('data-key');
+      if (k == null || !used[k]) container.removeChild(node);
+    });
+  }
+
   // ---------- module state ----------
   var _state = {
     activePid: null,
@@ -1246,6 +1557,8 @@ export const HTML_PAGE = `<!doctype html>
     notifSkipNextDetect: false,
     audioCtx: null,
     push: { supported: false, subscribed: false, endpoint: null, status: 'idle', error: '' },
+    sortMode: 'activity',   // activity | name | cost | status
+    groupByProject: false,
   };
   try {
     var p = JSON.parse(localStorage.getItem('ccvMcState') || '{}');
@@ -1259,6 +1572,8 @@ export const HTML_PAGE = `<!doctype html>
         _state.railOpen.untracked = !!p.railOpen.untracked;
         _state.railOpen.shellHist = !!p.railOpen.shellHist;
       }
+      if (p.sortMode && /^(activity|name|cost|status)$/.test(p.sortMode)) _state.sortMode = p.sortMode;
+      if (typeof p.groupByProject === 'boolean') _state.groupByProject = p.groupByProject;
     }
   } catch (e) {}
   function persistState() {
@@ -1269,6 +1584,8 @@ export const HTML_PAGE = `<!doctype html>
         termOpen: _state.termOpen,
         termHeight: _state.termHeight,
         railOpen: _state.railOpen,
+        sortMode: _state.sortMode,
+        groupByProject: _state.groupByProject,
       }));
     } catch (e) {}
   }
@@ -1383,38 +1700,67 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   // ---------- render: tab strip ----------
+  // 点击通过 #tab-strip 上的委托监听（见 wireDelegation）分发，这里只做键控渲染。
+  function tabName(it) { return it.alias || it.displayName || it.projectName || (it.cwd ? it.cwd.split('/').pop() : '?'); }
   function renderTabStrip() {
     var strip = document.getElementById('tab-strip');
     if (!strip) return;
-    var inst = filteredInstances();
+    var inst = filteredInstancesWithActivePinned();
     if (!inst.length) {
-      strip.innerHTML = '<div class="empty" style="padding:8px 12px;font-size:11px">no instances</div>';
+      strip.innerHTML = '<div class="empty" style="padding:8px 12px;font-size:11px">还没有实例 · 按 <kbd>c</kbd> 或点 + New 启动</div>';
       return;
     }
-    var html = '';
-    for (var i = 0; i < inst.length; i++) {
-      var it = inst[i];
-      var act = _state.activityByPid[it.pid] || {};
-      var view = statusView(act.status || 'idle');
-      var asks = extractAsks(act);
-      var needsAsk = asks.length > 0 && !_state.answered[it.pid];
-      var active = it.pid === _state.activePid;
-      var name = it.alias || it.displayName || it.projectName || (it.cwd ? it.cwd.split('/').pop() : '?');
-      html += '<div class="tab' + (active ? ' active' : '') + (needsAsk && active ? ' needs-ask' : '') + '" data-pid="' + it.pid + '">';
-      html += '<span class="dot" style="background:' + view.dot + '"></span>';
-      if (it.isHub) html += '<span class="hub-tag">HUB</span>';
-      html += '<span class="name">' + escape(name) + '</span>';
-      if (it.port) html += '<span class="port">:' + it.port + '</span>';
-      if (needsAsk) html += '<span class="ask-badge">!</span>';
-      html += '</div>';
-    }
-    strip.innerHTML = html;
-    [].forEach.call(strip.querySelectorAll('.tab'), function(el) {
-      el.addEventListener('click', function() {
-        var pid = +el.getAttribute('data-pid');
-        setActive(pid);
-      });
+    reconcileRows(strip, inst, {
+      keyOf: function(it) { return it.pid; },
+      attrsOf: function(it) { return { 'data-pid': it.pid }; },
+      classOf: function(it) {
+        var act = _state.activityByPid[it.pid] || {};
+        var active = it.pid === _state.activePid;
+        var needsAsk = extractAsks(act).length > 0 && !_state.answered[it.pid];
+        var pinned = active && _state._activeFilteredOut;
+        var wi = act.status === 'waiting_input';
+        return 'tab' + (active ? ' active' : '') + (needsAsk ? ' needs-ask' : '') + (wi ? ' waiting-input' : '') + (pinned ? ' filtered-pinned' : '');
+      },
+      sigOf: function(it) {
+        var act = _state.activityByPid[it.pid] || {};
+        var view = statusView(act.status || 'idle');
+        var active = it.pid === _state.activePid;
+        var needsAsk = extractAsks(act).length > 0 && !_state.answered[it.pid];
+        var pinned = active && _state._activeFilteredOut;
+        return [act.status || 'idle', view.dot, active ? 1 : 0, needsAsk ? 1 : 0, tabName(it), it.port || '', it.isHub ? 1 : 0, pinned ? 1 : 0].join('|');
+      },
+      innerOf: function(it) {
+        var act = _state.activityByPid[it.pid] || {};
+        var view = statusView(act.status || 'idle');
+        var needsAsk = extractAsks(act).length > 0 && !_state.answered[it.pid];
+        var h = '<span class="dot" style="background:' + view.dot + '"></span>';
+        if (it.isHub) h += '<span class="hub-tag">HUB</span>';
+        h += '<span class="name">' + escape(tabName(it)) + '</span>';
+        if (it.port) h += '<span class="port">:' + it.port + '</span>';
+        if (needsAsk) h += '<span class="ask-badge">!</span>';
+        return h;
+      },
     });
+  }
+
+  // app-bar 等回答计数徽标 + 标题前缀，让后台标签页也能一眼看出有几个在等。
+  function paintAskCount(n) {
+    var btn = document.getElementById('ask-count');
+    if (btn) {
+      if (n > 0) { btn.hidden = false; btn.textContent = '⏳ ' + n; }
+      else { btn.hidden = true; btn.textContent = ''; }
+    }
+    document.title = n > 0 ? '(' + n + ') ccv launcher' : 'ccv launcher';
+  }
+  // 跳到下一个等回答的会话（badge 点击 + J 键共用）。
+  function jumpNextAsk() {
+    var asks = _state.instances.filter(function(x) {
+      var a = _state.activityByPid[x.pid];
+      return a && a.status === 'waiting_ask' && !_state.answered[x.pid];
+    });
+    if (!asks.length) return;
+    var idx = asks.findIndex(function(x) { return x.pid === _state.activePid; });
+    setActive(asks[(idx + 1) % asks.length].pid);
   }
 
   // ---------- render: ask alert ----------
@@ -1431,6 +1777,7 @@ export const HTML_PAGE = `<!doctype html>
       if (!list.length) continue;
       asks.push({ inst: it, ask: list[0], all: list });
     }
+    paintAskCount(asks.length);
     if (!asks.length) { el.hidden = true; el.innerHTML = ''; return; }
     el.hidden = false;
     var html = '<span class="alert-tag">' + asks.length + ' 等回答</span>';
@@ -1454,33 +1801,122 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   // ---------- render: rail ----------
-  function renderRail() {
+  // rail 拆成两块：#rail-sessions（live 会话卡，3s 轮询键控更新）与
+  // #rail-extras（历史/shell 历史/未托管，仅 refreshList/折叠/别名变更时刷新）。
+  // 解耦后高频轮询不再重建静态区块，滚动位置不丢。点击统一走 #rail 委托。
+  function ensureRailContainers() {
     var el = document.getElementById('rail');
-    if (!el) return;
-    var inst = filteredInstances();
-    var html = '';
+    if (!el) return null;
+    var s = document.getElementById('rail-sessions');
+    var x = document.getElementById('rail-extras');
+    if (!s || !x) {
+      el.innerHTML = '<div id="rail-sessions"></div><div id="rail-extras"></div>';
+      s = document.getElementById('rail-sessions');
+      x = document.getElementById('rail-extras');
+    }
+    return { sessions: s, extras: x };
+  }
+
+  function renderRail() { renderRailSessions(); renderRailExtras(); }
+
+  function railSub(it, act) {
+    return act.title || (act.preview ? act.preview.replace(/^user:\s*/, '') : '') || (it.cwd || '').split('/').slice(-2).join('/');
+  }
+  // 会话区头部（标签 + 排序下拉 + 分组开关）只建一次并就地复用，避免高频轮询
+  // 重建控件、丢焦点。控件自身 stopPropagation，不触发 #rail 委托。
+  function buildRailSessionsHost(host) {
+    host.innerHTML =
+      '<div class="rail-hd">' +
+        '<span class="rail-hd-label"></span>' +
+        '<span style="flex:1"></span>' +
+        '<select id="rail-sort" class="rail-ctl" title="排序">' +
+          '<option value="activity">活动</option><option value="name">名称</option>' +
+          '<option value="cost">成本</option><option value="status">状态</option>' +
+        '</select>' +
+        '<button id="rail-group" class="rail-ctl" type="button" title="按项目分组">⊞</button>' +
+      '</div>' +
+      '<div id="rail-cards"></div>';
+    var sel = host.querySelector('#rail-sort');
+    sel.value = _state.sortMode;
+    sel.addEventListener('click', function(e) { e.stopPropagation(); });
+    sel.addEventListener('change', function() { _state.sortMode = sel.value; persistState(); renderRailSessions(); });
+    var gb = host.querySelector('#rail-group');
+    gb.classList.toggle('on', _state.groupByProject);
+    gb.addEventListener('click', function(e) {
+      e.stopPropagation();
+      _state.groupByProject = !_state.groupByProject;
+      gb.classList.toggle('on', _state.groupByProject);
+      persistState(); renderRailSessions();
+    });
+  }
+  function renderRailSessions() {
+    var c = ensureRailContainers();
+    if (!c) return;
+    var host = c.sessions;
+    var cards = host.querySelector('#rail-cards');
+    if (!cards) { buildRailSessionsHost(host); cards = host.querySelector('#rail-cards'); }
+    var hd = host.querySelector('.rail-hd');
+    var label = host.querySelector('.rail-hd-label');
+    var inst = filteredInstancesWithActivePinned();
     if (!inst.length) {
-      html += '<div class="empty" style="padding:10px 4px;font-size:11px">no sessions</div>';
-    } else {
-      html += '<div class="rail-hd">会话 · ' + inst.length + '</div>';
-      for (var i = 0; i < inst.length; i++) {
-        var it = inst[i];
+      hd.style.display = 'none';
+      cards.innerHTML = '<div class="empty" style="padding:10px 4px;font-size:11px">还没有会话 · 按 <kbd>c</kbd> 新建</div>';
+      return;
+    }
+    hd.style.display = '';
+    label.textContent = '会话 · ' + inst.length;
+    var ph = cards.querySelector('.empty'); if (ph) ph.remove();
+    // 分组时把项目头作为 keyed 行（key=g:<name>）交错插入会话卡之间。
+    var items = inst;
+    if (_state.groupByProject) {
+      var byKey = {}, order = [];
+      inst.forEach(function(it) { var k = groupKeyOf(it); if (!byKey[k]) { byKey[k] = []; order.push(k); } byKey[k].push(it); });
+      items = [];
+      order.forEach(function(k) { items.push({ __group: k, count: byKey[k].length }); byKey[k].forEach(function(it) { items.push(it); }); });
+    }
+    reconcileRows(cards, items, {
+      keyOf: function(it) { return it.__group ? ('g:' + it.__group) : it.pid; },
+      attrsOf: function(it) {
+        if (it.__group) return { 'data-pid': null, 'style': null };
+        var view = statusView((_state.activityByPid[it.pid] || {}).status || 'idle');
+        return { 'data-pid': it.pid, 'style': 'border-left-color:' + view.dot };
+      },
+      classOf: function(it) {
+        if (it.__group) return 'rail-group-hd';
+        var act = _state.activityByPid[it.pid] || {};
+        var active = it.pid === _state.activePid;
+        var needsAsk = act.status === 'waiting_ask' && !_state.answered[it.pid];
+        var pinned = active && _state._activeFilteredOut;
+        var wi = act.status === 'waiting_input';
+        return 'rail-card' + (active ? ' active' : '') + (needsAsk ? ' needs-ask' : '') + (wi ? ' waiting-input' : '') + (pinned ? ' filtered-pinned' : '');
+      },
+      sigOf: function(it) {
+        if (it.__group) return 'g|' + it.__group + '|' + it.count;
         var act = _state.activityByPid[it.pid] || {};
         var view = statusView(act.status || 'idle');
         var active = it.pid === _state.activePid;
         var needsAsk = act.status === 'waiting_ask' && !_state.answered[it.pid];
-        var name = it.alias || it.displayName || it.projectName || (it.cwd ? it.cwd.split('/').pop() : '?');
-        var sub = act.title || (act.preview ? act.preview.replace(/^user:\s*/, '') : '') || (it.cwd || '').split('/').slice(-2).join('/');
-        html += '<div class="rail-card' + (active ? ' active' : '') + '" style="border-left-color:' + view.dot + '" data-pid="' + it.pid + '">';
-        html += '<div class="top">';
-        html += '<span class="name">' + escape(name) + '</span>';
-        if (needsAsk) html += '<span class="ask-pill">!</span>';
-        html += '<span class="age">' + escape(fmtAge(act.lastEventAt)) + '</span>';
-        html += '</div>';
-        html += '<div class="sub">' + escape(sub || '—') + '</div>';
-        html += '</div>';
-      }
-    }
+        var pinned = active && _state._activeFilteredOut;
+        return [act.status || 'idle', view.dot, active ? 1 : 0, needsAsk ? 1 : 0, tabName(it), railSub(it, act), fmtAge(act.lastEventAt), pinned ? 1 : 0].join('|');
+      },
+      innerOf: function(it) {
+        if (it.__group) return '<span>' + escape(it.__group) + '</span><span class="gc">' + it.count + '</span>';
+        var act = _state.activityByPid[it.pid] || {};
+        var needsAsk = act.status === 'waiting_ask' && !_state.answered[it.pid];
+        var h = '<div class="top"><span class="name">' + escape(tabName(it)) + '</span>';
+        if (needsAsk) h += '<span class="ask-pill">!</span>';
+        h += '<span class="age">' + escape(fmtAge(act.lastEventAt)) + '</span></div>';
+        h += '<div class="sub">' + escape(railSub(it, act) || '—') + '</div>';
+        return h;
+      },
+    });
+  }
+
+  function renderRailExtras() {
+    var c = ensureRailContainers();
+    if (!c) return;
+    var el = c.extras;
+    var html = '';
 
     // ---- 历史项目 (idle workspaces) ----
     var hist = filteredHistory();
@@ -1567,52 +2003,8 @@ export const HTML_PAGE = `<!doctype html>
       html += '</div></div>';
     }
 
-    if (!html) html = '<div class="empty" style="padding:10px 4px;font-size:11px">no sessions</div>';
+    // extras 没有内容时留空即可（"no sessions" 由 #rail-sessions 负责）。
     el.innerHTML = html;
-
-    [].forEach.call(el.querySelectorAll('.rail-card'), function(card) {
-      card.addEventListener('click', function() { setActive(+card.getAttribute('data-pid')); });
-    });
-    [].forEach.call(el.querySelectorAll('.rail-section .sec-hd'), function(hd) {
-      hd.addEventListener('click', function() {
-        var sec = hd.parentNode.getAttribute('data-sec');
-        _state.railOpen[sec] = !_state.railOpen[sec];
-        persistState();
-        renderRail();
-      });
-    });
-    [].forEach.call(el.querySelectorAll('.rail-hist-card'), function(card) {
-      card.addEventListener('click', function(ev) {
-        // "+" 按钮显式新启动，跳过展开逻辑
-        if (ev.target && ev.target.classList.contains('spawn-fresh')) {
-          ev.stopPropagation();
-          var fcwd = ev.target.getAttribute('data-cwd');
-          if (fcwd) openNew(fcwd);
-          return;
-        }
-        var cwd = card.getAttribute('data-cwd');
-        if (!cwd) return;
-        // The same .rail-hist-card class is used by both 历史项目 and shell 历史
-        // sections; look in both state lists when computing sessionCount.
-        var hItem = (_state.history || []).find(function(x) { return x.cwd === cwd; })
-                 || (_state.shellHistory || []).find(function(x) { return x.cwd === cwd; });
-        var hasSessions = hItem && +hItem.sessionCount > 0;
-        if (!hasSessions) { openNew(cwd); return; }
-        toggleHistExpand(cwd);
-      });
-    });
-    [].forEach.call(el.querySelectorAll('.rail-sess-card'), function(card) {
-      card.addEventListener('click', function() {
-        var cwd = card.getAttribute('data-cwd');
-        var sid = card.getAttribute('data-sid');
-        if (cwd && sid) resumeSession(cwd, sid);
-      });
-    });
-    [].forEach.call(el.querySelectorAll('.rail-untracked-card'), function(card) {
-      card.addEventListener('click', function() {
-        takeoverLocal(+card.getAttribute('data-pid'), card.getAttribute('data-sid'), card.getAttribute('data-cwd'));
-      });
-    });
   }
 
   // 渲染单个 history 卡片展开后的会话子列表。状态：loading / empty / list。
@@ -1644,7 +2036,7 @@ export const HTML_PAGE = `<!doctype html>
   function toggleHistExpand(cwd) {
     if (_state.histOpen[cwd]) {
       delete _state.histOpen[cwd];
-      renderRail();
+      renderRailExtras();
       return;
     }
     _state.histOpen[cwd] = true;
@@ -1652,7 +2044,7 @@ export const HTML_PAGE = `<!doctype html>
     if (!cur || (!cur.loading && (Date.now() - (cur.fetchedAt || 0) > 30000))) {
       fetchSessionsForCwd(cwd);
     }
-    renderRail();
+    renderRailExtras();
   }
 
   function fetchSessionsForCwd(cwd) {
@@ -1663,10 +2055,10 @@ export const HTML_PAGE = `<!doctype html>
         fetchedAt: Date.now(),
       };
       // 只重渲展开中的卡片，避免抖动其他东西
-      if (_state.histOpen[cwd]) renderRail();
+      if (_state.histOpen[cwd]) renderRailExtras();
     }).catch(function(err) {
       _state.sessionsByCwd[cwd] = { items: [], fetchedAt: Date.now(), error: err.message };
-      if (_state.histOpen[cwd]) renderRail();
+      if (_state.histOpen[cwd]) renderRailExtras();
     });
   }
 
@@ -1680,8 +2072,9 @@ export const HTML_PAGE = `<!doctype html>
       if (res && res.instance && res.instance.pid) _state.activePid = res.instance.pid;
       else if (res && res.pid) _state.activePid = res.pid;
       refreshList();
+      toast('已恢复会话', 'ok');
     }).catch(function(err) {
-      alert('resume 失败: ' + (err && err.message || err));
+      toast('resume 失败: ' + (err && err.message || err), 'bad');
     });
   }
 
@@ -1702,11 +2095,33 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   // ---------- render: focus pane ----------
+  // focus 每 3s 轮询若整块重渲，timeline (overflow:auto) 会滚回顶部。用签名脏检查：
+  // 只有 active 实例真正变化的字段（覆盖 renderFocus 读取的全部来源）才重渲。
+  function focusSig(inst, act) {
+    if (!inst) return '__none__';
+    var edits = _state.editsByPid[inst.pid], git = _state.gitByPid[inst.pid];
+    var ctx = act.contextUsage, su = act.sessionUsage, cs = act.compactStatus;
+    return [
+      inst.pid, inst.alias || '', inst.ccuseProfile || '', inst.worktree ? (inst.worktree.branch || 1) : '',
+      act.status || '', act.lastEventAt || '', act.statusLabel || '',
+      act.title || '', act.preview || '',
+      extractAsks(act).length, _state.answered[inst.pid] ? (_state.answered[inst.pid].label || 1) : 0,
+      ctx ? ctx.percent : '', su ? su.costUSD : '', su ? su.requestCount : '', cs ? cs.recommended : '',
+      (act.recentEvents || []).length,
+      edits ? edits.fetchedAt : 0, git ? git.fetchedAt : 0,
+    ].join('|');
+  }
+  function renderFocusIfChanged() {
+    var inst = _state.instances.find(function(x) { return x.pid === _state.activePid; });
+    var sig = focusSig(inst, inst ? (_state.activityByPid[inst.pid] || {}) : {});
+    if (sig === _state._focusSig) return;
+    renderFocus();
+  }
   function renderFocus() {
     var el = document.getElementById('focus');
     if (!el) return;
     var inst = _state.instances.find(function(x) { return x.pid === _state.activePid; });
-    if (!inst) { el.innerHTML = '<div class="empty">select a session</div>'; return; }
+    if (!inst) { el.innerHTML = '<div class="empty">选择左侧一个会话查看详情 · 按 <kbd>c</kbd> 新建</div>'; _state._focusSig = '__none__'; return; }
     var act = _state.activityByPid[inst.pid] || {};
     var view = statusView(act.status || 'idle');
     var asks = extractAsks(act);
@@ -1963,6 +2378,8 @@ export const HTML_PAGE = `<!doctype html>
     [].forEach.call(el.querySelectorAll('.focus-hd .topic'), function(t) {
       t.addEventListener('click', function() { t.classList.toggle('expanded'); });
     });
+    // 更新脏检查基线，使后续 renderFocusIfChanged 能正确跳过未变化的轮询。
+    _state._focusSig = focusSig(inst, act);
   }
 
   // ---------- answer ask ----------
@@ -1997,16 +2414,37 @@ export const HTML_PAGE = `<!doctype html>
     });
   }
 
-  // 纯按 lastEventAt 倒序：最近活动的会话靠前。等回答状态已在卡片角标
-  // 和顶部 alert 上有强提示，不再让它强制顶置而打乱时间感。
   function instanceSortKey(it) {
     var act = _state.activityByPid[it.pid] || {};
     return Date.parse(act.lastEventAt) || 0;
   }
+  // 状态优先级：等回答/等输入靠前，空闲/无会话靠后。
+  var STATUS_RANK = { waiting_ask: 0, waiting_input: 1, waiting_tool: 2, tool_running: 3, thinking: 4, error: 5, idle: 6, no_session: 7 };
+  function groupKeyOf(it) {
+    if (it && it.projectName) return it.projectName;
+    var c = (it && it.cwd) || '';
+    return c.split('/').filter(Boolean).pop() || '?';
+  }
+  // 按 _state.sortMode 排序：activity(默认,最近活动) | name | cost | status。
   function sortInstances(list) {
+    var mode = _state.sortMode || 'activity';
     return list.slice().sort(function(a, b) {
-      var ta = instanceSortKey(a), tb = instanceSortKey(b);
-      if (ta !== tb) return tb - ta;
+      var d = 0;
+      if (mode === 'name') {
+        d = tabName(a).toLowerCase().localeCompare(tabName(b).toLowerCase());
+      } else if (mode === 'cost') {
+        var ca = ((_state.activityByPid[a.pid] || {}).sessionUsage || {}).costUSD || 0;
+        var cb = ((_state.activityByPid[b.pid] || {}).sessionUsage || {}).costUSD || 0;
+        d = cb - ca;
+      } else if (mode === 'status') {
+        var ra = STATUS_RANK[(_state.activityByPid[a.pid] || {}).status] != null ? STATUS_RANK[(_state.activityByPid[a.pid] || {}).status] : 9;
+        var rb = STATUS_RANK[(_state.activityByPid[b.pid] || {}).status] != null ? STATUS_RANK[(_state.activityByPid[b.pid] || {}).status] : 9;
+        d = ra - rb;
+        if (d === 0) d = instanceSortKey(b) - instanceSortKey(a);
+      } else { // activity
+        d = instanceSortKey(b) - instanceSortKey(a);
+      }
+      if (d !== 0) return d;
       return (a.pid || 0) - (b.pid || 0);
     });
   }
@@ -2021,16 +2459,26 @@ export const HTML_PAGE = `<!doctype html>
     }
     return sortInstances(base);
   }
+  // filter 命中列表 + 钉住当前 active（即便不匹配），避免选中态从 tab/rail 消失。
+  // 副作用：设 _state._activeFilteredOut，供渲染层加 .filtered-pinned 弱化样式。
+  function filteredInstancesWithActivePinned() {
+    var list = filteredInstances();
+    _state._activeFilteredOut = false;
+    var ap = _state.activePid;
+    if (ap && !list.some(function(x) { return x.pid === ap; })) {
+      var act = _state.instances.find(function(x) { return x.pid === ap; });
+      if (act) { list = list.concat([act]); _state._activeFilteredOut = true; }
+    }
+    return list;
+  }
 
   function setActive(pid) {
-    if (!pid || pid === _state.activePid) {
-      if (pid === _state.activePid) return;
-    }
+    if (pid === _state.activePid) return;
     _state.activePid = pid;
     persistState();
     renderTabStrip();
-    renderRail();
-    renderFocus();
+    renderRailSessions();
+    renderFocusIfChanged();
     renderAskAlert();
     refreshActivePidExtras();
     rewireTerminalForActive();
@@ -2068,67 +2516,99 @@ export const HTML_PAGE = `<!doctype html>
     }
   }
 
+  // 内联别名编辑：把 focus header 里的「别名」chip 原地换成输入框，
+  // Enter 保存 / Esc 取消 / 失焦保存。复用 /prefs/alias 端点。
   function editAlias(inst) {
+    var btn = document.querySelector('#focus [data-act="alias"]');
+    if (!btn || btn.querySelector('input')) return;
     var current = inst.alias || '';
-    var next = prompt('为这个项目设置别名 (留空清除):\\n\\n路径: ' + (inst.cwd || ''), current);
-    if (next === null) return;
-    next = (next || '').trim();
-    if (next === current) return;
-    api('/api/launcher/prefs/alias', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ cwd: inst.cwd, alias: next }),
-    }).then(function() {
-      inst.alias = next;
-      renderTabStrip(); renderRail(); renderFocus();
-    }).catch(function(err) {
-      alert('设置别名失败: ' + (err && err.message || err));
+    btn.innerHTML = '<span class="lbl">别名</span>';
+    var input = document.createElement('input');
+    input.type = 'text'; input.value = current; input.placeholder = '留空清除';
+    input.style.cssText = 'background:var(--bg);color:var(--fg);border:1px solid var(--accent);border-radius:4px;font-size:11px;padding:1px 5px;width:130px;outline:none';
+    btn.appendChild(input);
+    input.focus(); input.select();
+    var done = false;
+    var cancel = function() { if (done) return; done = true; renderFocus(); };
+    var commit = function() {
+      if (done) return; done = true;
+      var next = (input.value || '').trim();
+      if (next === current) { renderFocus(); return; }
+      api('/api/launcher/prefs/alias', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cwd: inst.cwd, alias: next }),
+      }).then(function() {
+        inst.alias = next;
+        toast(next ? '别名已更新' : '别名已清除', 'ok');
+        renderTabStrip(); renderRail(); renderFocus();
+      }).catch(function(err) {
+        toast('设置别名失败: ' + (err && err.message || err), 'bad');
+        renderFocus();
+      });
+    };
+    input.addEventListener('click', function(e) { e.stopPropagation(); });
+    input.addEventListener('keydown', function(e) {
+      e.stopPropagation();
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
     });
+    input.addEventListener('blur', commit);
   }
 
   function spawnNewSessionAt(inst, btn) {
     if (!inst || !inst.cwd) return;
-    var origLabel = btn ? btn.innerHTML : '';
-    if (btn) {
-      btn.disabled = true;
-      btn.innerHTML = '<span class="lbl">同目录</span><span class="val">Launching…</span>';
-    }
-    var newPid = null;
-    api('/api/launcher/spawn', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        cwd: inst.cwd,
-        force: true,
-        ccuseProfile: inst.ccuseProfile || '',
-      }),
-    }).then(function(res) {
-      newPid = (res && res.instance && res.instance.pid) || (res && res.pid) || null;
-      return refreshList();
-    }).then(function() {
-      if (newPid) setActive(newPid);
-    }).catch(function(err) {
-      alert('新建 session 失败: ' + (err && err.message || err));
-    }).finally(function() {
-      if (btn) { btn.disabled = false; btn.innerHTML = origLabel; }
+    confirmDialog({
+      title: '同目录新建 session',
+      body: '在以下目录再启动一个 ccv 实例（会占用一个新端口）：\\n' + inst.cwd,
+      okLabel: '新建',
+    }).then(function(ok) {
+      if (!ok) return;
+      var origLabel = btn ? btn.innerHTML : '';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="lbl">同目录</span><span class="val">Launching…</span>';
+      }
+      var newPid = null;
+      api('/api/launcher/spawn', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cwd: inst.cwd, force: true, ccuseProfile: inst.ccuseProfile || '' }),
+      }).then(function(res) {
+        newPid = (res && res.instance && res.instance.pid) || (res && res.pid) || null;
+        return refreshList();
+      }).then(function() {
+        if (newPid) setActive(newPid);
+        toast('已新建 session', 'ok');
+      }).catch(function(err) {
+        toast('新建 session 失败: ' + (err && err.message || err), 'bad');
+      }).finally(function() {
+        if (btn) { btn.disabled = false; btn.innerHTML = origLabel; }
+      });
     });
   }
 
   function killCcv(inst) {
     var name = inst.alias || inst.displayName || inst.projectName || ('pid ' + inst.pid);
-    if (!confirm('确认关闭这个 ccv 实例?\\n\\n' + name + (inst.port ? ' :' + inst.port : '') + '\\n\\nSIGTERM 会发送给进程，正在运行的任务会被打断。')) return;
-    api('/api/launcher/kill', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ pid: inst.pid }),
-    }).then(function() {
-      // Optimistically remove from local state.
-      _state.instances = _state.instances.filter(function(x) { return x.pid !== inst.pid; });
-      delete _state.activityByPid[inst.pid];
-      if (_state.activePid === inst.pid) _state.activePid = activePidOnFirstLoad();
-      renderTabStrip(); renderRail(); renderFocus();
-      setTimeout(refreshList, 500);
-    }).catch(function(err) {
-      alert('关闭失败: ' + (err && err.message || err));
+    confirmDialog({
+      title: '关闭 ccv 实例',
+      body: name + (inst.port ? ' :' + inst.port : '') + '\\n\\nSIGTERM 会发送给进程，正在运行的任务会被打断。',
+      danger: true, okLabel: '关闭',
+    }).then(function(ok) {
+      if (!ok) return;
+      api('/api/launcher/kill', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pid: inst.pid }),
+      }).then(function() {
+        // Optimistically remove from local state.
+        _state.instances = _state.instances.filter(function(x) { return x.pid !== inst.pid; });
+        delete _state.activityByPid[inst.pid];
+        if (_state.activePid === inst.pid) _state.activePid = activePidOnFirstLoad();
+        renderTabStrip(); renderRailSessions(); renderFocus();
+        setTimeout(refreshList, 500);
+        toast('已关闭 ' + name, 'ok');
+      }).catch(function(err) {
+        toast('关闭失败: ' + (err && err.message || err), 'bad');
+      });
     });
   }
 
@@ -2187,43 +2667,53 @@ export const HTML_PAGE = `<!doctype html>
         api('/api/launcher/prefs/ccuse-profile', {
           method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ default: (next || '').trim() }),
-        }).then(function() { loadPrefs(true).then(renderFocus); })
-          .catch(function(err) { alert('设置默认 profile 失败: ' + (err && err.message || err)); });
+        }).then(function() { loadPrefs(true).then(renderFocus); toast('默认 profile 已更新', 'ok'); })
+          .catch(function(err) { toast('设置默认 profile 失败: ' + (err && err.message || err), 'bad'); });
       });
     }
   }
 
   function switchCcuse(inst, profile) {
-    if (!confirm('切换 ccuse profile 为 "' + (profile || 'default') + '" 会重启 ccv (SIGTERM → 重新 spawn)。继续?')) return;
-    api('/api/launcher/restart', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ pid: inst.pid, ccuseProfile: profile }),
-    }).then(function(res) {
-      // Switch active to the new pid; full refresh follows.
-      if (res && res.instance && res.instance.pid) _state.activePid = res.instance.pid;
-      loadPrefs(true);
-      refreshList();
-    }).catch(function(err) {
-      alert('切换 profile 失败: ' + (err && err.message || err));
+    confirmDialog({
+      title: '切换 ccuse profile',
+      body: '切换为 "' + (profile || 'default') + '" 会重启 ccv（SIGTERM → 重新 spawn）。继续？',
+      okLabel: '切换并重启',
+    }).then(function(ok) {
+      if (!ok) return;
+      api('/api/launcher/restart', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pid: inst.pid, ccuseProfile: profile }),
+      }).then(function(res) {
+        // Switch active to the new pid; full refresh follows.
+        if (res && res.instance && res.instance.pid) _state.activePid = res.instance.pid;
+        loadPrefs(true);
+        refreshList();
+        toast('已切换到 ' + (profile || 'default'), 'ok');
+      }).catch(function(err) {
+        toast('切换 profile 失败: ' + (err && err.message || err), 'bad');
+      });
     });
   }
 
   function takeoverLocal(pid, sessionId, cwd) {
     if (!pid || !sessionId || !cwd) return;
-    var msg = '接管裸 claude 进程?\\n\\n' +
-              'pid: ' + pid + '\\n' +
-              'session: ' + sessionId + '\\n' +
-              'cwd: ' + cwd + '\\n\\n' +
-              '动作: SIGTERM 该 pid → 在新 Terminal 窗口里 ccv -r <sid> 接管该会话。';
-    if (!confirm(msg)) return;
-    api('/api/launcher/takeover-cc-session', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ pid: pid, sessionId: sessionId, cwd: cwd }),
-    }).then(function() {
-      // Refresh after a moment so the new ccv shows up via runtime watcher.
-      setTimeout(refreshList, 2000);
-    }).catch(function(err) {
-      alert('接管失败: ' + (err && err.message || err));
+    confirmDialog({
+      title: '接管裸 claude 进程',
+      body: 'pid: ' + pid + '\\nsession: ' + sessionId + '\\ncwd: ' + cwd +
+            '\\n\\n动作：SIGTERM 该 pid → 在新 Terminal 窗口里 ccv -r <sid> 接管该会话。',
+      danger: true, okLabel: '接管',
+    }).then(function(ok) {
+      if (!ok) return;
+      api('/api/launcher/takeover-cc-session', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pid: pid, sessionId: sessionId, cwd: cwd }),
+      }).then(function() {
+        // Refresh after a moment so the new ccv shows up via runtime watcher.
+        setTimeout(refreshList, 2000);
+        toast('已接管，正在新 Terminal 启动…', 'ok');
+      }).catch(function(err) {
+        toast('接管失败: ' + (err && err.message || err), 'bad');
+      });
     });
   }
 
@@ -2719,7 +3209,7 @@ export const HTML_PAGE = `<!doctype html>
         var host = (hub.lanUrl ? (function() { try { return new URL(hub.lanUrl).hostname; } catch (e) { return location.hostname; } })() : location.hostname);
         document.getElementById('srv').textContent = host + ':' + (hub.port || location.port);
       }
-      renderTabStrip(); renderRail(); renderFocus();
+      renderTabStrip(); renderRail(); renderFocusIfChanged();
       // Refresh activity immediately for any new instances
       if (prev.length !== _state.instances.length) refreshActivity();
     }).catch(function() {});
@@ -2740,7 +3230,8 @@ export const HTML_PAGE = `<!doctype html>
       // Detect runs before render so notifications fire on the same tick as UI
       // updates, but a notification bug must never block rendering — hence the guard.
       try { detectStatusTransitions(map); } catch (e) { console.warn('[NotifMgr] detect failed:', e && e.message); }
-      renderTabStrip(); renderRail(); renderFocus(); renderAskAlert();
+      // 3s 高频路径：只键控刷新会话卡 + 脏检查 focus，不重建 rail 静态区块。
+      renderTabStrip(); renderRailSessions(); renderFocusIfChanged(); renderAskAlert();
       refreshActivePidExtras();
     }).catch(function() {});
   }
@@ -2808,31 +3299,76 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   // ---------- keyboard ----------
+  function toggleHelp(force) {
+    var ov = document.getElementById('help-overlay');
+    if (!ov) return;
+    var open = force == null ? !ov.classList.contains('open') : force;
+    ov.classList.toggle('open', open);
+  }
+  function activeInst() { return _state.instances.find(function(x) { return x.pid === _state.activePid; }); }
+  function isOpenEl(id) { var el = document.getElementById(id); return !!(el && el.classList.contains('open')); }
+  // 是否有任何模态/浮层打开（含原生 <dialog open>：confirm/ops）。
+  function anyModalOpen() {
+    return !!document.querySelector('dialog[open]') || isOpenEl('help-overlay') ||
+      isOpenEl('cmd-palette') || isOpenEl('ccv-overlay') || isOpenEl('term-sheet');
+  }
+
   document.addEventListener('keydown', function(e) {
-    if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) {
+    // Bail on form fields AND when focus is inside an embedded terminal (xterm
+    // routes keys via a hidden textarea, but guard the host div too so single-key
+    // shortcuts like c/w/r never leak into a focused Console/Shell pane).
+    var inTerm = e.target && e.target.closest && e.target.closest('.term-xterm-host, #term-sheet');
+    if ((e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) || inTerm) {
       if (e.key === 'Escape' && e.target.id === 'filter') { e.target.blur(); }
       return;
     }
+    // Esc closes the topmost overlay we manage (native <dialog> handles its own Esc).
+    if (e.key === 'Escape') {
+      if (isOpenEl('help-overlay')) { toggleHelp(false); return; }
+      if (isOpenEl('cmd-palette') && typeof closeCommandPalette === 'function') { closeCommandPalette(); return; }
+      if (isOpenEl('ccv-overlay')) { closeCcv(); return; }
+      if (isOpenEl('term-sheet')) { closeSheet(); return; }
+      return;
+    }
+    // '?' toggles help (works even when help itself is open), but not over a dialog/palette/overlay.
+    if (e.key === '?') {
+      if (!document.querySelector('dialog[open]') && !isOpenEl('cmd-palette') && !isOpenEl('ccv-overlay') && !isOpenEl('term-sheet')) { e.preventDefault(); toggleHelp(); }
+      return;
+    }
+    // Any modal/overlay open → suppress action shortcuts (incl ⌘K) so e.g. W can't
+    // re-invoke killCcv() and showModal() an already-open confirm dialog.
+    if (anyModalOpen()) return;
+    // command palette: ⌘K / Ctrl+K
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+      if (typeof openCommandPalette === 'function') { e.preventDefault(); openCommandPalette(); }
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.key === '/') {
       e.preventDefault();
       document.getElementById('filter').focus();
+    } else if (e.key >= '1' && e.key <= '9') {
+      var vis = filteredInstancesWithActivePinned();
+      var pick = vis[(+e.key) - 1];
+      if (pick) { e.preventDefault(); setActive(pick.pid); }
+    } else if (e.key === 'c' || e.key === 'C') {
+      e.preventDefault();
+      openNew();
+    } else if (e.key === 'w' || e.key === 'W') {
+      var ki = activeInst();
+      if (ki && !ki.isHub) { e.preventDefault(); killCcv(ki); }
+    } else if (e.key === 'r' || e.key === 'R') {
+      var ri = activeInst();
+      if (ri && !ri.isHub) { e.preventDefault(); editAlias(ri); }
     } else if (e.key === 'j' || e.key === 'n' || e.key === 'J' || e.key === 'N') {
-      // Jump to next waiting_ask
-      var asks = _state.instances.filter(function(x) {
-        var a = _state.activityByPid[x.pid];
-        return a && a.status === 'waiting_ask' && !_state.answered[x.pid];
-      });
-      if (!asks.length) return;
-      var idx = asks.findIndex(function(x) { return x.pid === _state.activePid; });
-      var next = asks[(idx + 1) % asks.length];
-      setActive(next.pid);
-    } else if (e.key === 'Escape') {
-      var ov = document.getElementById('ccv-overlay');
-      if (ov && ov.classList.contains('open')) { closeCcv(); return; }
-      var sh = document.getElementById('term-sheet');
-      if (sh && sh.classList.contains('open')) { closeSheet(); return; }
+      jumpNextAsk();
     }
   });
+  // click outside the help panel closes it
+  (function() {
+    var ov = document.getElementById('help-overlay');
+    if (ov) ov.addEventListener('click', function(e) { if (e.target === ov) toggleHelp(false); });
+  })();
 
   // ---------- notification manager ----------
   var NOTIF_FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2358a6ff'/%3E%3Ctext x='32' y='42' font-family='Inter,Arial,sans-serif' font-size='32' font-weight='700' text-anchor='middle' fill='%230d1117'%3Ecc%3C/text%3E%3C/svg%3E";
@@ -3384,6 +3920,213 @@ export const HTML_PAGE = `<!doctype html>
     try { if (_state.audioCtx) _state.audioCtx.close(); } catch (e) {}
   });
 
+  // ---------- event delegation ----------
+  // 单一常驻委托监听（容器级，永不解绑；键控渲染只回收/复用 DOM 节点）。
+  // 点击时用 e.target.closest 重新读取 data-*，不依赖渲染期闭包。
+  function wireDelegation() {
+    var strip = document.getElementById('tab-strip');
+    if (strip) strip.addEventListener('click', function(e) {
+      var t = e.target.closest('.tab[data-pid]');
+      if (t) setActive(+t.getAttribute('data-pid'));
+    });
+    var rail = document.getElementById('rail');
+    if (rail) rail.addEventListener('click', function(e) {
+      var sf = e.target.closest('.spawn-fresh');
+      if (sf) { e.stopPropagation(); var fc = sf.getAttribute('data-cwd'); if (fc) openNew(fc); return; }
+      var hd = e.target.closest('.rail-section .sec-hd');
+      if (hd) {
+        var sec = hd.closest('.rail-section').getAttribute('data-sec');
+        _state.railOpen[sec] = !_state.railOpen[sec];
+        persistState(); renderRailExtras(); return;
+      }
+      var sess = e.target.closest('.rail-sess-card');
+      if (sess) { var c = sess.getAttribute('data-cwd'), s = sess.getAttribute('data-sid'); if (c && s) resumeSession(c, s); return; }
+      var hist = e.target.closest('.rail-hist-card');
+      if (hist) {
+        var hcwd = hist.getAttribute('data-cwd'); if (!hcwd) return;
+        var hItem = (_state.history || []).find(function(x) { return x.cwd === hcwd; })
+                 || (_state.shellHistory || []).find(function(x) { return x.cwd === hcwd; });
+        var hasSessions = hItem && +hItem.sessionCount > 0;
+        if (!hasSessions) { openNew(hcwd); return; }
+        toggleHistExpand(hcwd); return;
+      }
+      var unt = e.target.closest('.rail-untracked-card');
+      if (unt) { takeoverLocal(+unt.getAttribute('data-pid'), unt.getAttribute('data-sid'), unt.getAttribute('data-cwd')); return; }
+      var card = e.target.closest('.rail-card[data-pid]');
+      if (card) { setActive(+card.getAttribute('data-pid')); return; }
+    });
+  }
+
+  // ---------- command palette (⌘K / Ctrl+K) ----------
+  var _palItems = [], _palSel = 0;
+  // 子序列模糊匹配：连续命中给更高分，无命中返回 -1。
+  function fuzzyScore(hay, q) {
+    hay = (hay || '').toLowerCase(); q = (q || '').toLowerCase();
+    if (!q) return 0;
+    var hi = 0, score = 0;
+    for (var i = 0; i < q.length; i++) {
+      var idx = hay.indexOf(q[i], hi);
+      if (idx < 0) return -1;
+      score += (idx === hi ? 2 : 1);
+      hi = idx + 1;
+    }
+    return score;
+  }
+  function paletteSource() {
+    var items = [];
+    items.push({ label: '＋ 新建会话', search: 'new 新建 spawn create', run: function() { openNew(); } });
+    var ai = activeInst();
+    if (ai) {
+      items.push({ label: '↗ 打开 ccv · ' + tabName(ai), search: 'open ccv ' + tabName(ai), run: function() { openCcv(ai); } });
+      if (!ai.isHub) {
+        items.push({ label: '✎ 重命名当前 · ' + tabName(ai), search: 'rename alias 重命名 ' + tabName(ai), run: function() { editAlias(ai); } });
+        items.push({ label: '⏹ 关闭当前 · ' + tabName(ai), search: 'kill close 关闭 ' + tabName(ai), run: function() { killCcv(ai); } });
+      }
+    }
+    items.push({ label: '⏳ 跳到下一个等回答', search: 'ask jump 等回答', run: jumpNextAsk });
+    items.push({ label: '⚙ 运维面板', search: 'ops reaper 运维 worktree push', run: openOpsPanel });
+    items.push({ label: '? 快捷键帮助', search: 'help keys 帮助 快捷键', run: function() { toggleHelp(true); } });
+    sortInstances(_state.instances).forEach(function(it) {
+      var act = _state.activityByPid[it.pid] || {};
+      var v = statusView(act.status || 'idle');
+      items.push({
+        label: '› ' + tabName(it) + (it.port ? '  :' + it.port : ''),
+        sub: v.text,
+        search: tabName(it) + ' ' + (it.cwd || '') + ' ' + (it.port || ''),
+        run: function() { setActive(it.pid); },
+      });
+    });
+    return items;
+  }
+  function renderPalette(q) {
+    var box = document.getElementById('cmd-results');
+    if (!box) return;
+    var all = paletteSource();
+    var filtered;
+    if (!q) filtered = all;
+    else filtered = all.map(function(it) { return { it: it, s: fuzzyScore((it.search || '') + ' ' + it.label, q) }; })
+      .filter(function(x) { return x.s >= 0; })
+      .sort(function(a, b) { return b.s - a.s; })
+      .map(function(x) { return x.it; });
+    _palItems = filtered;
+    if (_palSel >= filtered.length) _palSel = Math.max(0, filtered.length - 1);
+    if (!filtered.length) { box.innerHTML = '<div class="pi-empty">无匹配</div>'; return; }
+    var html = '';
+    for (var i = 0; i < filtered.length; i++) {
+      var it = filtered[i];
+      html += '<div class="pi' + (i === _palSel ? ' sel' : '') + '" data-i="' + i + '" role="option"' + (i === _palSel ? ' aria-selected="true"' : '') + '>';
+      html += '<span class="pi-label">' + escape(it.label) + '</span>';
+      if (it.sub) html += '<span class="pi-sub">' + escape(it.sub) + '</span>';
+      html += '</div>';
+    }
+    box.innerHTML = html;
+    var sel = box.querySelector('.pi.sel');
+    if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: 'nearest' });
+  }
+  var _palTrigger = null;
+  function openCommandPalette() {
+    var pal = document.getElementById('cmd-palette');
+    var input = document.getElementById('cmd-input');
+    if (!pal || !input) return;
+    _palTrigger = document.activeElement;
+    _palSel = 0;
+    pal.classList.add('open');
+    input.value = '';
+    renderPalette('');
+    input.focus();
+  }
+  function closeCommandPalette() {
+    var pal = document.getElementById('cmd-palette');
+    if (pal) pal.classList.remove('open');
+    if (_palTrigger && _palTrigger.focus) { try { _palTrigger.focus(); } catch (e) {} }
+    _palTrigger = null;
+  }
+  function runPaletteSel() {
+    var it = _palItems[_palSel];
+    closeCommandPalette();
+    if (it && it.run) it.run();
+  }
+
+  // ---------- ops panel ----------
+  function opsRow(k, v, cls) {
+    return '<div class="ops-row"><span>' + escape(k) + '</span><span class="v' + (cls ? ' ' + cls : '') + '">' + escape(v) + '</span></div>';
+  }
+  function openOpsPanel() {
+    var dlg = document.getElementById('ops-dlg');
+    if (!dlg) return;
+    renderOpsPanel();
+    if (dlg.showModal && !dlg.open) { try { dlg.showModal(); } catch (e) {} }
+  }
+  function renderOpsPanel() {
+    var body = document.getElementById('ops-body');
+    if (!body) return;
+    body.innerHTML = '<h3>运维面板</h3><div class="ops-sec"><div class="hd">载入中…</div></div>';
+    Promise.all([
+      api('/api/launcher/reaper/stats').catch(function() { return null; }),
+      api('/api/launcher/push/subscriptions').catch(function() { return null; }),
+      api('/api/launcher/worktrees').catch(function() { return null; }),
+    ]).then(function(r) {
+      var reaper = r[0], push = r[1], wt = r[2];
+      var html = '<h3>运维面板</h3>';
+      html += '<div class="ops-sec"><div class="hd">Idle Reaper</div>';
+      if (reaper) {
+        html += opsRow('状态', reaper.running ? '运行中' : '未运行', reaper.running ? 'ok' : 'warn');
+        html += opsRow('已回收实例', String(reaper.reaped || 0));
+        html += opsRow('tick 次数', String(reaper.ticks || 0));
+        html += opsRow('最近 tick', reaper.lastTickAt ? fmtAge(new Date(reaper.lastTickAt).toISOString()) : '—');
+      } else { html += '<div class="ops-mini">不可用</div>'; }
+      html += '</div>';
+      html += '<div class="ops-sec"><div class="hd">Web Push</div>';
+      if (push) {
+        var subs = push.subs || [];
+        html += opsRow('订阅数', String(push.count != null ? push.count : subs.length));
+        var poller = push.poller || {};
+        if (poller.running != null) html += opsRow('poller', poller.running ? '运行中' : '停止', poller.running ? 'ok' : 'warn');
+        var failing = subs.filter(function(s) { return s.lastFailAt && (!s.lastOkAt || s.lastFailAt > s.lastOkAt); }).length;
+        if (failing) html += opsRow('投递失败的订阅', String(failing), 'bad');
+      } else { html += '<div class="ops-mini">不可用</div>'; }
+      html += '</div>';
+      html += '<div class="ops-sec"><div class="hd">Worktrees</div>';
+      if (wt && wt.worktrees) {
+        var list = wt.worktrees;
+        html += opsRow('总数', String(wt.count != null ? wt.count : list.length));
+        var orphan = list.filter(function(w) { return !w.alive; }).length;
+        var dirty = list.filter(function(w) { return w.hasUncommitted; }).length;
+        if (orphan) html += opsRow('孤儿(进程已退)', String(orphan), 'warn');
+        if (dirty) html += opsRow('有未提交改动', String(dirty), 'warn');
+        list.slice(0, 8).forEach(function(w) {
+          html += '<div class="ops-mini" title="' + escape(w.path || '') + '">' + (w.alive ? '● ' : '○ ') + escape(w.branch || '?') + (w.hasUncommitted ? ' *' : '') + '</div>';
+        });
+      } else { html += '<div class="ops-mini">不可用</div>'; }
+      html += '</div>';
+      body.innerHTML = html;
+    });
+  }
+
+  function wireCmdAndOps() {
+    var input = document.getElementById('cmd-input');
+    var results = document.getElementById('cmd-results');
+    var pal = document.getElementById('cmd-palette');
+    if (input) {
+      input.addEventListener('input', function() { _palSel = 0; renderPalette(input.value.trim()); });
+      input.addEventListener('keydown', function(e) {
+        if (e.key === 'ArrowDown') { e.preventDefault(); if (_palItems.length) { _palSel = (_palSel + 1) % _palItems.length; renderPalette(input.value.trim()); } }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); if (_palItems.length) { _palSel = (_palSel - 1 + _palItems.length) % _palItems.length; renderPalette(input.value.trim()); } }
+        else if (e.key === 'Enter') { e.preventDefault(); runPaletteSel(); }
+        else if (e.key === 'Escape') { e.preventDefault(); closeCommandPalette(); }
+      });
+    }
+    if (results) results.addEventListener('click', function(e) {
+      var row = e.target.closest('.pi[data-i]');
+      if (!row) return;
+      _palSel = +row.getAttribute('data-i');
+      runPaletteSel();
+    });
+    if (pal) pal.addEventListener('click', function(e) { if (e.target === pal) closeCommandPalette(); });
+    var oc = document.getElementById('ops-close'); if (oc) oc.addEventListener('click', function() { var d = document.getElementById('ops-dlg'); if (d) { try { d.close(); } catch (e) {} } });
+    var orf = document.getElementById('ops-refresh'); if (orf) orf.addEventListener('click', renderOpsPanel);
+  }
+
   // ---------- boot ----------
   function init() {
     // Notification settings (load prefs + wire UI before first activity poll
@@ -3406,6 +4149,7 @@ export const HTML_PAGE = `<!doctype html>
 
     // Wire static interactions
     document.getElementById('btn-new').addEventListener('click', openNew);
+    document.getElementById('ask-count').addEventListener('click', jumpNextAsk);
     document.getElementById('new-cancel').addEventListener('click', function() { document.getElementById('dlg').close(); });
     document.getElementById('new-launch').addEventListener('click', submitNew);
     document.getElementById('ccv-close').addEventListener('click', closeCcv);
@@ -3425,10 +4169,15 @@ export const HTML_PAGE = `<!doctype html>
     [].forEach.call(document.querySelectorAll('#term-tabs .term-tab'), function(t) {
       t.addEventListener('click', function() { setTermTab(t.getAttribute('data-tab')); });
     });
+    var _filterDeb = null;
     document.getElementById('filter').addEventListener('input', function(e) {
       _state.filter = e.target.value;
-      renderTabStrip(); renderRail();
+      if (_filterDeb) clearTimeout(_filterDeb);
+      // extras (历史/shell 历史) are filtered too — must re-render on filter change.
+      _filterDeb = setTimeout(function() { renderTabStrip(); renderRailSessions(); renderRailExtras(); }, 120);
     });
+    wireDelegation();
+    wireCmdAndOps();
     wireTermHandle();
     wireMobile();
     if (!_state.termOpen) {

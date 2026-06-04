@@ -684,6 +684,16 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
     return;
   }
 
+  // Idle-instance reaper stats (read-only, for the ops panel). Lazy import:
+  // reaper.mjs imports getInstanceActivity from this module, so a top-level
+  // `import { getReaperStats } from './reaper.mjs'` would close an import cycle.
+  if (url === '/api/launcher/reaper/stats' && method === 'GET') {
+    let stats = { running: false, ticks: 0, reaped: 0, lastTickAt: 0 };
+    try { const m = await import('./reaper.mjs'); stats = m.getReaperStats(); } catch (e) { /* reaper not started */ }
+    sendJson(res, 200, stats);
+    return;
+  }
+
   if (url === '/api/launcher/list' && method === 'GET') {
     rescanRuntime();
     await backfillExternalCcvs();
