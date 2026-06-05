@@ -7,7 +7,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CCV_PLUGIN_DIR="$HOME/.claude/cc-viewer/plugins"
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
-PLIST_NAME="com.dayuer.ccv-hub.plist"
+PLIST_NAME="com.user.ccv-hub.plist"
 
 echo "[1/4] 检查依赖"
 command -v ccv >/dev/null || { echo "ERROR: ccv 未安装。npm install -g cc-viewer 先"; exit 1; }
@@ -38,7 +38,7 @@ cp "$PROJECT_DIR/deploy/$PLIST_NAME" "$target"
 launchctl load "$target"
 sleep 2
 
-if launchctl list | grep -q com.dayuer.ccv-hub; then
+if launchctl list | grep -q com.user.ccv-hub; then
   echo "    ✓ launchd agent loaded"
 else
   echo "    ✗ launchd 加载失败，看 ~/Library/Logs/ccv-hub/stderr.log"
@@ -62,9 +62,9 @@ cat <<EOF
   2. htpasswd — 在 NAS 上生成 hub 子域的 Basic Auth:
        PASS=\$(openssl rand -base64 18 | tr -d '=+/' | cut -c1-20)
        HASH=\$(docker exec nginx-proxy-manager openssl passwd -apr1 "\$PASS")
-       echo "dayuer:\$HASH" | sudo tee /vol1/1000/Docker/config/nginx-proxy-manager/nginx/custom/ccv.htpasswd
-  3. DNS — DNSPod 加通配符 CNAME *.xiaoyuervae.cn → nginx.xiaoyuervae.cn (一次性配)
+       echo "<user>:\$HASH" | sudo tee /vol1/1000/Docker/config/nginx-proxy-manager/nginx/custom/ccv.htpasswd
+  3. DNS — DNSPod 加通配符 CNAME *.<your-domain> → nginx.<your-domain> (一次性配)
   4. 主路由 — TCP 9990 NAT → NAS:4443 (一次性配)
 
-打开 https://ccv.xiaoyuervae.cn:9990/launcher 验证。
+打开 https://ccv.<your-domain>:9990/launcher 验证。
 EOF

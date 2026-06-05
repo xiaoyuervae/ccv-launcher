@@ -1,7 +1,7 @@
 # M4 — CLAUDE.md scanner + inline editor test plan
 
 > ⚠ DANGER — read before running any step:
-> - **NEVER** touch port **7100** — that's the prod launchd hub (`com.dayuer.ccv-hub`).
+> - **NEVER** touch port **7100** — that's the prod launchd hub (`com.user.ccv-hub`).
 >   Always bring up a separate test hub on port **7200** (recipe below).
 > - **NEVER** run any `launchctl` command (`kickstart`, `unload`, `bootout`, …)
 >   against the prod hub.
@@ -54,7 +54,7 @@ rm -rf /tmp/ccv-t13-fixture
 `scanClaudeMd` + `isAllowedMdPath` + `backupMdBeforeWrite` were verified
 in-process before the M4 commit landed:
 
-- `scanClaudeMd('/Users/dayuer/Projects/ccv-launcher')` returned the real
+- `scanClaudeMd('/path/to/ccv-launcher')` returned the real
   global CLAUDE.md and resolved `@~/.claude/rules/aliyun-internal.md` as
   scope=`rule`. Read-only — no writes.
 - Whitelist accepts: `<fixture>/CLAUDE.md`, `<fixture>/.claude/skills/foo/x.md`,
@@ -214,5 +214,5 @@ kill $(lsof -nP -iTCP:7200 -sTCP:LISTEN -t)
   is fine and useful; writes overwrite the user's real config.
 - Do not curl-POST `/api/launcher/file` against any path under `~/.claude/`.
 - Do not run `launchctl kickstart` / `unload` / `bootout` on
-  `com.dayuer.ccv-hub`.
+  `com.user.ccv-hub`.
 - Do not change the test hub's `CCV_START_PORT` to anything other than 7200.

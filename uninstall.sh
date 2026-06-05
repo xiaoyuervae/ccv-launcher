@@ -6,7 +6,7 @@ set -euo pipefail
 
 CCV_PLUGIN_DIR="$HOME/.claude/cc-viewer/plugins"
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
-PLIST_NAME="com.dayuer.ccv-hub.plist"
+PLIST_NAME="com.user.ccv-hub.plist"
 target="$LAUNCH_AGENT_DIR/$PLIST_NAME"
 
 echo "[1/2] uninstall launchd agent"

@@ -1154,8 +1154,8 @@ const _compactStatusByPid = new Map(); // pid -> compactStatus payload
 
 export async function injectPromptToCcv(instance, prompt) {
   // Future: probe ccv for a stdin or WebSocket inject channel and use it
-  // when available. As of cc-viewer at /Users/dayuer/.nvm/.../cc-viewer/
-  // server/server.js, no such route exists — ccv is a passive jsonl
+  // when available. As of cc-viewer server/server.js, no such route
+  // exists — ccv is a passive jsonl
   // observer. Returning a structured "skipped" result lets callers jlog
   // the attempt and lets UI surface a manual-action hint without the
   // launcher silently doing nothing.

@@ -329,8 +329,8 @@ const _localCcCache = { at: 0, list: [] };
 export const LOCAL_CC_CACHE_TTL_MS = 5000;
 const _firstEntryCwdCache = new Map(); // jsonlPath -> { mtime, cwd }
 
-// Decode a Claude Code project-dir name like "-Users-dayuer-Foo-Bar" back into
-// "/Users/dayuer/Foo/Bar". Lossy for non-alphanumeric chars (CJK etc are
+// Decode a Claude Code project-dir name like "-Users-alice-Foo-Bar" back into
+// "/Users/alice/Foo/Bar". Lossy for non-alphanumeric chars (CJK etc are
 // flattened to "-"), so we only fall back to this when reading the jsonl's
 // first entry fails — the jsonl carries the real cwd verbatim.
 export function decodeProjectDirName(name) {

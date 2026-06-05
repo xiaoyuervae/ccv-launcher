@@ -3,25 +3,25 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.dayuer.ccv-hub</string>
+    <string>com.user.ccv-hub</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/dayuer/.nvm/versions/node/v22.22.0/bin/node</string>
-        <string>/Users/dayuer/.nvm/versions/node/v22.22.0/lib/node_modules/cc-viewer/cli.js</string>
+        <string>/Users/<youruser>/.nvm/versions/node/v22.22.0/bin/node</string>
+        <string>/Users/<youruser>/.nvm/versions/node/v22.22.0/lib/node_modules/cc-viewer/cli.js</string>
         <string>--d</string>
         <string>--no-open</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/dayuer/.nvm/versions/node/v22.22.0/lib/node_modules/cc-viewer</string>
+    <string>/Users/<youruser>/.nvm/versions/node/v22.22.0/lib/node_modules/cc-viewer</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/dayuer/.local/bin:/Users/dayuer/.nvm/versions/node/v22.22.0/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/<youruser>/.local/bin:/Users/<youruser>/.nvm/versions/node/v22.22.0/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
-        <string>/Users/dayuer</string>
+        <string>/Users/<youruser></string>
         <key>CCV_HUB</key>
         <string>1</string>
         <key>CCV_START_PORT</key>
@@ -46,10 +46,10 @@
     <integer>30</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/dayuer/Library/Logs/ccv-hub/stdout.log</string>
+    <string>/Users/<youruser>/Library/Logs/ccv-hub/stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/dayuer/Library/Logs/ccv-hub/stderr.log</string>
+    <string>/Users/<youruser>/Library/Logs/ccv-hub/stderr.log</string>
 
     <key>ProcessType</key>
     <string>Background</string>

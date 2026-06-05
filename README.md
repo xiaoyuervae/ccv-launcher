@@ -13,19 +13,19 @@
 ```
 浏览器 / 手机
   │
-  │ https://ccv.xiaoyuervae.cn:9990 (固定子域, 收藏即用)
+  │ https://ccv.<your-domain>:9990 (固定子域, 收藏即用)
   ▼
 NPM (Basic Auth — 唯一入口防线)
   │
   ▼
-macAir:7100 (hub: ccv 进程 + launcher.mjs 插件)
+<host>:7100 (hub: ccv 进程 + launcher.mjs 插件)
   │
   ├─ fs.watch ~/.claude/cc-viewer/runtime/<pid>.json
   ├─ POST /api/launcher/spawn → fork 新 ccv 子进程
   ├─ POST /api/launcher/kill  → SIGTERM 子进程
   └─ runtime-broadcast.mjs 在每个 ccv 进程写 runtime/<pid>.json
   
-子实例 ccv-7008..7099.xiaoyuervae.cn:9990 (无 NPM auth, 仅 ccv ?token=)
+子实例 ccv-7008..7099.<your-domain>:9990 (无 NPM auth, 仅 ccv ?token=)
 ```
 
 ## 实现策略
@@ -51,7 +51,7 @@ ccv-launcher/
 │   ├── runtime-broadcast.mjs
 │   └── launcher.mjs
 ├── deploy/
-│   ├── com.dayuer.ccv-hub.plist   # launchd agent 模板
+│   ├── com.user.ccv-hub.plist    # launchd agent 模板
 │   └── npm-http.conf              # NPM 反代两个 server 块
 ├── install.sh                     # macOS 一键安装 (plugins symlink + launchd)
 ├── uninstall.sh                   # 撤回 launchd + symlink
@@ -86,23 +86,23 @@ cd ~/Projects/ccv-launcher
 2. **DNS** — 通配符 CNAME `*.<your-domain>` → DDNS 维护的 A 记录主机名
 3. **主路由** — 外部 9990 端口 NAT 到 NPM 监听端口 (本项目是 NAS:4443)
 4. **htpasswd** — 在 NPM custom 目录生成 `ccv.htpasswd` 给 hub 子域 Basic Auth
-5. **改 plist 适配你的环境** — `deploy/com.dayuer.ccv-hub.plist` 里 `CCV_PUBLIC_URL_TEMPLATE`、`HOME`、日志路径、ccv 二进制路径
+5. **改 plist 适配你的环境** — `deploy/com.user.ccv-hub.plist` 里 `CCV_PUBLIC_URL_TEMPLATE`、`HOME`、日志路径、ccv 二进制路径
 
 ## 配置
 
-主要环境变量（在 `deploy/com.dayuer.ccv-hub.plist` 里）：
+主要环境变量（在 `deploy/com.user.ccv-hub.plist` 里）：
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `CCV_HUB` | `1` | 启用 launcher 模式 (其它 ccv 进程留空) |
 | `CCV_START_PORT` / `CCV_MAX_PORT` | `7100` / `7100` | hub 锁死在 7100 |
-| `CCV_PUBLIC_URL_TEMPLATE` | `https://ccv-{port}.xiaoyuervae.cn:9990/?token={token}` | 子实例公网 URL 模板, `{port}/{token}/{host}` 占位符 |
+| `CCV_PUBLIC_URL_TEMPLATE` | `https://ccv-{port}.<your-domain>:9990/?token={token}` | 子实例公网 URL 模板, `{port}/{token}/{host}` 占位符 |
 | `CCV_CHILD_PORT_FLOOR` / `CCV_CHILD_PORT_CEIL` | `7008` / `7099` | spawn 子实例的端口范围 |
 
 改完 `kickstart` 一次让 launchd 重载：
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.dayuer.ccv-hub
+launchctl kickstart -k gui/$(id -u)/com.user.ccv-hub
 ```
 
 ## 修改流程
@@ -110,7 +110,7 @@ launchctl kickstart -k gui/$(id -u)/com.dayuer.ccv-hub
 `~/.claude/cc-viewer/plugins/*.mjs` 是 symlink，编辑 `~/Projects/ccv-launcher/plugins/*.mjs` 即生效，但需重启 hub 让 ccv 重新 import：
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.dayuer.ccv-hub
+launchctl kickstart -k gui/$(id -u)/com.user.ccv-hub
 ```
 
 或粗暴 `kill <hub-pid>`，KeepAlive 自动拉起。子实例继续 detached 跑不受影响。
@@ -143,7 +143,7 @@ curl http://127.0.0.1:7100/api/launcher/list | jq .
 curl -X POST http://127.0.0.1:7100/api/launcher/spawn -d '{"cwd":"/tmp"}' -H 'Content-Type: application/json'
 
 # 公网调试 (内网 hairpin NAT 不通时)
-curl -sk -u dayuer:<密码> --resolve ccv.xiaoyuervae.cn:4443:<NAS-IP> https://ccv.xiaoyuervae.cn:4443/launcher
+curl -sk -u <user>:<password> --resolve ccv.<your-domain>:4443:<NAS-IP> https://ccv.<your-domain>:4443/launcher
 ```
 
 ## 卸载

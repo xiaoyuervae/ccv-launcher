@@ -1,7 +1,7 @@
 # M2 — worktree + commit/push + Open PR test plan
 
 > ⚠ DANGER — read before running any step:
-> - **NEVER** touch port **7100** — that's the prod launchd hub (`com.dayuer.ccv-hub`).
+> - **NEVER** touch port **7100** — that's the prod launchd hub (`com.user.ccv-hub`).
 >   Always bring up a separate test hub on port **7200**.
 > - **NEVER** run any `launchctl` command (`kickstart`, `unload`, `bootout`, …)
 >   against the prod hub. KeepAlive will respawn it but real children + active
@@ -60,7 +60,7 @@ push / cleanup gating) was validated in-process via
 
 ## 2. End-to-end with an isolated TEST hub on port 7200
 
-The user's prod hub at port 7100 (`com.dayuer.ccv-hub`) MUST stay running and
+The user's prod hub at port 7100 (`com.user.ccv-hub`) MUST stay running and
 MUST NOT be kickstart-ed. Bring up a separate test hub on port 7200 from the
 same `plugins/launcher.mjs` source (via the existing
 `~/.claude/cc-viewer/plugins/launcher.mjs` symlink):
