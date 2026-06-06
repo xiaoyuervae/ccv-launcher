@@ -1150,6 +1150,84 @@ export const HTML_PAGE = `<!doctype html>
   }
   dialog#ops-dlg button:hover { background: var(--bg); }
   dialog#ops-dlg button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
+
+  /* ---------- view toggle (app-bar 总览/详情) ---------- */
+  #view-toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  #view-toggle button {
+    background: transparent; color: var(--mute); border: 0;
+    padding: 5px 10px; font-size: 11px; cursor: pointer; font-family: inherit;
+  }
+  #view-toggle button + button { border-left: 1px solid var(--line); }
+  #view-toggle button.on { background: var(--accent); color: var(--bg); font-weight: 600; }
+  #view-toggle button:not(.on):hover { color: var(--fg); background: var(--bg3); }
+
+  /* ---------- overview board ---------- */
+  /* hidden attr must beat the explicit display on #mc-grid / #overview */
+  #mc-grid[hidden], #overview[hidden] { display: none; }
+  #overview { flex: 1; min-height: 0; min-width: 0; overflow: auto; background: var(--bg); }
+  .board {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px; padding: 14px 16px; align-items: start; min-width: 0;
+  }
+  .board-col {
+    background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px; min-width: 0;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .board-col-hd {
+    display: flex; align-items: center; gap: 6px;
+    color: var(--mute); font-size: 10px; text-transform: uppercase;
+    letter-spacing: .5px; padding: 2px 4px; font-weight: 600;
+  }
+  .board-col-hd .gc {
+    margin-left: auto; background: var(--bg3); border-radius: 8px;
+    padding: 0 7px; font-size: 10px; font-family: var(--mono); color: var(--mute);
+  }
+  .board-col[data-col="attention"] .board-col-hd { color: var(--ask); }
+  .board-col-body { display: flex; flex-direction: column; gap: 6px; min-height: 24px; }
+  .board-empty { color: var(--mute); font-size: 11px; text-align: center; padding: 10px 0; opacity: .6; }
+  .board-card {
+    background: var(--bg2); border: 1px solid var(--line);
+    border-left: 3px solid var(--mute);
+    border-radius: 6px; padding: 9px 11px; cursor: pointer;
+    display: flex; flex-direction: column; gap: 5px; min-width: 0;
+  }
+  .board-card:hover { border-color: var(--accent); }
+  .board-card.active { border-color: var(--accent); background: var(--bg3); }
+  .board-card.needs-ask { background: rgba(248,81,73,.10); border-left-color: var(--ask) !important; }
+  .board-card.needs-ask .bc-badge { animation: dot-pulse 1.4s ease-in-out infinite; }
+  .board-card.waiting-input { background: rgba(163,113,247,.08); }
+  @media (prefers-reduced-motion: reduce) { .board-card.needs-ask .bc-badge { animation: none; } }
+  .board-card .bc-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .board-card .bc-name {
+    font-weight: 600; font-size: 12px; color: var(--fg);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
+  .board-card .bc-badge {
+    flex-shrink: 0; font-size: 9px; font-weight: 700; padding: 1px 6px;
+    border-radius: 8px; font-family: var(--mono); white-space: nowrap;
+  }
+  .board-card .bc-age {
+    margin-left: auto; flex-shrink: 0; color: var(--mute);
+    font-size: 9px; font-family: var(--mono);
+  }
+  .board-card .bc-topic {
+    color: var(--fg); font-size: 12px; line-height: 1.4;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; text-overflow: ellipsis; word-break: break-word;
+  }
+  .board-card .bc-act {
+    color: var(--warn); font-size: 11px; font-family: var(--mono); line-height: 1.35;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .board-card .bc-foot { color: var(--mute); font-size: 10px; font-family: var(--mono); }
+  @media (max-width: 640px) {
+    .board { grid-template-columns: 1fr; gap: 10px; padding: 12px; }
+    .board-card { padding: 11px 13px; }
+    .board-card .bc-name { font-size: 13.5px; }
+    .board-card .bc-topic { font-size: 13px; }
+    .board-card .bc-act { font-size: 12px; }
+  }
 </style>
 </head>
 <body>
@@ -1167,6 +1245,10 @@ export const HTML_PAGE = `<!doctype html>
     <span class="warn-tag" id="quota-warn" hidden>⚠</span>
     <span class="val" id="quota-val">—</span>
     <div class="bar"><div class="fill" id="quota-fill" style="width:0"></div></div>
+  </div>
+  <div id="view-toggle" title="总览 / 详情 切换 (V)">
+    <button type="button" data-view="overview">总览</button>
+    <button type="button" data-view="focus">详情</button>
   </div>
   <input type="text" id="filter" placeholder="filter  /" spellcheck="false" autocomplete="off">
   <button id="ask-count" class="icon-btn" type="button" hidden title="跳到下一个等回答的会话 (J)" aria-label="等回答会话数"></button>
@@ -1206,6 +1288,8 @@ export const HTML_PAGE = `<!doctype html>
     </div>
   </section>
 </main>
+
+<main id="overview" hidden><div class="board" id="board-cols"></div></main>
 
 <div id="mobile-bar">
   <button class="primary" id="mob-ccv">↗ 打开 ccv</button>
@@ -1325,6 +1409,7 @@ export const HTML_PAGE = `<!doctype html>
     <div class="krow"><kbd>c</kbd><span class="desc">新建会话</span></div>
     <div class="krow"><kbd>w</kbd><span class="desc">关闭当前会话</span></div>
     <div class="krow"><kbd>r</kbd><span class="desc">重命名当前会话（别名）</span></div>
+    <div class="krow"><kbd>v</kbd><span class="desc">总览 / 详情 切换</span></div>
     <div class="krow"><kbd>⌘/Ctrl</kbd>+<kbd>k</kbd><span class="desc">命令面板</span></div>
     <div class="krow"><kbd>?</kbd><span class="desc">显示/隐藏本帮助</span></div>
     <div class="krow"><kbd>Esc</kbd><span class="desc">关闭浮层 / 面板</span></div>
@@ -1559,6 +1644,8 @@ export const HTML_PAGE = `<!doctype html>
     push: { supported: false, subscribed: false, endpoint: null, status: 'idle', error: '' },
     sortMode: 'activity',   // activity | name | cost | status
     groupByProject: false,
+    viewMode: 'overview',   // overview (看板总览) | focus (单会话详情)
+    _overviewSig: null,
   };
   try {
     var p = JSON.parse(localStorage.getItem('ccvMcState') || '{}');
@@ -1574,6 +1661,7 @@ export const HTML_PAGE = `<!doctype html>
       }
       if (p.sortMode && /^(activity|name|cost|status)$/.test(p.sortMode)) _state.sortMode = p.sortMode;
       if (typeof p.groupByProject === 'boolean') _state.groupByProject = p.groupByProject;
+      if (p.viewMode && /^(overview|focus)$/.test(p.viewMode)) _state.viewMode = p.viewMode;
     }
   } catch (e) {}
   function persistState() {
@@ -1586,6 +1674,7 @@ export const HTML_PAGE = `<!doctype html>
         railOpen: _state.railOpen,
         sortMode: _state.sortMode,
         groupByProject: _state.groupByProject,
+        viewMode: _state.viewMode,
       }));
     } catch (e) {}
   }
@@ -2493,6 +2582,142 @@ export const HTML_PAGE = `<!doctype html>
     setTermTab(_state.termTab, true);
   }
 
+  // ---------- overview board ----------
+  // 三列状态分组的卡墙：一眼看全所有 session 在干嘛（借鉴 Symphony 看板的
+  // 「粗列分组 + 卡内实时活动行」）。数据全复用 _state.activityByPid，零后端改动。
+  var BOARD_COLS = [
+    { key: 'attention', label: '⏳ 等你',  statuses: ['waiting_ask', 'waiting_input'] },
+    { key: 'running',   label: '▶ 运行中', statuses: ['tool_running', 'thinking', 'waiting_tool'] },
+    { key: 'idle',      label: '○ 空闲',   statuses: ['idle', 'no_session', 'error'] },
+  ];
+  function boardColOf(status) {
+    for (var i = 0; i < BOARD_COLS.length; i++) {
+      if (BOARD_COLS[i].statuses.indexOf(status) >= 0) return BOARD_COLS[i].key;
+    }
+    return 'idle';
+  }
+  function ensureBoardCols() {
+    var host = document.getElementById('board-cols');
+    if (!host) return null;
+    if (host.querySelector('.board-col')) return host;
+    var h = '';
+    for (var i = 0; i < BOARD_COLS.length; i++) {
+      var col = BOARD_COLS[i];
+      h += '<div class="board-col" data-col="' + col.key + '">'
+        +    '<div class="board-col-hd"><span class="lbl">' + col.label + '</span><span class="gc" data-count>0</span></div>'
+        +    '<div class="board-col-body" data-body="' + col.key + '"></div>'
+        +  '</div>';
+    }
+    host.innerHTML = h;
+    return host;
+  }
+  function boardCardInner(it) {
+    var act = _state.activityByPid[it.pid] || {};
+    var view = statusView(act.status || 'idle');
+    var topic = act.title || railSub(it, act) || (it.cwd || '');
+    var s = '';
+    s += '<div class="bc-top">';
+    s +=   '<span class="bc-name">' + escape(tabName(it)) + '</span>';
+    s +=   '<span class="bc-badge" style="background:' + view.color + '20;color:' + view.color + '">' + view.icon + ' ' + escape(view.text) + '</span>';
+    s +=   '<span class="bc-age">' + escape(fmtAge(act.lastEventAt)) + '</span>';
+    s += '</div>';
+    s += '<div class="bc-topic" title="' + escape(topic) + '">' + escape(topic) + '</div>';
+    // 实时活动行：statusLabel 已含动作 + （等待类还含时长）。idle 状态只是
+    // "idle Xs"，右上角 age 已表达，省掉这行避免噪音。
+    var isIdle = act.status === 'idle' || act.status === 'no_session';
+    if (act.statusLabel && !isIdle) {
+      s += '<div class="bc-act">' + escape(act.statusLabel) + '</div>';
+    }
+    var foot = [];
+    var ctx = act.contextUsage;
+    if (ctx && ctx.percent != null) foot.push('ctx ' + (+ctx.percent).toFixed(0) + '%');
+    var su = act.sessionUsage;
+    if (su && su.costUSD != null) foot.push('$' + (+su.costUSD).toFixed(2));
+    if (foot.length) s += '<div class="bc-foot">' + escape(foot.join(' · ')) + '</div>';
+    return s;
+  }
+  function overviewSig() {
+    var list = _state.instances || [];
+    var parts = ['f=' + (_state.filter || ''), 'a=' + (_state.activePid || '')];
+    for (var i = 0; i < list.length; i++) {
+      var it = list[i], act = _state.activityByPid[it.pid] || {};
+      var ctx = act.contextUsage || {}, su = act.sessionUsage || {};
+      parts.push(it.pid + ':' + (act.status || '') + ':' + (act.statusLabel || '') + ':'
+        + (act.title || '') + ':' + (act.lastEventAt || '') + ':' + (ctx.percent || '') + ':'
+        + (su.costUSD || '') + ':' + (_state.answered[it.pid] ? 1 : 0) + ':' + tabName(it));
+    }
+    return parts.join('|');
+  }
+  function renderOverviewIfChanged() {
+    if (_state.viewMode !== 'overview') return;
+    if (overviewSig() === _state._overviewSig) return;
+    renderOverview();
+  }
+  function renderOverview() {
+    var host = ensureBoardCols();
+    if (!host) return;
+    var list = filteredInstances();
+    var buckets = { attention: [], running: [], idle: [] };
+    for (var i = 0; i < list.length; i++) {
+      var act = _state.activityByPid[list[i].pid] || {};
+      buckets[boardColOf(act.status || 'idle')].push(list[i]);
+    }
+    for (var c = 0; c < BOARD_COLS.length; c++) {
+      var col = BOARD_COLS[c];
+      var items = buckets[col.key].slice().sort(function(a, b) { return instanceSortKey(b) - instanceSortKey(a); });
+      var cnt = host.querySelector('[data-col="' + col.key + '"] [data-count]');
+      if (cnt) cnt.textContent = items.length;
+      var body = host.querySelector('[data-body="' + col.key + '"]');
+      if (!body) continue;
+      if (!items.length) { body.innerHTML = '<div class="board-empty">—</div>'; continue; }
+      reconcileRows(body, items, {
+        keyOf: function(it) { return it.pid; },
+        attrsOf: function(it) {
+          var v = statusView((_state.activityByPid[it.pid] || {}).status || 'idle');
+          return { 'data-pid': it.pid, 'style': 'border-left-color:' + v.dot };
+        },
+        classOf: function(it) {
+          var act = _state.activityByPid[it.pid] || {};
+          var cls = 'board-card';
+          if (it.pid === _state.activePid) cls += ' active';
+          if (act.status === 'waiting_ask' && !_state.answered[it.pid]) cls += ' needs-ask';
+          if (act.status === 'waiting_input') cls += ' waiting-input';
+          return cls;
+        },
+        sigOf: function(it) {
+          var act = _state.activityByPid[it.pid] || {};
+          var ctx = act.contextUsage || {}, su = act.sessionUsage || {};
+          return [act.status || '', act.statusLabel || '', act.title || '', act.lastEventAt || '',
+            ctx.percent || '', su.costUSD || '', it.pid === _state.activePid ? 1 : 0,
+            _state.answered[it.pid] ? 1 : 0, tabName(it)].join('|');
+        },
+        innerOf: boardCardInner,
+      });
+    }
+    _state._overviewSig = overviewSig();
+  }
+  // 切换 mc-grid(详情) / overview(总览) 的可见性 + toggle 按钮高亮（不 persist/render）。
+  function applyViewDom() {
+    var ov = document.getElementById('overview');
+    var grid = document.getElementById('mc-grid');
+    var isOv = _state.viewMode === 'overview';
+    if (ov) ov.hidden = !isOv;
+    if (grid) grid.hidden = isOv;
+    var tg = document.getElementById('view-toggle');
+    if (tg) [].forEach.call(tg.querySelectorAll('button'), function(b) {
+      b.classList.toggle('on', b.getAttribute('data-view') === _state.viewMode);
+    });
+  }
+  function setViewMode(mode) {
+    if (mode !== 'overview' && mode !== 'focus') return;
+    var changed = _state.viewMode !== mode;
+    _state.viewMode = mode;
+    if (changed) persistState();
+    applyViewDom();
+    if (mode === 'overview') { renderOverview(); }
+    else { renderFocusIfChanged(); rewireTerminalForActive(); }
+  }
+
   // ---------- per-instance actions ----------
   function copyText(text, btn, before, after) {
     if (!text) return;
@@ -3209,7 +3434,7 @@ export const HTML_PAGE = `<!doctype html>
         var host = (hub.lanUrl ? (function() { try { return new URL(hub.lanUrl).hostname; } catch (e) { return location.hostname; } })() : location.hostname);
         document.getElementById('srv').textContent = host + ':' + (hub.port || location.port);
       }
-      renderTabStrip(); renderRail(); renderFocusIfChanged();
+      renderTabStrip(); renderRail(); renderFocusIfChanged(); renderOverviewIfChanged();
       // Refresh activity immediately for any new instances
       if (prev.length !== _state.instances.length) refreshActivity();
     }).catch(function() {});
@@ -3231,7 +3456,7 @@ export const HTML_PAGE = `<!doctype html>
       // updates, but a notification bug must never block rendering — hence the guard.
       try { detectStatusTransitions(map); } catch (e) { console.warn('[NotifMgr] detect failed:', e && e.message); }
       // 3s 高频路径：只键控刷新会话卡 + 脏检查 focus，不重建 rail 静态区块。
-      renderTabStrip(); renderRailSessions(); renderFocusIfChanged(); renderAskAlert();
+      renderTabStrip(); renderRailSessions(); renderFocusIfChanged(); renderAskAlert(); renderOverviewIfChanged();
       refreshActivePidExtras();
     }).catch(function() {});
   }
@@ -3360,6 +3585,9 @@ export const HTML_PAGE = `<!doctype html>
     } else if (e.key === 'r' || e.key === 'R') {
       var ri = activeInst();
       if (ri && !ri.isHub) { e.preventDefault(); editAlias(ri); }
+    } else if (e.key === 'v' || e.key === 'V') {
+      e.preventDefault();
+      setViewMode(_state.viewMode === 'overview' ? 'focus' : 'overview');
     } else if (e.key === 'j' || e.key === 'n' || e.key === 'J' || e.key === 'N') {
       jumpNextAsk();
     }
@@ -3955,6 +4183,12 @@ export const HTML_PAGE = `<!doctype html>
       var card = e.target.closest('.rail-card[data-pid]');
       if (card) { setActive(+card.getAttribute('data-pid')); return; }
     });
+    // 看板卡点击：选中并切到详情视图（Symphony「扫一眼 → 点进去看 agent」）。
+    var board = document.getElementById('board-cols');
+    if (board) board.addEventListener('click', function(e) {
+      var bc = e.target.closest('.board-card[data-pid]');
+      if (bc) { setActive(+bc.getAttribute('data-pid')); setViewMode('focus'); }
+    });
   }
 
   // ---------- command palette (⌘K / Ctrl+K) ----------
@@ -4150,6 +4384,13 @@ export const HTML_PAGE = `<!doctype html>
     // Wire static interactions
     document.getElementById('btn-new').addEventListener('click', openNew);
     document.getElementById('ask-count').addEventListener('click', jumpNextAsk);
+    (function() {
+      var vt = document.getElementById('view-toggle');
+      if (vt) vt.addEventListener('click', function(e) {
+        var b = e.target.closest('button[data-view]');
+        if (b) setViewMode(b.getAttribute('data-view'));
+      });
+    })();
     document.getElementById('new-cancel').addEventListener('click', function() { document.getElementById('dlg').close(); });
     document.getElementById('new-launch').addEventListener('click', submitNew);
     document.getElementById('ccv-close').addEventListener('click', closeCcv);
@@ -4174,12 +4415,13 @@ export const HTML_PAGE = `<!doctype html>
       _state.filter = e.target.value;
       if (_filterDeb) clearTimeout(_filterDeb);
       // extras (历史/shell 历史) are filtered too — must re-render on filter change.
-      _filterDeb = setTimeout(function() { renderTabStrip(); renderRailSessions(); renderRailExtras(); }, 120);
+      _filterDeb = setTimeout(function() { renderTabStrip(); renderRailSessions(); renderRailExtras(); renderOverviewIfChanged(); }, 120);
     });
     wireDelegation();
     wireCmdAndOps();
     wireTermHandle();
     wireMobile();
+    applyViewDom(); // reflect persisted/default viewMode before first paint
     if (!_state.termOpen) {
       document.getElementById('term-panel').classList.add('collapsed');
       document.getElementById('term-toggle').textContent = '▴';
