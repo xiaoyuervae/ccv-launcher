@@ -838,6 +838,18 @@ export function backupMdBeforeWrite(absPath) {
   return backupPath;
 }
 
+// Fire-and-forget: tell a newly spawned ccv instance to skip its resume prompt
+// and start a fresh JSONL. 409 (already resolved / no resume state) is expected
+// when there's no old JSONL to resume from — silently ignored.
+function _autoResolveNew(port) {
+  fetch(`http://127.0.0.1:${port}/api/resume-choice`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ choice: 'new' }),
+    signal: AbortSignal.timeout(3000),
+  }).catch(() => {});
+}
+
 export async function doSpawn(targetCwd, { force = false, ccuseProfile = '', useWorktree = false, branchName = '', resumeSessionId = '' } = {}) {
   if (!targetCwd || typeof targetCwd !== 'string') throw new Error('cwd required');
   // Resuming pins a specific past session (-r <sid> passed through to claude).
@@ -940,6 +952,12 @@ export async function doSpawn(targetCwd, { force = false, ccuseProfile = '', use
     // we may not be able to SIGTERM child.pid directly later.
     if (wtInfo && entry && entry.pid) {
       _pidWorktrees.set(entry.pid, wtInfo);
+    }
+    // Auto-resolve ccv's resume prompt to "new" when the launcher explicitly
+    // requested a fresh session (force spawn without resume). Without this the
+    // ccv viewer shows the old session's conversation and waits for user input.
+    if (force && !resumeSessionId && entry && entry.port) {
+      _autoResolveNew(entry.port);
     }
     return entry;
   } catch (err) {

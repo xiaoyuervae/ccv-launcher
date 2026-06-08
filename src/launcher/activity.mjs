@@ -137,15 +137,24 @@ export function pickInstanceLogs(projectName, instances) {
         inWindow.sort((a, b) => b.mtime - a.mtime);
         pick = inWindow[0];
       } else {
-        // No new file in window → this peer must have resumed an older session.
-        const before = remaining.filter(c => c.fnameMs < start - PEER_PICKER_SLACK_MS);
+        // No new file in window → possibly a resumed older session, but only
+        // if the file was written to AFTER this instance started (proving the
+        // interceptor is actively appending to it). Without the mtime guard,
+        // a freshly spawned instance (whose JSONL hasn't been created yet)
+        // would incorrectly inherit a stale file from a previous session.
+        const before = remaining.filter(c =>
+          c.fnameMs < start - PEER_PICKER_SLACK_MS &&
+          c.mtime >= start - PEER_PICKER_SLACK_MS
+        );
         if (before.length) {
           before.sort((a, b) => b.fnameMs - a.fnameMs);
           pick = before[0];
         }
       }
     }
-    if (!pick) {
+    if (!pick && !start) {
+      // start===0 means no startedAt — can't do window math, just take the
+      // most recently written file as a best-effort guess.
       const sorted = [...remaining].sort((a, b) => b.mtime - a.mtime);
       pick = sorted[0];
     }

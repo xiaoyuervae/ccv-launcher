@@ -79,6 +79,27 @@ export function normalizeAlias(raw) {
   return out.trim().slice(0, 32);
 }
 
+// Per-instance (pid) aliases: volatile, in-memory only. Running sessions get
+// their own alias independent of the cwd-based workspace alias.
+const _instanceAliases = new Map();
+
+export function getInstanceAlias(pid) {
+  if (!pid) return '';
+  return _instanceAliases.get(pid) || '';
+}
+
+export function setInstanceAlias(pid, raw) {
+  if (!pid) return false;
+  const normalized = normalizeAlias(raw);
+  if (normalized) _instanceAliases.set(pid, normalized);
+  else _instanceAliases.delete(pid);
+  return true;
+}
+
+export function clearInstanceAlias(pid) {
+  _instanceAliases.delete(pid);
+}
+
 export function getAlias(cwd) {
   if (!cwd) return '';
   return loadPrefs().aliases[cwd] || '';

@@ -21,23 +21,45 @@ export const HTML_PAGE = `<!doctype html>
 <meta name="theme-color" content="#0d1117">
 <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
 <script>
-  // Lazy-load xterm only on viewports that show the docked terminal (>640px).
-  // Saves ~200KB + 3 cross-origin RTTs on mobile, where #term-panel is hidden.
+  // Lazy-load xterm on desktop, and expose the same loader for mobile sheets.
+  // The main UI awaits this before mounting a terminal so CDN latency cannot
+  // throw "Terminal is not defined" during first paint.
   (function() {
-    if (matchMedia('(max-width: 640px)').matches) return;
-    var head = document.head;
-    var css = document.createElement('link');
-    css.rel = 'stylesheet';
-    css.href = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css';
-    head.appendChild(css);
-    var s1 = document.createElement('script');
-    s1.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js';
-    s1.async = false;
-    head.appendChild(s1);
-    var s2 = document.createElement('script');
-    s2.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js';
-    s2.async = false;
-    head.appendChild(s2);
+    var XT_CSS = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css';
+    var XT_JS = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js';
+    var FIT_JS = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js';
+    function loadCssOnce(src) {
+      if (document.querySelector('link[href="' + src + '"]')) return;
+      var css = document.createElement('link');
+      css.rel = 'stylesheet';
+      css.href = src;
+      document.head.appendChild(css);
+    }
+    function loadScriptOnce(src) {
+      return new Promise(function(resolve, reject) {
+        var existing = document.querySelector('script[src="' + src + '"]');
+        if (existing) {
+          if (existing.dataset.ccvLoaded === '1') return resolve();
+          existing.addEventListener('load', function() { resolve(); }, { once: true });
+          existing.addEventListener('error', function() { reject(new Error('failed to load ' + src)); }, { once: true });
+          return;
+        }
+        var s = document.createElement('script');
+        s.src = src;
+        s.async = false;
+        s.addEventListener('load', function() { s.dataset.ccvLoaded = '1'; resolve(); }, { once: true });
+        s.addEventListener('error', function() { reject(new Error('failed to load ' + src)); }, { once: true });
+        document.head.appendChild(s);
+      });
+    }
+    window.__ccvLoadXterm = function() {
+      if (window.Terminal && window.FitAddon) return Promise.resolve();
+      if (window.__ccvXtermReady) return window.__ccvXtermReady;
+      loadCssOnce(XT_CSS);
+      window.__ccvXtermReady = loadScriptOnce(XT_JS).then(function() { return loadScriptOnce(FIT_JS); });
+      return window.__ccvXtermReady;
+    };
+    if (!matchMedia('(max-width: 640px)').matches) window.__ccvLoadXterm();
   })();
 </script>
 <style>
@@ -52,13 +74,14 @@ export const HTML_PAGE = `<!doctype html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body {
     background: var(--bg); color: var(--fg);
-    overflow-x: hidden; max-width: 100vw;
+    width: 100%; max-width: 100vw;
+    height: 100%; height: 100dvh;
+    overflow: hidden;
   }
   body {
     font: 13px/1.45 var(--sans);
-    min-height: 100vh; min-height: 100dvh;
+    min-height: 0;
     display: flex; flex-direction: column;
-    overflow-y: hidden;
   }
 
   /* ---------- app bar ---------- */
@@ -210,8 +233,9 @@ export const HTML_PAGE = `<!doctype html>
   /* ---------- main grid: rail + focus column ---------- */
   #mc-grid {
     flex: 1; display: grid;
-    grid-template-columns: 220px minmax(0, 1fr);
+    grid-template-columns: clamp(260px, 18vw, 340px) minmax(0, 1fr);
     min-height: 0; min-width: 0;
+    overflow: hidden;
   }
   #rail {
     background: var(--bg); padding: 10px 8px;
@@ -238,14 +262,17 @@ export const HTML_PAGE = `<!doctype html>
     background: var(--bg2);
     border: 1px solid var(--line);
     border-left: 2px solid var(--mute);
-    border-radius: 4px; padding: 6px 8px; cursor: pointer;
-    display: flex; flex-direction: column; gap: 2px;
+    border-radius: 4px; padding: 7px 8px 8px; cursor: pointer;
+    display: flex; flex-direction: column; gap: 4px;
   }
   .rail-card.active {
     background: var(--bg3); border-color: var(--accent);
   }
-  .rail-card .top { display: flex; align-items: center; gap: 5px; }
-  .rail-card .name { font-weight: 600; font-size: 11.5px; }
+  .rail-card .top { display: flex; align-items: center; gap: 5px; min-width: 0; }
+  .rail-card .name {
+    font-weight: 650; font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
   .rail-card .ask-pill {
     background: var(--ask); color: var(--bg); font-size: 9px; font-weight: 700;
     padding: 0 4px; border-radius: 6px;
@@ -254,6 +281,23 @@ export const HTML_PAGE = `<!doctype html>
   .rail-card .sub {
     color: var(--mute); font-size: 10px; line-height: 1.3;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .rail-card .purpose {
+    color: var(--fg); font-size: 11px; line-height: 1.35;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; text-overflow: ellipsis; word-break: break-word;
+  }
+  .rail-card .purpose .purpose-label {
+    color: var(--accent); font-size: 9px; font-weight: 750;
+    margin-right: 5px; text-transform: uppercase; font-family: var(--mono);
+  }
+  .rail-card .recent {
+    color: var(--mute); font-size: 10px; line-height: 1.3;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .rail-card .recent .recent-label {
+    color: var(--ok); font-size: 9px; font-weight: 700;
+    margin-right: 5px; font-family: var(--mono);
   }
   .rail-card.active .sub { color: var(--fg); }
 
@@ -354,13 +398,24 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   /* ---------- focus column ---------- */
-  /* #focus 占主体, 内部 overflow 滚; term-panel 固定 280px (用户可拖大). 这是
-     0cd30b5 之前的经典布局: busy focus 不会把 console 挤到只剩 1 行。
-     timeline 卡内部限高滚动, 避免单卡撑爆整列。 */
-  #focus-col { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
-  #focus { flex: 1 1 0; min-height: 0; min-width: 0; overflow: auto; }
-  .focus-inner { padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-  .focus-card.timeline-card .timeline { max-height: 38vh; overflow: auto; }
+  /* 详情页按自然流排布：focus 内容封顶滚动，terminal 紧跟 focus 后面。
+     JS 会在高屏上按可用高度动态放大 focus，优先露出真实内容而不是留下空洞。 */
+  #focus-col {
+    display: flex; flex-direction: column;
+    min-height: 0; min-width: 0;
+    overflow: hidden;
+  }
+  #focus {
+    flex: 0 0 auto;
+    min-height: 0; min-width: 0;
+    max-height: min(48vh, 560px);
+    overflow: auto;
+  }
+  .focus-inner {
+    padding: 14px 18px; display: flex; flex-direction: column; gap: 12px;
+    min-width: 0;
+  }
+  .focus-card.timeline-card .timeline { max-height: 26vh; overflow: auto; }
   .focus-hd { display: flex; flex-direction: column; gap: 3px; }
   .focus-hd .row1 { display: flex; align-items: center; gap: 8px; }
   .focus-hd h1 { font-size: 17px; font-weight: 600; letter-spacing: -.3px; margin: 0; }
@@ -386,6 +441,32 @@ export const HTML_PAGE = `<!doctype html>
   }
   .focus-hd .topic.recent { border-left-color: var(--ok); margin-top: 4px; }
   .focus-hd .topic.recent .topic-hd { color: var(--ok); }
+  .focus-purpose {
+    margin-top: 8px; padding: 11px 13px 12px;
+    background: var(--bg2); border: 1px solid var(--line);
+    border-left: 3px solid var(--accent); border-radius: 6px;
+  }
+  .focus-purpose .purpose-label {
+    color: var(--accent); font-size: 10px; font-weight: 750;
+    text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px;
+  }
+  .focus-purpose .purpose-text {
+    color: var(--fg); font-size: 15px; line-height: 1.45; font-weight: 650;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden; text-overflow: ellipsis; word-break: break-word;
+  }
+  .focus-purpose .purpose-recent {
+    margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line);
+    color: var(--mute); font-size: 12px; line-height: 1.4;
+    display: flex; gap: 8px; min-width: 0;
+  }
+  .focus-purpose .purpose-recent .recent-label {
+    color: var(--ok); font-size: 10px; font-weight: 700;
+    font-family: var(--mono); flex-shrink: 0;
+  }
+  .focus-purpose .purpose-recent .recent-text {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .status-badge {
     font-size: 10px; font-weight: 700; padding: 2px 8px;
     border-radius: 10px; font-family: var(--mono);
@@ -496,7 +577,7 @@ export const HTML_PAGE = `<!doctype html>
   .ask-btn:disabled { opacity: .5; cursor: wait; }
 
   .stat-grid {
-    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px;
   }
   .stat-box {
     background: var(--bg2); border: 1px solid var(--line);
@@ -559,13 +640,24 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   /* ---------- bottom terminal panel ---------- */
-  /* 固定 280px (用户拖 #term-handle 可覆盖到接近窗口高度). Collapsed → 32px. */
+  /* Terminal follows the detail content and stays compact by default. Dragging
+     the handle writes an inline height; flex stays auto so stale flex-basis
+     cannot make the panel consume the page. */
   #term-panel {
     border-top: 1px solid var(--line); background: var(--term);
     display: flex; flex-direction: column;
-    flex: 0 0 280px; min-height: 0; transition: flex-basis .15s;
+    flex: 1 1 auto;
+    min-height: 170px;
+    transition: height .15s;
   }
-  #term-panel.collapsed { flex: 0 0 32px; }
+  #term-panel:not(.manual-size):not(.collapsed) {
+    flex: 1 1 auto !important;
+    min-height: 170px !important;
+  }
+  #term-panel.collapsed {
+    flex: 0 0 auto;
+    height: 32px; min-height: 32px; max-height: 32px;
+  }
   #term-handle {
     height: 4px; cursor: ns-resize;
     background: linear-gradient(180deg, var(--bg2), transparent);
@@ -616,7 +708,7 @@ export const HTML_PAGE = `<!doctype html>
   .term-pane.active { display: flex; }
   .term-xterm-host {
     flex: 1; min-height: 0;
-    padding: 6px 8px;
+    padding: 5px 8px;
   }
   .term-logs-host {
     flex: 1; min-height: 0; overflow: auto;
@@ -829,12 +921,29 @@ export const HTML_PAGE = `<!doctype html>
     #app-bar .grow { flex: 1; }
     #app-bar .logo { width: 28px; height: 28px; font-size: 13px; }
     #app-bar .stat-cost, #app-bar .stat-quota {
-      font-size: 11px; padding: 4px 8px;
+      font-size: 11px; padding: 4px 7px;
+      flex-shrink: 0; white-space: nowrap;
     }
-    #btn-new {
-      padding: 9px 14px; font-size: 13px; font-weight: 700;
-      min-height: 36px;
+    #app-bar .stat-cost .lbl,
+    #app-bar .stat-quota .lbl {
+      display: none;
     }
+    #app-bar .stat-quota {
+      max-width: 112px; gap: 4px;
+    }
+    #app-bar .stat-quota .val {
+      white-space: nowrap;
+    }
+    #app-bar #view-toggle {
+      display: none;
+    }
+    #app-bar #btn-new {
+      width: 42px; min-width: 42px; height: 36px;
+      padding: 0; font-size: 0; line-height: 1;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+    #app-bar #btn-new::before { content: '+'; font-size: 20px; font-weight: 800; }
+    #app-bar #ask-count { width: 34px; height: 36px; padding: 0; }
     #app-bar #btn-notif {
       width: 36px; height: 36px; font-size: 16px;
     }
@@ -896,8 +1005,15 @@ export const HTML_PAGE = `<!doctype html>
     #mc-grid { grid-template-columns: 1fr; }
     #rail { display: none; }
     #term-panel { display: none; }
-    #focus { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
-    .focus-inner { padding: 12px 14px; gap: 10px; }
+    #focus {
+      max-height: none;
+      overflow: auto;
+      padding-bottom: calc(96px + env(safe-area-inset-bottom));
+    }
+    /* 手机：无 docked terminal，恢复自然流——timeline 不 grow/不内部滚，整页滚动 */
+    .focus-inner { padding: 12px 14px; gap: 10px; min-height: 0; }
+    .focus-card.timeline-card { flex: 0 0 auto; min-height: 0; }
+    .focus-card.timeline-card .timeline { flex: none; min-height: 0; max-height: none; overflow: visible; }
     .focus-hd h1 { font-size: 16px; }
 
     /* Header: hide redundant "Open ccv" + pid/port meta + row1 status badge
@@ -908,6 +1024,14 @@ export const HTML_PAGE = `<!doctype html>
     .focus-hd .row1 .status-badge { display: none; }
     .focus-hd .row1 { gap: 10px; row-gap: 6px; flex-wrap: wrap; }
     .focus-hd h1 { font-size: 18px; line-height: 1.25; }
+    .focus-purpose { padding: 10px 12px 11px; }
+    .focus-purpose .purpose-text {
+      font-size: 14px; -webkit-line-clamp: 4;
+    }
+    .focus-purpose .purpose-recent .recent-text {
+      white-space: normal;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    }
 
     /* Topic quotes (第一条 / 最近一条): clamp to 1 line, tap to expand.
        Current Chromium aliases display:-webkit-box to flow-root, which
@@ -1166,14 +1290,16 @@ export const HTML_PAGE = `<!doctype html>
   #mc-grid[hidden], #overview[hidden] { display: none; }
   #overview { flex: 1; min-height: 0; min-width: 0; overflow: auto; background: var(--bg); }
   .board {
-    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
     gap: 12px; padding: 14px 16px; align-items: start; min-width: 0;
+    max-width: 1480px;
   }
   .board-col {
     background: var(--bg); border: 1px solid var(--line);
     border-radius: 8px; padding: 8px; min-width: 0;
     display: flex; flex-direction: column; gap: 6px;
   }
+  .board-col.empty { display: none; }
   .board-col-hd {
     display: flex; align-items: center; gap: 6px;
     color: var(--mute); font-size: 10px; text-transform: uppercase;
@@ -1190,7 +1316,7 @@ export const HTML_PAGE = `<!doctype html>
     background: var(--bg2); border: 1px solid var(--line);
     border-left: 3px solid var(--mute);
     border-radius: 6px; padding: 9px 11px; cursor: pointer;
-    display: flex; flex-direction: column; gap: 5px; min-width: 0;
+    display: flex; flex-direction: column; gap: 7px; min-width: 0;
   }
   .board-card:hover { border-color: var(--accent); }
   .board-card.active { border-color: var(--accent); background: var(--bg3); }
@@ -1216,16 +1342,70 @@ export const HTML_PAGE = `<!doctype html>
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
     overflow: hidden; text-overflow: ellipsis; word-break: break-word;
   }
+  .board-card .bc-purpose {
+    border-left: 2px solid rgba(88,166,255,.55);
+    padding-left: 8px; min-width: 0;
+  }
+  .board-card .bc-label {
+    display: block; color: var(--accent); font-size: 9px;
+    font-family: var(--mono); font-weight: 750; text-transform: uppercase;
+    margin-bottom: 2px;
+  }
+  .board-card .bc-purpose-text {
+    color: var(--fg); font-size: 12.5px; line-height: 1.42; font-weight: 650;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden; text-overflow: ellipsis; word-break: break-word;
+  }
+  .board-card .bc-recent {
+    color: var(--mute); font-size: 11px; line-height: 1.35;
+    display: flex; gap: 7px; min-width: 0;
+  }
+  .board-card .bc-recent .bc-label {
+    color: var(--ok); margin-bottom: 0; flex-shrink: 0;
+  }
+  .board-card .bc-recent-text {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .board-card .bc-act {
     color: var(--warn); font-size: 11px; font-family: var(--mono); line-height: 1.35;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .board-card .bc-meta {
+    display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+  }
+  .board-card .bc-chip {
+    color: var(--mute); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 4px;
+    padding: 1px 5px; font-size: 10px; font-family: var(--mono);
+  }
   .board-card .bc-foot { color: var(--mute); font-size: 10px; font-family: var(--mono); }
+  .board-card .bc-path {
+    color: var(--mute); font-size: 10px; font-family: var(--mono);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .board-card .bc-ask-actions {
+    display: flex; gap: 6px; flex-wrap: wrap; margin-top: 1px;
+  }
+  .board-card .bc-ask-btn {
+    background: rgba(248,81,73,.16); color: var(--fg);
+    border: 1px solid rgba(248,81,73,.38); border-radius: 5px;
+    padding: 4px 8px; font-size: 11px; line-height: 1.25;
+    cursor: pointer; font-weight: 600; min-height: 26px;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .board-card .bc-ask-btn.primary {
+    background: var(--ask); color: var(--bg); border-color: var(--ask);
+  }
+  .board-card .bc-ask-btn.secondary {
+    background: var(--bg3); color: var(--fg); border-color: var(--line);
+  }
+  .board-card .bc-ask-btn:hover { opacity: .92; }
+  .board-card .bc-ask-btn:disabled { opacity: .5; cursor: wait; }
   @media (max-width: 640px) {
     .board { grid-template-columns: 1fr; gap: 10px; padding: 12px; }
     .board-card { padding: 11px 13px; }
     .board-card .bc-name { font-size: 13.5px; }
-    .board-card .bc-topic { font-size: 13px; }
+    .board-card .bc-topic, .board-card .bc-purpose-text { font-size: 13px; }
     .board-card .bc-act { font-size: 12px; }
   }
 </style>
@@ -1616,7 +1796,7 @@ export const HTML_PAGE = `<!doctype html>
     activePid: null,
     termTab: 'console',
     termOpen: true,
-    termHeight: 280,
+    termHeight: null,       // null = compact CSS default; number = user-resized
     answered: {},           // pid -> { askId, label }
     instances: [],          // /api/launcher/list payload
     activityByPid: {},      // pid -> activity entry
@@ -1653,7 +1833,9 @@ export const HTML_PAGE = `<!doctype html>
       if (p.activePid) _state.activePid = +p.activePid || null;
       if (p.termTab) _state.termTab = p.termTab;
       if (typeof p.termOpen === 'boolean') _state.termOpen = p.termOpen;
-      if (p.termHeight && p.termHeight >= 80 && p.termHeight <= 2000) _state.termHeight = p.termHeight;
+      // Layout changed to compact terminal placement. Ignore stored heights so
+      // stale localStorage cannot keep the terminal oversized after refresh.
+      _state.termHeight = null;
       if (p.railOpen && typeof p.railOpen === 'object') {
         _state.railOpen.hist = !!p.railOpen.hist;
         _state.railOpen.untracked = !!p.railOpen.untracked;
@@ -1791,6 +1973,48 @@ export const HTML_PAGE = `<!doctype html>
   // ---------- render: tab strip ----------
   // 点击通过 #tab-strip 上的委托监听（见 wireDelegation）分发，这里只做键控渲染。
   function tabName(it) { return it.alias || it.displayName || it.projectName || (it.cwd ? it.cwd.split('/').pop() : '?'); }
+  function compactText(s) {
+    return String(s == null ? '' : s).replace(/\\s+/g, ' ').trim();
+  }
+  function cleanPromptText(s) {
+    var t = compactText(s).replace(/^user:\\s*/i, '');
+    if (/^Caveat:\\s*The messages below were generated by the user while running local commands\\./i.test(t)) return '';
+    return t;
+  }
+  function shortPathLabel(cwd) {
+    var c = compactText(cwd);
+    if (!c) return '';
+    return c.replace(/^\\/Users\\/[^/]+/, '~');
+  }
+  function sessionPurpose(it, act) {
+    var title = cleanPromptText(act && act.title);
+    if (title) return { text: title, source: 'purpose' };
+    var preview = cleanPromptText(act && act.preview);
+    if (preview) return { text: preview, source: 'recent' };
+    if (it && it.isHub) return { text: 'Launcher hub 服务', source: 'system' };
+    var path = shortPathLabel(it && it.cwd);
+    if (path) return { text: path, source: 'path' };
+    return { text: tabName(it || {}), source: 'name' };
+  }
+  function sessionRecent(act) {
+    var title = cleanPromptText(act && act.title);
+    var preview = cleanPromptText(act && act.preview);
+    if (preview && preview !== title) return preview;
+    var events = (act && act.recentEvents) || [];
+    for (var i = 0; i < events.length; i++) {
+      var ev = events[i] || {};
+      var t = cleanPromptText(ev.userPrompt) || cleanPromptText(ev.assistantText);
+      if (t && t !== title && t !== preview) return t;
+    }
+    return '';
+  }
+  function purposeLabel(source) {
+    if (source === 'recent') return '最近';
+    if (source === 'system') return '系统';
+    if (source === 'path') return '路径';
+    if (source === 'name') return '名称';
+    return '目的';
+  }
   function renderTabStrip() {
     var strip = document.getElementById('tab-strip');
     if (!strip) return;
@@ -1909,7 +2133,7 @@ export const HTML_PAGE = `<!doctype html>
   function renderRail() { renderRailSessions(); renderRailExtras(); }
 
   function railSub(it, act) {
-    return act.title || (act.preview ? act.preview.replace(/^user:\s*/, '') : '') || (it.cwd || '').split('/').slice(-2).join('/');
+    return sessionPurpose(it, act).text;
   }
   // 会话区头部（标签 + 排序下拉 + 分组开关）只建一次并就地复用，避免高频轮询
   // 重建控件、丢焦点。控件自身 stopPropagation，不触发 #rail 委托。
@@ -1986,16 +2210,22 @@ export const HTML_PAGE = `<!doctype html>
         var active = it.pid === _state.activePid;
         var needsAsk = act.status === 'waiting_ask' && !_state.answered[it.pid];
         var pinned = active && _state._activeFilteredOut;
-        return [act.status || 'idle', view.dot, active ? 1 : 0, needsAsk ? 1 : 0, tabName(it), railSub(it, act), fmtAge(act.lastEventAt), pinned ? 1 : 0].join('|');
+        var purpose = sessionPurpose(it, act);
+        return [act.status || 'idle', view.dot, active ? 1 : 0, needsAsk ? 1 : 0, tabName(it), purpose.text, purpose.source, sessionRecent(act), fmtAge(act.lastEventAt), pinned ? 1 : 0].join('|');
       },
       innerOf: function(it) {
         if (it.__group) return '<span>' + escape(it.__group) + '</span><span class="gc">' + it.count + '</span>';
         var act = _state.activityByPid[it.pid] || {};
         var needsAsk = act.status === 'waiting_ask' && !_state.answered[it.pid];
+        var purpose = sessionPurpose(it, act);
+        var recent = sessionRecent(act);
         var h = '<div class="top"><span class="name">' + escape(tabName(it)) + '</span>';
         if (needsAsk) h += '<span class="ask-pill">!</span>';
         h += '<span class="age">' + escape(fmtAge(act.lastEventAt)) + '</span></div>';
-        h += '<div class="sub">' + escape(railSub(it, act) || '—') + '</div>';
+        h += '<div class="purpose" title="' + escape(purpose.text || '') + '"><span class="purpose-label">' + escape(purposeLabel(purpose.source)) + '</span>' + escape(purpose.text || '—') + '</div>';
+        if (recent && recent !== purpose.text) {
+          h += '<div class="recent" title="' + escape(recent) + '"><span class="recent-label">最近</span>' + escape(recent) + '</div>';
+        }
         return h;
       },
     });
@@ -2107,11 +2337,11 @@ export const HTML_PAGE = `<!doctype html>
     } else {
       for (var i = 0; i < entry.items.length; i++) {
         var s = entry.items[i];
-        var preview = (s.firstUser || '').slice(0, 80);
+        var preview = cleanPromptText(s.firstUser || '').slice(0, 120);
         var sidShort = (s.sessionId || '').slice(0, 8);
         var ageStr = fmtAge(new Date(s.mtimeMs).toISOString());
         html += '<div class="rail-sess-card" data-cwd="' + escape(cwd) + '" data-sid="' + escape(s.sessionId) + '" title="resume session ' + escape(s.sessionId) + '">';
-        html += '<div class="preview' + (preview ? '' : ' empty') + '">' + escape(preview || '(无 user 消息)') + '</div>';
+        html += '<div class="preview' + (preview ? '' : ' empty') + '">' + escape(preview || '(无明确创建目的)') + '</div>';
         html += '<div class="meta"><span class="sid">' + escape(sidShort) + '</span>';
         if (s.gitBranch) html += '<span>' + escape(s.gitBranch) + '</span>';
         html += '<span class="age">' + escape(ageStr) + '</span></div>';
@@ -2190,11 +2420,16 @@ export const HTML_PAGE = `<!doctype html>
     if (!inst) return '__none__';
     var edits = _state.editsByPid[inst.pid], git = _state.gitByPid[inst.pid];
     var ctx = act.contextUsage, su = act.sessionUsage, cs = act.compactStatus;
+    var askList = extractAsks(act);
+    var ask0 = askList[0] || {};
+    var askChoices = (ask0.choices || []).map(function(c) { return c.label; }).join(',');
+    var purpose = sessionPurpose(inst, act);
     return [
       inst.pid, inst.alias || '', inst.ccuseProfile || '', inst.worktree ? (inst.worktree.branch || 1) : '',
       act.status || '', act.lastEventAt || '', act.statusLabel || '',
-      act.title || '', act.preview || '',
-      extractAsks(act).length, _state.answered[inst.pid] ? (_state.answered[inst.pid].label || 1) : 0,
+      purpose.text || '', purpose.source || '', act.title || '', act.preview || '', sessionRecent(act),
+      askList.length, ask0.id || '', ask0.question || '', askChoices,
+      _state.answered[inst.pid] ? (_state.answered[inst.pid].label || 1) : 0,
       ctx ? ctx.percent : '', su ? su.costUSD : '', su ? su.requestCount : '', cs ? cs.recommended : '',
       (act.recentEvents || []).length,
       edits ? edits.fetchedAt : 0, git ? git.fetchedAt : 0,
@@ -2203,18 +2438,63 @@ export const HTML_PAGE = `<!doctype html>
   function renderFocusIfChanged() {
     var inst = _state.instances.find(function(x) { return x.pid === _state.activePid; });
     var sig = focusSig(inst, inst ? (_state.activityByPid[inst.pid] || {}) : {});
-    if (sig === _state._focusSig) return;
+    if (sig === _state._focusSig) { scheduleDetailLayoutBalance(); return; }
     renderFocus();
+  }
+  function canInlineAsk(a) {
+    return a && !a.multiSelect && !((a.questionCount || 0) > 1);
+  }
+  function renderAskCardHtml(inst, asks, answered) {
+    var html = '';
+    if (asks.length > 0 && !answered) {
+      var a = asks[0];
+      var inlineAnswerable = canInlineAsk(a);
+      html += '<div class="focus-card ask">';
+      html += '<div class="card-hd">⏳ ccv 在等你回答</div>';
+      html += '<div class="ask-q">' + escape(a.question) + '</div>';
+      if (a.context) html += '<div class="ask-ctx">' + escape(a.context) + '</div>';
+      html += '<div class="ask-choices">';
+      if (a.choices.length && inlineAnswerable) {
+        for (var i = 0; i < a.choices.length; i++) {
+          var c = a.choices[i];
+          html += '<button class="ask-btn' + (i === 0 ? ' primary' : '') + '" data-act="answer-ask" data-ask="' + escape(a.id || '') + '" data-idx="' + i + '" data-label="' + escape(c.label) + '" data-qtext="' + escape(a.rawQuestion || '') + '"' + (c.description ? ' title="' + escape(c.description) + '"' : '') + '>' + escape(c.label) + '</button>';
+        }
+        html += '<button class="ask-btn" data-act="open-ccv" title="在 ccv 内查看完整上下文 / 选 Other">↗</button>';
+      } else if (a.choices.length) {
+        for (var j = 0; j < a.choices.length; j++) {
+          var cc = a.choices[j];
+          html += '<button class="ask-btn' + (j === 0 ? ' primary' : '') + '" data-act="open-ccv"' + (cc.description ? ' title="' + escape(cc.description) + '"' : '') + '>' + escape(cc.label) + ' ↗</button>';
+        }
+      } else {
+        html += '<button class="ask-btn primary" data-act="open-ccv">在 ccv 内回答 ↗</button>';
+      }
+      html += '</div>';
+      if (a.multiSelect) {
+        html += '<div class="ask-ctx" style="margin-top:8px;margin-bottom:0">多选题，跳到 ccv 页面勾选</div>';
+      } else if ((a.questionCount || 0) > 1) {
+        html += '<div class="ask-ctx" style="margin-top:8px;margin-bottom:0">本次问了 ' + (a.questionCount || 0) + ' 个问题，跳到 ccv 页面一起回答</div>';
+      }
+      html += '</div>';
+    } else if (answered) {
+      html += '<div class="focus-card ok">';
+      html += '<span style="color:var(--ok)">✓</span>';
+      html += '<span style="font-size:12px">已回复 <b>' + escape(answered.label) + '</b> · 发送给 ccv :' + (inst.port || '?') + '</span>';
+      html += '</div>';
+    }
+    return html;
   }
   function renderFocus() {
     var el = document.getElementById('focus');
     if (!el) return;
+    if (el.querySelector('input:focus, textarea:focus')) return;
     var inst = _state.instances.find(function(x) { return x.pid === _state.activePid; });
     if (!inst) { el.innerHTML = '<div class="empty">选择左侧一个会话查看详情 · 按 <kbd>c</kbd> 新建</div>'; _state._focusSig = '__none__'; return; }
     var act = _state.activityByPid[inst.pid] || {};
     var view = statusView(act.status || 'idle');
     var asks = extractAsks(act);
     var answered = _state.answered[inst.pid];
+    var purpose = sessionPurpose(inst, act);
+    var recent = sessionRecent(act);
 
     var html = '<div class="focus-inner">';
 
@@ -2257,68 +2537,24 @@ export const HTML_PAGE = `<!doctype html>
       html += '<span style="flex:1"></span>';
       html += '</div>';
     }
-    if (act.title) {
-      html += '<div class="topic" title="' + escape(act.title) + '">';
-      html += '<span class="topic-hd">第一条信息</span>' + escape(act.title);
-      html += '</div>';
-    }
-    var lastMsg = (act.preview || '').replace(/^user:\\s*/, '').trim();
-    if (lastMsg && lastMsg !== act.title) {
-      html += '<div class="topic recent" title="' + escape(lastMsg) + '">';
-      html += '<span class="topic-hd">最近一条</span>' + escape(lastMsg);
-      html += '</div>';
+    html += '<div class="focus-purpose" title="' + escape(purpose.text || '') + '">';
+    html += '<div class="purpose-label">' + escape(purpose.source === 'purpose' ? '创建目的' : purposeLabel(purpose.source)) + '</div>';
+    html += '<div class="purpose-text">' + escape(purpose.text || '—') + '</div>';
+    if (recent && recent !== purpose.text) {
+      html += '<div class="purpose-recent" title="' + escape(recent) + '"><span class="recent-label">最近</span><span class="recent-text">' + escape(recent) + '</span></div>';
     }
     html += '</div>';
+    html += '</div>';
+
+    // 最需要处理的内容优先露出，避免被底部 Console 挤到首屏下方。
+    html += renderAskCardHtml(inst, asks, answered);
 
     // 现在在做
-    if (act.statusLabel) {
+    var passiveStatus = act.status === 'idle' || act.status === 'no_session';
+    if (act.statusLabel && !passiveStatus) {
       html += '<div class="focus-card accent">';
       html += '<div class="card-hd">现在在做的事</div>';
       html += '<div class="card-title">' + escape(act.statusLabel) + '</div>';
-      html += '</div>';
-    }
-
-    // ask card
-    if (asks.length > 0 && !answered) {
-      var a = asks[0];
-      // multi-select 没法用单按钮回，回退到跳 ccv 的旧行为
-      // multi-question (a.questions.length > 1)：launcher inline 只展示 q[0]，
-      // 直接答会丢 q[1..N] —— 后端 answers map 残缺导致 ccv 那侧渲染错乱，
-      // 同样退回到跳 ccv。
-      var multi = !!a.multiSelect;
-      var multiQ = (a.questionCount || 0) > 1;
-      var inlineAnswerable = !multi && !multiQ;
-      html += '<div class="focus-card ask">';
-      html += '<div class="card-hd">⏳ ccv 在等你回答</div>';
-      html += '<div class="ask-q">' + escape(a.question) + '</div>';
-      if (a.context) html += '<div class="ask-ctx">' + escape(a.context) + '</div>';
-      html += '<div class="ask-choices">';
-      if (a.choices.length && inlineAnswerable) {
-        for (var i = 0; i < a.choices.length; i++) {
-          var c = a.choices[i];
-          html += '<button class="ask-btn' + (i === 0 ? ' primary' : '') + '" data-act="answer-ask" data-ask="' + escape(a.id || '') + '" data-idx="' + i + '" data-label="' + escape(c.label) + '" data-qtext="' + escape(a.rawQuestion || '') + '"' + (c.description ? ' title="' + escape(c.description) + '"' : '') + '>' + escape(c.label) + '</button>';
-        }
-        html += '<button class="ask-btn" data-act="open-ccv" title="在 ccv 内查看完整上下文 / 选 Other">↗</button>';
-      } else if (a.choices.length) {
-        // multi-select 或 multi-question：保留跳 ccv 的入口（直接答需要更复杂的 UI）
-        for (var j = 0; j < a.choices.length; j++) {
-          var cc = a.choices[j];
-          html += '<button class="ask-btn' + (j === 0 ? ' primary' : '') + '" data-act="open-ccv"' + (cc.description ? ' title="' + escape(cc.description) + '"' : '') + '>' + escape(cc.label) + ' ↗</button>';
-        }
-      } else {
-        html += '<button class="ask-btn primary" data-act="open-ccv">在 ccv 内回答 ↗</button>';
-      }
-      html += '</div>';
-      if (multi) {
-        html += '<div class="ask-ctx" style="margin-top:8px;margin-bottom:0">多选题，跳到 ccv 页面勾选</div>';
-      } else if (multiQ) {
-        html += '<div class="ask-ctx" style="margin-top:8px;margin-bottom:0">本次问了 ' + (a.questionCount || 0) + ' 个问题，跳到 ccv 页面一起回答</div>';
-      }
-      html += '</div>';
-    } else if (answered) {
-      html += '<div class="focus-card ok">';
-      html += '<span style="color:var(--ok)">✓</span>';
-      html += '<span style="font-size:12px">已回复 <b>' + escape(answered.label) + '</b> · 发送给 ccv :' + (inst.port || '?') + '</span>';
       html += '</div>';
     }
 
@@ -2400,9 +2636,7 @@ export const HTML_PAGE = `<!doctype html>
     }
 
     // recent activity timeline (from activity payload's recentEvents).
-    // Marked .timeline-card so it grows to fill leftover #focus height and
-    // scrolls internally — keeps focus pane visually full even when other
-    // sections are sparse (e.g. fresh session, no edits, no worktree).
+    // The list scrolls internally so it cannot push the compact terminal down.
     var events = act.recentEvents || [];
     if (events.length) {
       html += '<div class="focus-card timeline-card">';
@@ -2469,6 +2703,7 @@ export const HTML_PAGE = `<!doctype html>
     });
     // 更新脏检查基线，使后续 renderFocusIfChanged 能正确跳过未变化的轮询。
     _state._focusSig = focusSig(inst, act);
+    scheduleDetailLayoutBalance();
   }
 
   // ---------- answer ask ----------
@@ -2542,7 +2777,12 @@ export const HTML_PAGE = `<!doctype html>
     var base = _state.instances;
     if (q) {
       base = base.filter(function(it) {
-        var hay = [it.displayName, it.projectName, it.alias, it.cwd, (it.tags || []).join(' ')].join(' ').toLowerCase();
+        var act = _state.activityByPid[it.pid] || {};
+        var purpose = sessionPurpose(it, act);
+        var hay = [
+          it.displayName, it.projectName, it.alias, it.cwd, (it.tags || []).join(' '),
+          purpose.text, sessionRecent(act), act.statusLabel, act.preview
+        ].join(' ').toLowerCase();
         return q.split(/\\s+/).every(function(t) { return hay.indexOf(t) >= 0; });
       });
     }
@@ -2614,14 +2854,23 @@ export const HTML_PAGE = `<!doctype html>
   function boardCardInner(it) {
     var act = _state.activityByPid[it.pid] || {};
     var view = statusView(act.status || 'idle');
-    var topic = act.title || railSub(it, act) || (it.cwd || '');
+    var purpose = sessionPurpose(it, act);
+    var recent = sessionRecent(act);
+    var asks = extractAsks(act);
+    var ask = (!_state.answered[it.pid] && act.status === 'waiting_ask' && asks.length) ? asks[0] : null;
     var s = '';
     s += '<div class="bc-top">';
     s +=   '<span class="bc-name">' + escape(tabName(it)) + '</span>';
     s +=   '<span class="bc-badge" style="background:' + view.color + '20;color:' + view.color + '">' + view.icon + ' ' + escape(view.text) + '</span>';
     s +=   '<span class="bc-age">' + escape(fmtAge(act.lastEventAt)) + '</span>';
     s += '</div>';
-    s += '<div class="bc-topic" title="' + escape(topic) + '">' + escape(topic) + '</div>';
+    s += '<div class="bc-purpose" title="' + escape(purpose.text || '') + '">';
+    s +=   '<span class="bc-label">' + escape(purposeLabel(purpose.source)) + '</span>';
+    s +=   '<div class="bc-purpose-text">' + escape(purpose.text || '—') + '</div>';
+    s += '</div>';
+    if (recent && recent !== purpose.text) {
+      s += '<div class="bc-recent" title="' + escape(recent) + '"><span class="bc-label">最近</span><span class="bc-recent-text">' + escape(recent) + '</span></div>';
+    }
     // 实时活动行：statusLabel 已含动作 + （等待类还含时长）。idle 状态只是
     // "idle Xs"，右上角 age 已表达，省掉这行避免噪音。
     var isIdle = act.status === 'idle' || act.status === 'no_session';
@@ -2629,11 +2878,32 @@ export const HTML_PAGE = `<!doctype html>
       s += '<div class="bc-act">' + escape(act.statusLabel) + '</div>';
     }
     var foot = [];
+    if (it.port) foot.push(':' + it.port);
+    if (it.ccuseProfile) foot.push(it.ccuseProfile);
     var ctx = act.contextUsage;
     if (ctx && ctx.percent != null) foot.push('ctx ' + (+ctx.percent).toFixed(0) + '%');
     var su = act.sessionUsage;
     if (su && su.costUSD != null) foot.push('$' + (+su.costUSD).toFixed(2));
-    if (foot.length) s += '<div class="bc-foot">' + escape(foot.join(' · ')) + '</div>';
+    if (foot.length) {
+      s += '<div class="bc-meta">';
+      for (var f = 0; f < foot.length; f++) s += '<span class="bc-chip">' + escape(foot[f]) + '</span>';
+      s += '</div>';
+    }
+    var path = shortPathLabel(it.cwd || '');
+    if (path) s += '<div class="bc-path" title="' + escape(it.cwd || '') + '">' + escape(path) + '</div>';
+    if (ask) {
+      s += '<div class="bc-ask-actions">';
+      if (canInlineAsk(ask) && ask.choices.length) {
+        for (var i = 0; i < Math.min(2, ask.choices.length); i++) {
+          var c = ask.choices[i];
+          s += '<button type="button" class="bc-ask-btn' + (i === 0 ? ' primary' : '') + '" data-pid="' + it.pid + '" data-ask="' + escape(ask.id || '') + '" data-idx="' + i + '" data-label="' + escape(c.label) + '" data-qtext="' + escape(ask.rawQuestion || '') + '"' + (c.description ? ' title="' + escape(c.description) + '"' : '') + '>' + escape(c.label) + '</button>';
+        }
+        s += '<button type="button" class="bc-ask-btn secondary" data-open-pid="' + it.pid + '" title="在 ccv 内查看完整问题">↗</button>';
+      } else {
+        s += '<button type="button" class="bc-ask-btn primary" data-open-pid="' + it.pid + '">在 ccv 内回答 ↗</button>';
+      }
+      s += '</div>';
+    }
     return s;
   }
   function overviewSig() {
@@ -2642,9 +2912,12 @@ export const HTML_PAGE = `<!doctype html>
     for (var i = 0; i < list.length; i++) {
       var it = list[i], act = _state.activityByPid[it.pid] || {};
       var ctx = act.contextUsage || {}, su = act.sessionUsage || {};
+      var asks = extractAsks(act), ask = asks[0] || {};
+      var purpose = sessionPurpose(it, act);
       parts.push(it.pid + ':' + (act.status || '') + ':' + (act.statusLabel || '') + ':'
-        + (act.title || '') + ':' + (act.lastEventAt || '') + ':' + (ctx.percent || '') + ':'
-        + (su.costUSD || '') + ':' + (_state.answered[it.pid] ? 1 : 0) + ':' + tabName(it));
+        + purpose.text + ':' + purpose.source + ':' + (act.preview || '') + ':' + sessionRecent(act) + ':' + (act.lastEventAt || '') + ':' + (ctx.percent || '') + ':'
+        + (su.costUSD || '') + ':' + (ask.id || '') + ':' + (ask.question || '') + ':'
+        + (_state.answered[it.pid] ? 1 : 0) + ':' + tabName(it));
     }
     return parts.join('|');
   }
@@ -2665,6 +2938,8 @@ export const HTML_PAGE = `<!doctype html>
     for (var c = 0; c < BOARD_COLS.length; c++) {
       var col = BOARD_COLS[c];
       var items = buckets[col.key].slice().sort(function(a, b) { return instanceSortKey(b) - instanceSortKey(a); });
+      var colEl = host.querySelector('[data-col="' + col.key + '"]');
+      if (colEl) colEl.classList.toggle('empty', !items.length && list.length > 0);
       var cnt = host.querySelector('[data-col="' + col.key + '"] [data-count]');
       if (cnt) cnt.textContent = items.length;
       var body = host.querySelector('[data-body="' + col.key + '"]');
@@ -2687,8 +2962,11 @@ export const HTML_PAGE = `<!doctype html>
         sigOf: function(it) {
           var act = _state.activityByPid[it.pid] || {};
           var ctx = act.contextUsage || {}, su = act.sessionUsage || {};
-          return [act.status || '', act.statusLabel || '', act.title || '', act.lastEventAt || '',
+          var asks = extractAsks(act), ask = asks[0] || {};
+          var purpose = sessionPurpose(it, act);
+          return [act.status || '', act.statusLabel || '', purpose.text, purpose.source, act.preview || '', sessionRecent(act), act.lastEventAt || '',
             ctx.percent || '', su.costUSD || '', it.pid === _state.activePid ? 1 : 0,
+            ask.id || '', ask.question || '', (ask.choices || []).map(function(c) { return c.label; }).join(','),
             _state.answered[it.pid] ? 1 : 0, tabName(it)].join('|');
         },
         innerOf: boardCardInner,
@@ -2698,6 +2976,10 @@ export const HTML_PAGE = `<!doctype html>
   }
   // 切换 mc-grid(详情) / overview(总览) 的可见性 + toggle 按钮高亮（不 persist/render）。
   function applyViewDom() {
+    // Mobile is optimized around the tab strip + single-session detail. The
+    // desktop overview board is too cramped there, so avoid persisting users
+    // into an overview state they cannot comfortably act from.
+    if (isMobileViewport() && _state.viewMode === 'overview') _state.viewMode = 'focus';
     var ov = document.getElementById('overview');
     var grid = document.getElementById('mc-grid');
     var isOv = _state.viewMode === 'overview';
@@ -2715,7 +2997,51 @@ export const HTML_PAGE = `<!doctype html>
     if (changed) persistState();
     applyViewDom();
     if (mode === 'overview') { renderOverview(); }
-    else { renderFocusIfChanged(); rewireTerminalForActive(); }
+    else { renderFocusIfChanged(); rewireTerminalForActive(); scheduleDetailLayoutBalance(); }
+  }
+
+  var _detailBalanceRaf = null;
+  function resetFocusSizingForManualTerm() {
+    var focus = document.getElementById('focus');
+    if (!focus) return;
+    focus.style.flex = '';
+    focus.style.height = '';
+    focus.style.maxHeight = '';
+  }
+  function scheduleDetailLayoutBalance() {
+    if (_detailBalanceRaf) cancelAnimationFrame(_detailBalanceRaf);
+    _detailBalanceRaf = requestAnimationFrame(function() {
+      _detailBalanceRaf = null;
+      balanceDetailLayout();
+    });
+  }
+  function balanceDetailLayout() {
+    if (isMobileViewport() || _state.viewMode !== 'focus') return;
+    var focus = document.getElementById('focus');
+    var panel = document.getElementById('term-panel');
+    var col = document.getElementById('focus-col');
+    if (!focus || !panel || !col) return;
+    resetFocusSizingForManualTerm();
+    if (!_state.termHeight && !panel.classList.contains('collapsed')) {
+      panel.classList.remove('manual-size');
+      panel.style.flex = '';
+      panel.style.height = '';
+      panel.style.minHeight = '';
+      panel.style.maxHeight = '';
+    }
+    var colH = col.clientHeight || 0;
+    var panelH = panel.getBoundingClientRect().height || 0;
+    if (!colH || !panelH) return;
+    var availableFocusH = Math.max(120, colH - panelH);
+    var desiredFocusH = Math.min(focus.scrollHeight || 0, availableFocusH);
+    if (availableFocusH - desiredFocusH > 0 && availableFocusH - desiredFocusH < 80) {
+      desiredFocusH = availableFocusH;
+    }
+    if (desiredFocusH > 0) {
+      focus.style.flex = '0 0 auto';
+      focus.style.height = desiredFocusH + 'px';
+      focus.style.maxHeight = desiredFocusH + 'px';
+    }
   }
 
   // ---------- per-instance actions ----------
@@ -2761,7 +3087,7 @@ export const HTML_PAGE = `<!doctype html>
       if (next === current) { renderFocus(); return; }
       api('/api/launcher/prefs/alias', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cwd: inst.cwd, alias: next }),
+        body: JSON.stringify({ cwd: inst.cwd, alias: next, pid: inst.pid }),
       }).then(function() {
         inst.alias = next;
         toast(next ? '别名已更新' : '别名已清除', 'ok');
@@ -2952,7 +3278,12 @@ export const HTML_PAGE = `<!doctype html>
       theme: { background: '#0f1115', foreground: '#e6e8ec', cursor: '#6ea8fe' },
     };
   }
-  function attachXterm(host, wsUrl, opts) {
+  function ensureXtermReady() {
+    if (window.Terminal && window.FitAddon) return Promise.resolve();
+    if (typeof window.__ccvLoadXterm === 'function') return window.__ccvLoadXterm();
+    return Promise.reject(new Error('xterm loader unavailable'));
+  }
+  function _mountXterm(host, wsUrl, opts) {
     opts = opts || {};
     while (host.firstChild) host.removeChild(host.firstChild);
     var term = new Terminal(buildTermConfig());
@@ -2990,8 +3321,27 @@ export const HTML_PAGE = `<!doctype html>
     ro.observe(host);
     return { term: term, ws: ws, fit: fit, ro: ro };
   }
+  function attachXterm(host, wsUrl, opts) {
+    opts = opts || {};
+    while (host.firstChild) host.removeChild(host.firstChild);
+    host.innerHTML = '<div class="empty" style="padding:14px 16px;text-align:left">loading terminal…</div>';
+    var handle = { term: null, ws: null, fit: null, ro: null, cancelled: false };
+    ensureXtermReady().then(function() {
+      if (handle.cancelled) return;
+      var mounted = _mountXterm(host, wsUrl, opts);
+      handle.term = mounted.term;
+      handle.ws = mounted.ws;
+      handle.fit = mounted.fit;
+      handle.ro = mounted.ro;
+    }).catch(function(err) {
+      if (handle.cancelled) return;
+      host.innerHTML = '<div class="empty" style="padding:14px 16px;text-align:left;color:var(--bad)">terminal failed to load: ' + escape(err && err.message || err) + '</div>';
+    });
+    return handle;
+  }
   function tearDown(handle) {
     if (!handle) return;
+    handle.cancelled = true;
     try { handle.ro && handle.ro.disconnect(); } catch (e) {}
     try { handle.ws && handle.ws.close(); } catch (e) {}
     try { handle.term && handle.term.dispose(); } catch (e) {}
@@ -3001,15 +3351,31 @@ export const HTML_PAGE = `<!doctype html>
   var _console = null;
   var _shell = null;
   var _logsTimer = null;
+  // 远程访问修正：publicUrl/lanUrl 可能被配成 loopback（见 CCV_PUBLIC_URL_TEMPLATE
+  // = http://127.0.0.1:{port}）。loopback 在非本机客户端上指向客户端自己，console /
+  // Open ccv 必然连不上。只要页面本身是从可路由 host 打开的（location.hostname 非
+  // loopback），就把 URL 的 host 换成它（端口/协议/token/path 全保留）。反代场景下
+  // publicUrl 是真实域名(非 loopback)，原样保留。
+  var LOOPBACK_RE = /^(127\\.\\d+\\.\\d+\\.\\d+|0\\.0\\.0\\.0|localhost|::1|\\[::1\\])$/i;
+  function isLoopbackHost(h) { return LOOPBACK_RE.test(h || ''); }
+  function reachableUrl(raw) {
+    try {
+      var u = new URL(raw, window.location.href);
+      if (isLoopbackHost(u.hostname) && !isLoopbackHost(window.location.hostname)) {
+        u.hostname = window.location.hostname;
+      }
+      return u.toString();
+    } catch (e) { return raw; }
+  }
   function wsUrlForConsole(inst) {
     var loc = window.location;
-    if (inst.publicUrl) {
-      try { var u = new URL(inst.publicUrl); return (u.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + u.host + '/ws/terminal'; } catch (e) {}
+    var base = inst.publicUrl || inst.lanUrl || (loc.protocol + '//' + loc.hostname + ':' + inst.port + '/');
+    try {
+      var u = new URL(reachableUrl(base), loc.href);
+      return (u.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + u.host + '/ws/terminal';
+    } catch (e) {
+      return (loc.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + loc.hostname + ':' + inst.port + '/ws/terminal';
     }
-    if (inst.lanUrl) {
-      try { var u2 = new URL(inst.lanUrl); return 'ws://' + u2.host + '/ws/terminal'; } catch (e) {}
-    }
-    return (loc.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + loc.hostname + ':' + inst.port + '/ws/terminal';
   }
   function wsUrlForShell(cwd) {
     var loc = window.location;
@@ -3097,6 +3463,7 @@ export const HTML_PAGE = `<!doctype html>
       panel.classList.remove('collapsed');
       // 切 tab 时若之前是 collapsed (inline flex 已清), restore 用户自定高度
       if (_state.termHeight) applyTermSize(_state.termHeight);
+      else clearTermSize(true);
     }
     var tabs = document.querySelectorAll('#term-tabs .term-tab');
     [].forEach.call(tabs, function(t) {
@@ -3111,6 +3478,7 @@ export const HTML_PAGE = `<!doctype html>
     if (tab === 'console') { stopLogsPoll(); attachConsole(inst); }
     else if (tab === 'shell') { stopLogsPoll(); attachShell(inst); }
     else if (tab === 'logs') { startLogsPoll(inst); }
+    scheduleDetailLayoutBalance();
   }
   function toggleTerm() {
     var panel = document.getElementById('term-panel');
@@ -3121,20 +3489,25 @@ export const HTML_PAGE = `<!doctype html>
     if (open) {
       // 展开时 restore 用户拖过的高度; inline flex 之前可能被清掉
       if (_state.termHeight) applyTermSize(_state.termHeight);
+      else clearTermSize(true);
       // remount xterm because hidden during collapsed
       setTermTab(_state.termTab, true);
     } else {
       // 折叠时清 inline flex/min-height, 让 .collapsed CSS class 生效
+      panel.classList.remove('manual-size');
       panel.style.flex = '';
+      panel.style.height = '';
       panel.style.minHeight = '';
+      panel.style.maxHeight = '';
+      resetFocusSizingForManualTerm();
     }
   }
 
   // ---------- ccv iframe overlay (multi-tab) ----------
   function ccvUrl(inst) {
-    if (inst.publicUrl) return inst.publicUrl;
-    if (inst.lanUrl) return inst.lanUrl;
-    return location.protocol + '//' + location.hostname + ':' + inst.port + '/' + (inst.token ? ('?token=' + encodeURIComponent(inst.token)) : '');
+    var raw = inst.publicUrl || inst.lanUrl
+      || (location.protocol + '//' + location.hostname + ':' + inst.port + '/' + (inst.token ? ('?token=' + encodeURIComponent(inst.token)) : ''));
+    return reachableUrl(raw);
   }
   // Multi-tab ccv overlay. Each "Open ccv" call adds (or focuses) a tab in
   // the overlay's top strip; iframes for non-active tabs are kept alive but
@@ -3326,6 +3699,7 @@ export const HTML_PAGE = `<!doctype html>
       });
       tree.innerHTML = html;
       document.getElementById('new-cwd').value = d.current || path || '';
+      populateCcuseSelect(d.current || path || '');
       document.getElementById('new-err').hidden = true;
       document.getElementById('new-err').textContent = '';
       [].forEach.call(tree.querySelectorAll('.tree-row'), function(row) {
@@ -3468,21 +3842,35 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   // ---------- term panel drag-resize ----------
-  // 0cd30b5 改成 flex: 1 1 0 + min-height: 280px (auto-absorb leftover space).
-  // 在 flex 布局里 inline height 会被 flex-basis 算法忽略, 所以这里改成
-  // 调整 flex-basis + 关掉 min-height, 让 drag 能真正生效, 并放开上限
-  // 到窗口高度 - 100px, 用户能把 term 往上拉覆盖几乎整个 focus。
+  // Drag adjusts explicit height. The default state uses CSS height clamp and
+  // always clears old inline flex-basis from previous builds.
   function applyTermSize(h) {
     var panel = document.getElementById('term-panel');
     if (!panel) return;
-    panel.style.flex = '0 0 ' + h + 'px';
+    panel.classList.add('manual-size');
+    panel.style.flex = '0 0 auto';
+    panel.style.height = h + 'px';
     panel.style.minHeight = '0';
+    panel.style.maxHeight = 'none';
+    resetFocusSizingForManualTerm();
+  }
+  function clearTermSize(keepAuto) {
+    var panel = document.getElementById('term-panel');
+    if (!panel) return;
+    panel.classList.remove('manual-size');
+    panel.style.flex = '';
+    panel.style.height = '';
+    panel.style.minHeight = '';
+    panel.style.maxHeight = '';
+    resetFocusSizingForManualTerm();
+    if (keepAuto) scheduleDetailLayoutBalance();
   }
   function wireTermHandle() {
     var handle = document.getElementById('term-handle');
     var panel = document.getElementById('term-panel');
     if (!handle || !panel) return;
     if (_state.termHeight) applyTermSize(_state.termHeight);
+    else clearTermSize(true);
     var dragging = false, startY = 0, startH = 0;
     handle.addEventListener('mousedown', function(e) {
       if (panel.classList.contains('collapsed')) return;
@@ -3490,11 +3878,19 @@ export const HTML_PAGE = `<!doctype html>
       document.body.style.userSelect = 'none';
       e.preventDefault();
     });
+    handle.addEventListener('dblclick', function(e) {
+      if (panel.classList.contains('collapsed')) return;
+      _state.termHeight = null;
+      clearTermSize(true);
+      persistState();
+      setTermTab(_state.termTab, true);
+      e.preventDefault();
+    });
     document.addEventListener('mousemove', function(e) {
       if (!dragging) return;
       var dy = startY - e.clientY;
-      var maxH = Math.max(200, window.innerHeight - 100);
-      var h = Math.max(80, Math.min(maxH, startH + dy));
+      var maxH = Math.max(240, Math.min(window.innerHeight * 0.42, 420));
+      var h = Math.max(170, Math.min(maxH, startH + dy));
       applyTermSize(h);
     });
     document.addEventListener('mouseup', function() {
@@ -3503,6 +3899,9 @@ export const HTML_PAGE = `<!doctype html>
       document.body.style.userSelect = '';
       _state.termHeight = document.getElementById('term-panel').getBoundingClientRect().height;
       persistState();
+    });
+    window.addEventListener('resize', function() {
+      if (!_state.termHeight) scheduleDetailLayoutBalance();
     });
   }
 
@@ -4186,6 +4585,23 @@ export const HTML_PAGE = `<!doctype html>
     // 看板卡点击：选中并切到详情视图（Symphony「扫一眼 → 点进去看 agent」）。
     var board = document.getElementById('board-cols');
     if (board) board.addEventListener('click', function(e) {
+      var ans = e.target.closest('.bc-ask-btn[data-pid][data-ask]');
+      if (ans) {
+        e.stopPropagation();
+        var pid = +ans.getAttribute('data-pid');
+        var inst = _state.instances.find(function(x) { return x.pid === pid; });
+        if (!inst) return;
+        answerAsk(inst, ans.getAttribute('data-ask'), +ans.getAttribute('data-idx'), ans.getAttribute('data-label'), ans.getAttribute('data-qtext') || '', ans);
+        return;
+      }
+      var open = e.target.closest('.bc-ask-btn[data-open-pid]');
+      if (open) {
+        e.stopPropagation();
+        var opid = +open.getAttribute('data-open-pid');
+        var oi = _state.instances.find(function(x) { return x.pid === opid; });
+        if (oi) { setActive(opid); openCcv(oi); }
+        return;
+      }
       var bc = e.target.closest('.board-card[data-pid]');
       if (bc) { setActive(+bc.getAttribute('data-pid')); setViewMode('focus'); }
     });
@@ -4393,6 +4809,9 @@ export const HTML_PAGE = `<!doctype html>
     })();
     document.getElementById('new-cancel').addEventListener('click', function() { document.getElementById('dlg').close(); });
     document.getElementById('new-launch').addEventListener('click', submitNew);
+    document.getElementById('new-cwd').addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); submitNew(); }
+    });
     document.getElementById('ccv-close').addEventListener('click', closeCcv);
     document.getElementById('ccv-reload').addEventListener('click', reloadActiveCcv);
     document.getElementById('ccv-newtab').addEventListener('click', openActiveCcvInNewTab);

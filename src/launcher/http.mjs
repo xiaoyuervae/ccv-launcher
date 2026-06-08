@@ -34,7 +34,7 @@ import {
   ccvProjectName, findActiveLogFile, parseJsonlFilenameTime, pickInstanceLogs, findActiveLogFileForInstance, tailJsonlEntries, truncate, lastUserPrompt, lastUserPromptAcrossEntries, firstUserPrompt, stripUserPromptFraming, readFirstUserPrompt, inspectToolFlow, summarizeToolInput, summarizeEntry, ageString, fetchPendingAsks, deriveStatus, findRecentAssistantTextTs, isAssistantTextEnd,
 } from './activity.mjs';
 import {
-  loadPrefs, savePrefs, normalizeAlias, getAlias, setAlias, getCcuseProfile, setCcuseProfile, setDefaultCcuseProfile, normalizeTag, getTags, setTags, addTag, removeTag, getAllTags, DEFAULT_COMPACT_THRESHOLD, getCompactThreshold, setCompactThreshold, getWorktreeDefault, setWorktreeDefault, listCcuseProfiles,
+  loadPrefs, savePrefs, normalizeAlias, getAlias, setAlias, getInstanceAlias, setInstanceAlias, clearInstanceAlias, getCcuseProfile, setCcuseProfile, setDefaultCcuseProfile, normalizeTag, getTags, setTags, addTag, removeTag, getAllTags, DEFAULT_COMPACT_THRESHOLD, getCompactThreshold, setCompactThreshold, getWorktreeDefault, setWorktreeDefault, listCcuseProfiles,
 } from './prefs.mjs';
 import {
   pendingPairs, approvedSessions, PAIR_CODE_TTL_MS, SESSION_MAX_AGE, loadSessions, saveSessions, generatePairCode, cleanExpiredPairs, parseCookies, isLanIp, getClientIp, isAuthenticated, shortUA, subjectIdFor,
@@ -325,7 +325,7 @@ export async function getInstanceActivity(instance) {
     statusLabel: status.label,
     preview,
     title,
-    alias: getAlias(instance.cwd),
+    alias: getInstanceAlias(instance.pid),
     ccuseProfile: getCcuseProfile(instance.cwd),
     lastEventAt: entries.length ? entries[entries.length - 1].timestamp : null,
     fileMtime,
@@ -723,7 +723,7 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
     // chip without an extra round-trip.
     const enrichedRunning = running.map(i => ({
       ...i,
-      alias: getAlias(i.cwd),
+      alias: getInstanceAlias(i.pid),
       ccuseProfile: getCcuseProfile(i.cwd),
       worktree: worktreeForPid(i.pid),
     }));
@@ -1018,10 +1018,16 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
   if (url === '/api/launcher/prefs/alias' && method === 'POST') {
     try {
       const raw = await readBody(req);
-      const { cwd: targetCwd, alias } = JSON.parse(raw || '{}');
-      if (!targetCwd) throw new Error('cwd required');
-      setAlias(targetCwd, alias || '');
-      sendJson(res, 200, { ok: true, alias: getAlias(targetCwd) });
+      const { cwd: targetCwd, alias, pid } = JSON.parse(raw || '{}');
+      if (!targetCwd && !pid) throw new Error('cwd or pid required');
+      const numPid = pid ? parseInt(pid, 10) : 0;
+      if (numPid) {
+        setInstanceAlias(numPid, alias || '');
+        sendJson(res, 200, { ok: true, alias: getInstanceAlias(numPid) || getAlias(targetCwd || '') });
+      } else {
+        setAlias(targetCwd, alias || '');
+        sendJson(res, 200, { ok: true, alias: getAlias(targetCwd) });
+      }
     } catch (err) {
       sendJson(res, 400, { error: err.message });
     }
