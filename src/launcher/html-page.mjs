@@ -4004,7 +4004,6 @@ export const HTML_PAGE = `<!doctype html>
   var NOTIF_THROTTLE_MS = 5 * 60 * 1000;
   var NOTIF_INTEREST = {
     waiting_ask:   { title: '需要回答', body: '%name 提了一个问题' },
-    waiting_tool:  { title: '等待授权', body: '%name 的工具调用等待批准' },
     waiting_input: { title: '完成一轮', body: '%name 等待你的下一步指令' },
     error:         { title: '出错',     body: '%name 出现异常' },
   };
