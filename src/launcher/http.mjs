@@ -702,7 +702,7 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
     // merge workspace-registry history: show idle projects not currently running
     let idle = [];
     try {
-      const wsHistory = getWorkspaces();
+      const wsHistory = await getWorkspaces();
       idle = wsHistory
         .filter(w => w.path && !runningCwds.has(w.path))
         .filter(w => existsSync(w.path)) // skip deleted dirs
