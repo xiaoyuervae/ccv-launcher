@@ -13,31 +13,88 @@
       "Sonnet 4 (claude-sonnet-4-20250514) has tiered pricing: above 200k tokens uses input_above_200k rates from pricing.json."
     ]
   },
-
   "models": {
-    "claude-opus-4-20250514": { "context_limit": 200000, "display_name": "Opus 4" },
-    "claude-opus-4-1": { "context_limit": 200000, "display_name": "Opus 4.1" },
-    "claude-opus-4-1-20250805": { "context_limit": 200000, "display_name": "Opus 4.1" },
-    "claude-opus-4-5": { "context_limit": 200000, "display_name": "Opus 4.5" },
-    "claude-opus-4-5-20251101": { "context_limit": 200000, "display_name": "Opus 4.5" },
-    "claude-opus-4-6": { "context_limit": 1000000, "display_name": "Opus 4.6" },
-    "claude-opus-4-6-20260205": { "context_limit": 1000000, "display_name": "Opus 4.6" },
-    "claude-opus-4-7": { "context_limit": 1000000, "display_name": "Opus 4.7" },
-    "claude-opus-4-7-20260416": { "context_limit": 1000000, "display_name": "Opus 4.7" },
-
-    "claude-sonnet-4-20250514": { "context_limit": 1000000, "display_name": "Sonnet 4" },
-    "claude-sonnet-4-5": { "context_limit": 200000, "display_name": "Sonnet 4.5" },
-    "claude-sonnet-4-5-20250929": { "context_limit": 200000, "display_name": "Sonnet 4.5" },
-    "claude-sonnet-4-6": { "context_limit": 1000000, "display_name": "Sonnet 4.6" },
-    "claude-sonnet-4-7": { "context_limit": 1000000, "display_name": "Sonnet 4.7" },
-
-    "claude-haiku-4-5": { "context_limit": 200000, "display_name": "Haiku 4.5" },
-    "claude-haiku-4-5-20251001": { "context_limit": 200000, "display_name": "Haiku 4.5" },
-
-    "claude-3-5-sonnet-20241022": { "context_limit": 200000, "display_name": "Sonnet 3.5" },
-    "claude-3-5-haiku-20241022": { "context_limit": 200000, "display_name": "Haiku 3.5" }
+    "claude-opus-4-20250514": {
+      "context_limit": 200000,
+      "display_name": "Opus 4"
+    },
+    "claude-opus-4-1": {
+      "context_limit": 200000,
+      "display_name": "Opus 4.1"
+    },
+    "claude-opus-4-1-20250805": {
+      "context_limit": 200000,
+      "display_name": "Opus 4.1"
+    },
+    "claude-opus-4-5": {
+      "context_limit": 200000,
+      "display_name": "Opus 4.5"
+    },
+    "claude-opus-4-5-20251101": {
+      "context_limit": 200000,
+      "display_name": "Opus 4.5"
+    },
+    "claude-opus-4-6": {
+      "context_limit": 1000000,
+      "display_name": "Opus 4.6"
+    },
+    "claude-opus-4-6-20260205": {
+      "context_limit": 1000000,
+      "display_name": "Opus 4.6"
+    },
+    "claude-opus-4-7": {
+      "context_limit": 1000000,
+      "display_name": "Opus 4.7"
+    },
+    "claude-opus-4-7-20260416": {
+      "context_limit": 1000000,
+      "display_name": "Opus 4.7"
+    },
+    "claude-sonnet-4-20250514": {
+      "context_limit": 1000000,
+      "display_name": "Sonnet 4"
+    },
+    "claude-sonnet-4-5": {
+      "context_limit": 200000,
+      "display_name": "Sonnet 4.5"
+    },
+    "claude-sonnet-4-5-20250929": {
+      "context_limit": 200000,
+      "display_name": "Sonnet 4.5"
+    },
+    "claude-sonnet-4-6": {
+      "context_limit": 1000000,
+      "display_name": "Sonnet 4.6"
+    },
+    "claude-sonnet-4-7": {
+      "context_limit": 1000000,
+      "display_name": "Sonnet 4.7"
+    },
+    "claude-haiku-4-5": {
+      "context_limit": 200000,
+      "display_name": "Haiku 4.5"
+    },
+    "claude-haiku-4-5-20251001": {
+      "context_limit": 200000,
+      "display_name": "Haiku 4.5"
+    },
+    "claude-3-5-sonnet-20241022": {
+      "context_limit": 200000,
+      "display_name": "Sonnet 3.5"
+    },
+    "claude-3-5-haiku-20241022": {
+      "context_limit": 200000,
+      "display_name": "Haiku 3.5"
+    },
+    "claude-fable-5": {
+      "context_limit": 1000000,
+      "display_name": "Fable 5"
+    },
+    "claude-opus-4-8": {
+      "context_limit": 1000000,
+      "display_name": "Opus 4.8"
+    }
   },
-
   "context_modifiers": [
     {
       "pattern": "[1m]",
@@ -45,7 +102,6 @@
       "context_limit": 1000000
     }
   ],
-
   "fallback": {
     "context_limit": 200000,
     "rules": [

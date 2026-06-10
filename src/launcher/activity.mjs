@@ -476,11 +476,10 @@ export function ageString(ms) {
 export async function fetchPendingAsks(instance) {
   // Query the instance's own /api/pending-asks (in-memory state lives there).
   if (!instance?.port || !instance?.token) return [];
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 800);
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 800);
     const resp = await fetch(`http://127.0.0.1:${instance.port}/api/pending-asks?token=${instance.token}`, { signal: ctrl.signal });
-    clearTimeout(timer);
     if (!resp.ok) return [];
     const data = await resp.json();
     const asks = Array.isArray(data?.pendingAsks) ? data.pendingAsks : [];
@@ -491,7 +490,7 @@ export async function fetchPendingAsks(instance) {
     // sibling ccv at the same cwd. Falls back to including untagged entries for older ccv
     // versions that don't set source.
     return asks.filter(a => !a.source || a.source === 'memory');
-  } catch { return []; }
+  } catch { return []; } finally { clearTimeout(timer); }
 }
 
 export function deriveStatus({ entries, pendingAsks, fileMtime }) {

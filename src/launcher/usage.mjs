@@ -93,7 +93,9 @@ export function getModelInfo(modelId) {
     // Family fallback — same heuristics as priceForModel; keeps lookup
     // resilient when a brand-new model id appears before vendor/models.json
     // is refreshed.
-    if (baseId.includes('opus-4-7')) entry = models['claude-opus-4-7'];
+    if (baseId.includes('fable')) entry = models['claude-fable-5'];
+    else if (baseId.includes('opus-4-8')) entry = models['claude-opus-4-8'];
+    else if (baseId.includes('opus-4-7')) entry = models['claude-opus-4-7'];
     else if (baseId.includes('opus-4-6')) entry = models['claude-opus-4-6'];
     else if (baseId.includes('opus-4-5')) entry = models['claude-opus-4-5'];
     else if (baseId.includes('opus-4-1')) entry = models['claude-opus-4-1'];
@@ -139,6 +141,8 @@ export function priceForModel(modelId) {
   const pricing = loadPricing();
   if (modelId && pricing[modelId]) return pricing[modelId];
   if (typeof modelId === 'string') {
+    if (modelId.includes('fable')) return pricing['claude-fable-5'];
+    if (modelId.includes('opus-4-8')) return pricing['claude-opus-4-8'];
     if (modelId.includes('opus-4-7')) return pricing['claude-opus-4-7'];
     if (modelId.includes('opus-4-6')) return pricing['claude-opus-4-6'];
     if (modelId.includes('opus-4-5')) return pricing['claude-opus-4-5'];
@@ -811,12 +815,16 @@ export function readClaudeOauthToken() {
   return token;
 }
 
+// 429 后必须退避：quota 刷新由前端 10s 轮询间接驱动，没有冷却的话会以
+// 轮询频率持续打已限流的接口（日志里曾连刷上千条 non-ok: 429）。
+let _oauthCooldownUntil = 0;
 export async function fetchOauthUsage() {
+  if (Date.now() < _oauthCooldownUntil) return null;
   const token = readClaudeOauthToken();
   if (!token) return null;
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 6000);
   try {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 6000);
     const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
       method: 'GET',
       headers: {
@@ -826,15 +834,24 @@ export async function fetchOauthUsage() {
       },
       signal: ctrl.signal,
     });
-    clearTimeout(to);
     if (!r.ok) {
+      if (r.status === 429) {
+        const ra = Number(r.headers.get('retry-after'));
+        _oauthCooldownUntil = Date.now() + (Number.isFinite(ra) && ra > 0 ? ra * 1000 : 5 * 60_000);
+      } else if (r.status >= 500) {
+        _oauthCooldownUntil = Date.now() + 60_000;
+      }
       log('fetchOauthUsage non-ok:', r.status);
       return null;
     }
     return await r.json();
   } catch (err) {
+    // 网络层失败（超时/断网）也短退避，避免每次轮询都白等 6s 超时。
+    _oauthCooldownUntil = Date.now() + 60_000;
     log('fetchOauthUsage error:', err.message);
     return null;
+  } finally {
+    clearTimeout(to);
   }
 }
 

@@ -1133,6 +1133,8 @@ export const HTML_PAGE = `<!doctype html>
     font-size: 14px; cursor: pointer;
     transition: background .15s, border-color .15s;
   }
+  /* display:inline-flex 会覆盖 [hidden] 的 UA display:none，需显式恢复 */
+  #app-bar .icon-btn[hidden] { display: none; }
   #app-bar .icon-btn:hover { background: var(--bg3); }
   #app-bar .icon-btn[data-on="1"] { border-color: var(--accent); color: var(--accent); }
   dialog#notif-dlg {
