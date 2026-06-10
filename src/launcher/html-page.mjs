@@ -3369,13 +3369,13 @@ export const HTML_PAGE = `<!doctype html>
   }
   function wsUrlForConsole(inst) {
     var loc = window.location;
-    var base = inst.publicUrl || inst.lanUrl || (loc.protocol + '//' + loc.hostname + ':' + inst.port + '/');
-    try {
-      var u = new URL(reachableUrl(base), loc.href);
-      return (u.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + u.host + '/ws/terminal';
-    } catch (e) {
-      return (loc.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + loc.hostname + ':' + inst.port + '/ws/terminal';
+    if (preferPublicHost() && inst.publicUrl) {
+      try {
+        var u = new URL(reachableUrl(inst.publicUrl), loc.href);
+        return (u.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + u.host + '/ws/terminal';
+      } catch (e) {}
     }
+    return (loc.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + loc.hostname + ':' + inst.port + '/ws/terminal';
   }
   function wsUrlForShell(cwd) {
     var loc = window.location;
@@ -3504,10 +3504,18 @@ export const HTML_PAGE = `<!doctype html>
   }
 
   // ---------- ccv iframe overlay (multi-tab) ----------
+  // 按访问 launcher 的域名决定子实例 URL：公网域名访问才用模板生成的公网地址
+  // （端口编码进子域，经 NPM 反代）；本机 / 局域网访问直接用当前域名 + 实例端口，
+  // 避免本机回流公网失败（hairpin NAT / 公网域名不在本机解析）。
+  function preferPublicHost() {
+    var h = location.hostname;
+    var isLocal = h === 'localhost' || h === '127.0.0.1'
+      || /^\\d{1,3}(\\.\\d{1,3}){3}$/.test(h) || /\\.local$/i.test(h);
+    return !isLocal;
+  }
   function ccvUrl(inst) {
-    var raw = inst.publicUrl || inst.lanUrl
-      || (location.protocol + '//' + location.hostname + ':' + inst.port + '/' + (inst.token ? ('?token=' + encodeURIComponent(inst.token)) : ''));
-    return reachableUrl(raw);
+    if (preferPublicHost() && inst.publicUrl) return reachableUrl(inst.publicUrl);
+    return location.protocol + '//' + location.hostname + ':' + inst.port + '/' + (inst.token ? ('?token=' + encodeURIComponent(inst.token)) : '');
   }
   // Multi-tab ccv overlay. Each "Open ccv" call adds (or focuses) a tab in
   // the overlay's top strip; iframes for non-active tabs are kept alive but
@@ -3661,8 +3669,11 @@ export const HTML_PAGE = `<!doctype html>
     populateCcuseSelect(cwd);
     dlg.showModal();
     // Empty path → backend defaults to homedir. Never send "~" literally
-    // (resolvePath doesn't expand it).
-    loadDir(cwd || localStorage.getItem('ccvNewLastDir') || '');
+    // (resolvePath doesn't expand it). fallbackHome: a remembered ccvNewLastDir
+    // (or a preset cwd) may point at a dir that was since deleted/renamed —
+    // don't greet the user with a red "invalid directory" on open; fall back
+    // to home silently and drop the stale value.
+    loadDir(cwd || localStorage.getItem('ccvNewLastDir') || '', { fallbackHome: true });
   }
 
   function populateCcuseSelect(cwd) {
@@ -3683,7 +3694,7 @@ export const HTML_PAGE = `<!doctype html>
       sel.innerHTML = html;
     });
   }
-  function loadDir(path) {
+  function loadDir(path, opts) {
     // Defense in depth: even if a caller accidentally passes the click Event
     // (addEventListener forwards it as arg[0]), don't let it land in /new-cwd.
     if (typeof path !== 'string') path = '';
@@ -3706,6 +3717,14 @@ export const HTML_PAGE = `<!doctype html>
         row.addEventListener('click', function() { loadDir(row.getAttribute('data-path')); });
       });
     }).catch(function(err) {
+      // Stale starting dir (deleted/renamed since it was remembered): retry
+      // once at home instead of erroring. path === '' can't recurse here since
+      // the guard requires a non-empty path, and home always exists.
+      if (opts && opts.fallbackHome && path) {
+        try { localStorage.removeItem('ccvNewLastDir'); } catch (e) {}
+        loadDir('', opts);
+        return;
+      }
       document.getElementById('new-err').textContent = err.message;
       document.getElementById('new-err').hidden = false;
     });
