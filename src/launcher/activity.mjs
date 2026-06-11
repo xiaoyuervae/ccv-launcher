@@ -326,6 +326,16 @@ export function stripUserPromptFraming(text) {
   // anything meaningful alongside it. "[Image: source: ...]" without other
   // text on its own line is not informative as a session topic.
   if (/^\[Image:\s+source:\s+[^\]]+]\s*$/.test(t)) return '';
+  // Goal-hook activation (cc-viewer /goal): the injected wrapper is agent
+  // directive boilerplate, but the quoted condition inside IS the user's goal —
+  // surface that instead of the wrapper. If the quote can't be isolated, drop
+  // the whole thing rather than titling the card with hook instructions.
+  const goalMatch = t.match(/^A session-scoped Stop hook is now active with condition:\s*["“]([\s\S]+?)["”]\s*\.?\s*(?:Briefly acknowledge|$)/);
+  if (goalMatch) return goalMatch[1].trim();
+  if (/^A session-scoped Stop hook is now active\b/.test(t)) return '';
+  // Drop auto-injected recap prompts (cc-viewer recap feature fires these as
+  // user-role messages when the user returns to a session).
+  if (/^The user stepped away and is coming back\.\s*Recap\b/i.test(t)) return '';
   return t.trim();
 }
 

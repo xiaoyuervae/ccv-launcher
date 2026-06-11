@@ -16,6 +16,7 @@ export const HTML_PAGE = `<!doctype html>
 <title>ccv launcher</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2358a6ff'/%3E%3Ctext x='32' y='42' font-family='Inter,Arial,sans-serif' font-size='32' font-weight='700' text-anchor='middle' fill='%230d1117'%3Ecc%3C/text%3E%3C/svg%3E">
 <link rel="manifest" href="/launcher/manifest.webmanifest">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0d1117">

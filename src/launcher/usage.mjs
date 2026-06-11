@@ -838,6 +838,12 @@ export async function fetchOauthUsage() {
       if (r.status === 429) {
         const ra = Number(r.headers.get('retry-after'));
         _oauthCooldownUntil = Date.now() + (Number.isFinite(ra) && ra > 0 ? ra * 1000 : 5 * 60_000);
+      } else if (r.status === 401 || r.status === 403) {
+        // Auth failure won't heal by retrying with the same token — back off
+        // long, and drop the in-memory token so the next attempt re-reads the
+        // keychain (Claude Code may have refreshed credentials by then).
+        _oauthCooldownUntil = Date.now() + 15 * 60_000;
+        _ccTokenMem = null;
       } else if (r.status >= 500) {
         _oauthCooldownUntil = Date.now() + 60_000;
       }
