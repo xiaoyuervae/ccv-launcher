@@ -3347,6 +3347,7 @@ export const HTML_PAGE = `<!doctype html>
     handle.cancelled = true;
     try { handle.ro && handle.ro.disconnect(); } catch (e) {}
     try { handle.ws && handle.ws.close(); } catch (e) {}
+    try { handle.es && handle.es.close(); } catch (e) {}
     try { handle.term && handle.term.dispose(); } catch (e) {}
   }
 
@@ -3380,13 +3381,89 @@ export const HTML_PAGE = `<!doctype html>
     }
     return (loc.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + loc.hostname + ':' + inst.port + '/ws/terminal';
   }
-  function wsUrlForShell(cwd) {
-    var loc = window.location;
-    var proto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+  function shellStreamUrl(cwd) {
     var stored = null;
     try { stored = sessionStorage.getItem('ccvShellSessionId'); } catch (e) {}
     var sid = stored ? '&sessionId=' + encodeURIComponent(stored) : '';
-    return proto + '//' + loc.host + '/ws/shell?cwd=' + encodeURIComponent(cwd) + sid;
+    return '/api/launcher/shell/stream?cwd=' + encodeURIComponent(cwd) + sid;
+  }
+  function _mountXtermHttp(host, streamUrl, opts) {
+    opts = opts || {};
+    while (host.firstChild) host.removeChild(host.firstChild);
+    var term = new Terminal(buildTermConfig());
+    var fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(host);
+    try { fit.fit(); } catch (e) {}
+    term.writeln('\\x1b[90mConnecting…\\x1b[0m');
+    var sessionId = null;
+    var es = new EventSource(streamUrl, { withCredentials: true });
+    es.addEventListener('hello', function(ev) {
+      try {
+        var msg = JSON.parse(ev.data);
+        sessionId = msg.sessionId;
+        if (opts.persistSessionKey && sessionId) {
+          try { sessionStorage.setItem(opts.persistSessionKey, sessionId); } catch (e) {}
+        }
+        if (msg.isReattach) term.writeln('\\x1b[32m[reattached]\\x1b[0m');
+      } catch (e) {}
+    });
+    es.addEventListener('data', function(ev) {
+      try {
+        var msg = JSON.parse(ev.data);
+        if (msg.data) term.write(msg.data);
+      } catch (e) { term.write(ev.data); }
+    });
+    es.addEventListener('exit', function(ev) {
+      try {
+        var msg = JSON.parse(ev.data);
+        term.writeln('\\r\\n\\x1b[33m[process exited: ' + (msg.exitCode == null ? '?' : msg.exitCode) + ']\\x1b[0m');
+      } catch (e) {}
+    });
+    es.onerror = function() {
+      if (es.readyState === EventSource.CLOSED) {
+        term.writeln('\\r\\n\\x1b[90m[disconnected]\\x1b[0m');
+      }
+    };
+    term.onData(function(data) {
+      if (!sessionId) return;
+      fetch('/api/launcher/shell/input', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: sessionId, type: 'input', data: data }),
+        credentials: 'include',
+      }).catch(function() {});
+    });
+    term.onResize(function(sz) {
+      if (!sessionId) return;
+      fetch('/api/launcher/shell/input', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: sessionId, type: 'resize', cols: sz.cols, rows: sz.rows }),
+        credentials: 'include',
+      }).catch(function() {});
+    });
+    var ro = new ResizeObserver(function() { try { fit.fit(); } catch (e) {} });
+    ro.observe(host);
+    return { term: term, es: es, fit: fit, ro: ro };
+  }
+  function attachShellHttp(host, streamUrl, opts) {
+    opts = opts || {};
+    while (host.firstChild) host.removeChild(host.firstChild);
+    host.innerHTML = '<div class="empty" style="padding:14px 16px;text-align:left">loading terminal…</div>';
+    var handle = { term: null, es: null, fit: null, ro: null, cancelled: false };
+    ensureXtermReady().then(function() {
+      if (handle.cancelled) return;
+      var mounted = _mountXtermHttp(host, streamUrl, opts);
+      handle.term = mounted.term;
+      handle.es = mounted.es;
+      handle.fit = mounted.fit;
+      handle.ro = mounted.ro;
+    }).catch(function(err) {
+      if (handle.cancelled) return;
+      host.innerHTML = '<div class="empty" style="padding:14px 16px;text-align:left;color:var(--bad)">terminal failed to load: ' + escape(err && err.message || err) + '</div>';
+    });
+    return handle;
   }
   function attachConsole(inst) {
     detachConsole();
@@ -3403,12 +3480,12 @@ export const HTML_PAGE = `<!doctype html>
     if (_state.caps && _state.caps.shell === false) {
       host.innerHTML = '<div class="empty" style="padding:14px 16px;line-height:1.55">'
         + '<div style="color:var(--warn);font-weight:600;margin-bottom:6px">shell pty 不可用</div>'
-        + '<div style="font-size:11.5px">当前 cc-viewer 构建缺少 <code>pty-session-manager</code>，hub 没启用 <code>/ws/shell</code>。<br>'
+        + '<div style="font-size:11.5px">当前 cc-viewer 构建缺少 <code>node-pty</code>，hub 没启用 shell。<br>'
         + '可在 ccv 内置终端使用 (Open ccv ↗)，或升级 cc-viewer。</div>'
         + '</div>';
       return;
     }
-    _shell = attachXterm(host, wsUrlForShell(inst.cwd), { persistSessionKey: 'ccvShellSessionId' });
+    _shell = attachShellHttp(host, shellStreamUrl(inst.cwd), { persistSessionKey: 'ccvShellSessionId' });
   }
   function detachShell() { tearDown(_shell); _shell = null; }
   function stopLogsPoll() {
@@ -3650,7 +3727,7 @@ export const HTML_PAGE = `<!doctype html>
     if (kind === 'console') {
       _sheet = attachXterm(host, wsUrlForConsole(inst));
     } else {
-      _sheet = attachXterm(host, wsUrlForShell(inst.cwd), { persistSessionKey: 'ccvShellSessionId' });
+      _sheet = attachShellHttp(host, shellStreamUrl(inst.cwd), { persistSessionKey: 'ccvShellSessionId' });
     }
   }
   function closeSheet() {

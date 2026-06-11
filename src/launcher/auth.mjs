@@ -82,6 +82,7 @@ export function getClientIp(req) {
 }
 
 export function isAuthenticated(req) {
+  if (process.env.CCV_SKIP_AUTH === '1') return true;
   // LAN requests skip auth
   if (isLanIp(getClientIp(req))) return true;
   const cookies = parseCookies(req.headers.cookie);

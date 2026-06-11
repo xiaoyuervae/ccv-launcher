@@ -41,27 +41,30 @@ import {
 } from './auth.mjs';
 
 // ----- Entry-owned bindings -----
-// /healthz reports shell-session counts (_shellWss / _ptyManager / SHELL_PTY_CAP)
-// owned by installShellWebSocket in the entry. The pairing/workspace endpoints
-// walk ccv's own workspace registry via getWorkspaces / removeWorkspace which
-// the entry dynamic-imports at boot. Entry calls wireEntryBindings() once
-// after both are available to plug them in here.
-let _shellWss = null;
-let _ptyManager = null;
+// Shell session helpers are provided by launcher.mjs (self-contained PTY
+// manager using node-pty directly — no PtySessionManager dependency).
+// Workspace helpers come from ccv's workspace-registry.
+let _shellCreateSession = null;
+let _shellAttachSession = null;
+let _shellOrphan = null;
+let _shellGetSession = null;
+let _shellSessionCount = () => 0;
+let _shellAvailable = () => false;
 let SHELL_PTY_CAP = 8;
 let getWorkspaces = () => [];
 let removeWorkspace = () => false;
 
 export function wireEntryBindings(bindings = {}) {
-  if (bindings.getShellWss) _shellWssGetter = bindings.getShellWss;
-  if (bindings.getPtyManager) _ptyManagerGetter = bindings.getPtyManager;
+  if (bindings.shellCreateSession) _shellCreateSession = bindings.shellCreateSession;
+  if (bindings.shellAttachSession) _shellAttachSession = bindings.shellAttachSession;
+  if (bindings.shellOrphan) _shellOrphan = bindings.shellOrphan;
+  if (bindings.shellGetSession) _shellGetSession = bindings.shellGetSession;
+  if (bindings.shellSessionCount) _shellSessionCount = bindings.shellSessionCount;
+  if (bindings.shellAvailable) _shellAvailable = bindings.shellAvailable;
   if (typeof bindings.shellPtyCap === 'number') SHELL_PTY_CAP = bindings.shellPtyCap;
   if (bindings.getWorkspaces) getWorkspaces = bindings.getWorkspaces;
   if (bindings.removeWorkspace) removeWorkspace = bindings.removeWorkspace;
 }
-
-let _shellWssGetter = () => _shellWss;
-let _ptyManagerGetter = () => _ptyManager;
 
 // Open a short-lived WebSocket to ccv's main /ws endpoint and deliver an
 // ask answer. ccv's protocol does NOT send a positive ack to the answering
@@ -395,20 +398,12 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
   // is always tied to a live ws so this is normally 0 except briefly during
   // close races).
   if (url === '/healthz' && method === 'GET') {
-    const wss = _shellWssGetter();
-    const ptyMgr = _ptyManagerGetter();
-    const wsCount = wss ? wss.clients.size : 0;
-    const ptyCount = ptyMgr ? ptyMgr._stats().sessions : 0;
-    // Manager sessions whose ws went away are "orphaned" until the TTL
-    // expires; on the wire this looks like ptyCount > wsCount.
-    const orphanCount = Math.max(0, ptyCount - wsCount);
+    const ptyCount = _shellSessionCount();
     sendJson(res, 200, {
       ok: true,
       uptimeSec: Math.round(process.uptime()),
       ptyCount,
       ptyCap: SHELL_PTY_CAP,
-      wsCount,
-      orphanCount,
       sessionCount: approvedSessions.size,
       instanceCount: instances.size,
       pendingPairs: pendingPairs.size,
@@ -533,7 +528,10 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
   // ---- Main launcher routes ----
 
   if (url === '/launcher' && method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+    });
     res.end(HTML_PAGE);
     return;
   }
@@ -675,11 +673,10 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
   }
 
   // Capabilities probe — lets the launcher UI grey-out features that depend
-  // on optional cc-viewer bits (shell PTY needs PtySessionManager which some
-  // cc-viewer builds ship without).
+  // on optional cc-viewer bits (shell PTY needs node-pty).
   if (url === '/api/launcher/capabilities' && method === 'GET') {
     sendJson(res, 200, {
-      shell: !!_shellWssGetter(),
+      shell: _shellAvailable(),
     });
     return;
   }
@@ -1760,6 +1757,91 @@ export async function dispatchLauncherRoute(req, res, parsedUrl) {
       sendJson(res, 200, { ok: true, cwd: resolved });
     } catch (err) {
       log('open-terminal error:', err.message);
+      sendJson(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  // ---- Shell HTTP transport (SSE stream + POST input) ----
+
+  if (url === '/api/launcher/shell/stream' && method === 'GET') {
+    if (!_shellAvailable()) {
+      sendJson(res, 503, { error: 'shell not available' });
+      return;
+    }
+    const cwd = parsedUrl.searchParams.get('cwd') || homedir();
+    const reqSessionId = parsedUrl.searchParams.get('sessionId') || null;
+    const subjectId = subjectIdFor(req);
+    const ip = getClientIp(req);
+
+    let result;
+    try {
+      if (reqSessionId) result = _shellAttachSession(reqSessionId);
+      if (!result) result = _shellCreateSession(cwd, subjectId, ip);
+    } catch (err) {
+      sendJson(res, 503, { error: err.message });
+      return;
+    }
+    const { sessionId, session, isReattach } = result;
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders();
+
+    function sseWrite(event, data) {
+      try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch {}
+    }
+
+    sseWrite('hello', { sessionId, isReattach });
+
+    if (isReattach && session.ringBuf) {
+      sseWrite('data', { data: session.ringBuf });
+    }
+
+    const dataListener = (data, exitCode) => {
+      if (data === null) {
+        sseWrite('exit', { exitCode });
+        try { res.end(); } catch {}
+        return;
+      }
+      sseWrite('data', { data });
+    };
+    session.dataListeners.add(dataListener);
+
+    const heartbeat = setInterval(() => {
+      try { res.write(': heartbeat\n\n'); } catch {}
+    }, 25_000);
+
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      session.dataListeners.delete(dataListener);
+      _shellOrphan(sessionId);
+    };
+    req.on('close', cleanup);
+    req.on('error', cleanup);
+    res.on('error', cleanup);
+    return;
+  }
+
+  if (url === '/api/launcher/shell/input' && method === 'POST') {
+    if (!_shellAvailable()) {
+      sendJson(res, 503, { error: 'shell not available' });
+      return;
+    }
+    try {
+      const raw = await readBody(req);
+      const { sessionId, type, data, cols, rows } = JSON.parse(raw || '{}');
+      if (!sessionId) throw new Error('sessionId required');
+      const session = _shellGetSession(sessionId);
+      if (!session) { sendJson(res, 404, { error: 'session not found' }); return; }
+      if (type === 'input' && data) session.pty.write(data);
+      else if (type === 'resize' && cols && rows) session.pty.resize(cols, rows);
+      sendJson(res, 200, { ok: true });
+    } catch (err) {
       sendJson(res, 400, { error: err.message });
     }
     return;

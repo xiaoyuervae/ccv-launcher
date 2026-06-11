@@ -18,8 +18,24 @@ export default {
   hooks: {
     localUrl: async (input) => {
       try {
-        const template = process.env.CCV_PUBLIC_URL_TEMPLATE;
-        if (!template) return input;
+        let template = process.env.CCV_PUBLIC_URL_TEMPLATE;
+        if (!template) {
+          // Cloud CLI fallback: query port-mapping API for public URL
+          try {
+            const port = input?.port;
+            if (port) {
+              const ctrl = new AbortController();
+              setTimeout(() => ctrl.abort(), 3000);
+              const resp = await fetch(`http://localhost:58596/api/port-mapping?port=${port}`, { signal: ctrl.signal });
+              const data = await resp.json();
+              if (data.success) {
+                const publicUrl = `${data.url}/?token=${input.token || ''}`;
+                return { url: publicUrl, publicUrl, originalUrl: input?.url };
+              }
+            }
+          } catch { /* fall through */ }
+          return input;
+        }
         if (!input || typeof input !== 'object') return input;
 
         const { url: originalUrl, ip, port, token } = input;
