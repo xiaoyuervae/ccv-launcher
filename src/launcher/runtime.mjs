@@ -896,6 +896,19 @@ export async function doSpawn(targetCwd, { force = false, ccuseProfile = '', use
     CCV_START_PORT: String(port),
     CCV_MAX_PORT: String(HUB_PORT_CEIL),
   };
+  // launchd-spawned hubs inherit a minimal PATH that omits /usr/sbin:/sbin (a
+  // login shell adds them via path_helper, but `zsh -i` and direct spawn don't).
+  // Some internal CLIs — notably Normandy `ncs` (which `mw` calls for credentials)
+  // — shell out to /usr/sbin/{ioreg,system_profiler} at startup to compute a
+  // machine fingerprint and fail with an opaque "unexpected error" when those
+  // dirs are missing. Guarantee the macOS system bin dirs for every child.
+  {
+    const parts = (env.PATH || '').split(':').filter(Boolean);
+    for (const dir of ['/usr/bin', '/bin', '/usr/sbin', '/sbin']) {
+      if (!parts.includes(dir)) parts.push(dir);
+    }
+    env.PATH = parts.join(':');
+  }
   // Inherit CCV_PUBLIC_URL_TEMPLATE so children produce matching public URLs.
 
   // ccuse integration: launchd-spawned hub doesn't source .zshrc, so the user's
